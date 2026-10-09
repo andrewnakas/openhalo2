@@ -707,6 +707,22 @@ index 8e9325e..6fc89a1 100644
  void recomp_unimpl(const char *text, uint32_t va);
  #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
  
+diff --git a/tools/conformance/xbe_run.py b/tools/conformance/xbe_run.py
+index 7ecb09d..2e1292c 100644
+--- a/tools/conformance/xbe_run.py
++++ b/tools/conformance/xbe_run.py
+@@ -284,6 +284,11 @@ RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
+ RECOMP_TLS uint32_t g_seh_ebp, g_ebp;
+ RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
+ RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS int g_fp_cmp; RECOMP_TLS uint16_t g_fp_cc = 0x4000;
++RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3, g_mm4, g_mm5, g_mm6, g_mm7;
++RECOMP_TLS uint32_t g_recomp_eflags = 0x00000202u;
++RECOMP_TLS uint32_t g_recomp_mxcsr = 0x00001F80u;
++uint64_t xbox_ReadTimeStampCounter(void) { return 0; }
++void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
+ RECOMP_TLS RecompXmm g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7;
+ volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
+ volatile uint64_t g_icall_count;
 diff --git a/tools/disasm/engine.py b/tools/disasm/engine.py
 index db71403..75ee96c 100644
 --- a/tools/disasm/engine.py

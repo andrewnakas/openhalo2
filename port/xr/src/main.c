@@ -226,6 +226,15 @@ extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 #define APU_TRAP_BASE 0xFE800000u
 #define APU_TRAP_END  0xFE880000u
 
+/* The USB host controller model (xboxrecomp src/usb/ohci.c). The library
+ * never starts it by itself: the title has to call xbox_OhciInit and hand it
+ * the faults on its registers. Without both, RECOMP_USB and RECOMP_PAD_SCRIPT
+ * do nothing at all, which is what "no pad/USB log lines" was. */
+void xbox_OhciInit(void);
+int  xbox_OhciOwnsAddress(uint32_t xbox_va);
+int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
+void xbox_OhciReport(void);
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -252,6 +261,11 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         {
             uint32_t xbox_va =
                 (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+
+            /* USB controller registers -> the OHCI model. */
+            if (xbox_OhciOwnsAddress(xbox_va)
+                    && xbox_OhciHandleMmio(ep->ContextRecord, xbox_va))
+                return EXCEPTION_CONTINUE_EXECUTION;
 
             if (xbox_va >= APU_TRAP_BASE && xbox_va < APU_TRAP_END
                     && apu_hook_handle_mmio(
@@ -364,6 +378,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         fprintf(stderr, "[BOOT] emulated APU %s\n",
                 g_apu_state ? "up" : "FAILED to initialise");
     }
+
+    /* The pads. Does nothing unless RECOMP_USB is set. Needs guest memory
+     * mapped (it makes the controller registers fault). */
+    xbox_OhciInit();
+    atexit(xbox_OhciReport);
 
     /* Step 3: Initialize Xbox kernel */
     printf("Initializing Xbox kernel replacement...\n");
