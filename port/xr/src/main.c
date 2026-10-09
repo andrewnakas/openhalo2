@@ -37,6 +37,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <io.h>
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
@@ -327,6 +328,31 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Set in WinMain: the playable configuration (window, real input), and
+ * whether the log went to halo2_recomp.log. */
+static int g_play_mode, g_log_to_file;
+
+/* A fault nothing handled. The vectored handler above has already written
+ * the report; with a window on screen and no console, say where it is
+ * instead of vanishing. */
+static LONG WINAPI unhandled_filter(PEXCEPTION_POINTERS ep)
+{
+    static volatile LONG once;
+    (void)ep;
+    if (g_play_mode && InterlockedExchange(&once, 1) == 0) {
+        fflush(NULL);
+        MessageBoxA(NULL, g_log_to_file
+                    ? "Halo 2 has stopped (a fault in the recompiled game).\n\n"
+                      "The report is at the end of halo2_recomp.log, beside "
+                      "halo2_recomp.exe."
+                    : "Halo 2 has stopped (a fault in the recompiled game).\n\n"
+                      "The report is in the program's output.",
+                    "Halo 2", MB_ICONERROR | MB_SETFOREGROUND);
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 /* ── WinMain ───────────────────────────────────────────────── */
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -339,6 +365,73 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)hPrevInstance;
     (void)lpCmdLine;
     (void)nCmdShow;
+
+    /* Run from the folder the program is in: `game` and `save` are relative,
+     * and a double-click or a shortcut may start anywhere. */
+    {
+        char dir[MAX_PATH];
+        DWORD n = GetModuleFileNameA(NULL, dir, sizeof dir);
+        char *slash = (n && n < sizeof dir) ? strrchr(dir, '\\') : NULL;
+        if (slash) {
+            *slash = 0;
+            SetCurrentDirectoryA(dir);
+        }
+    }
+
+    /* Play or test.
+     *
+     * A plain launch (double-click, no environment) is the playable one: the
+     * game window, a host controller or the keyboard and mouse, the log in a
+     * file. The test scripts drive the same program headless, and they are
+     * recognised by what they set: a watchdog, a scripted pad or a frame
+     * dump. RECOMP_WINDOW=1 / 0 says so outright and wins. */
+    {
+        static const char *const test_vars[] = {
+            "RECOMP_HEADLESS", "RECOMP_WATCHDOG_SECS", "RECOMP_PAD_LIVE",
+            "RECOMP_PAD_SCRIPT", "RECOMP_FB_DUMP", "RECOMP_FB_WINDOW",
+        };
+        const char *w = getenv("RECOMP_WINDOW");
+        size_t ti;
+        g_play_mode = 1;
+        for (ti = 0; ti < sizeof test_vars / sizeof test_vars[0]; ti++)
+            if (getenv(test_vars[ti]))
+                g_play_mode = 0;
+        if (w && *w)
+            g_play_mode = (*w != '0');
+        if (g_play_mode) {
+            _putenv_s("RECOMP_WINDOW", "1");
+            if (!getenv("RECOMP_WINDOW_TITLE"))
+                _putenv_s("RECOMP_WINDOW_TITLE", "Halo 2");
+        } else {
+            _putenv_s("RECOMP_WINDOW", "0");
+        }
+    }
+
+    /* The log. Whoever started us with stdout/stderr on a file or a pipe
+     * gets them there (every test script does). Otherwise there is nowhere
+     * for them to go -- this is a GUI-subsystem program, a double-click gives
+     * it no console -- so they go to halo2_recomp.log beside the program,
+     * the previous run's kept as halo2_recomp.prev.log. */
+    {
+        DWORD te = GetFileType(GetStdHandle(STD_ERROR_HANDLE));
+        DWORD to = GetFileType(GetStdHandle(STD_OUTPUT_HANDLE));
+        if (te != FILE_TYPE_DISK && te != FILE_TYPE_PIPE
+            && to != FILE_TYPE_DISK && to != FILE_TYPE_PIPE) {
+            MoveFileExA("halo2_recomp.log", "halo2_recomp.prev.log",
+                        MOVEFILE_REPLACE_EXISTING);
+            if (freopen("halo2_recomp.log", "w", stderr)) {
+                /* One file, one position: stdout becomes a second descriptor
+                 * on the same open file. */
+                if (freopen("NUL", "w", stdout))
+                    _dup2(_fileno(stderr), _fileno(stdout));
+                SetStdHandle(STD_ERROR_HANDLE,
+                             (HANDLE)_get_osfhandle(_fileno(stderr)));
+                SetStdHandle(STD_OUTPUT_HANDLE,
+                             (HANDLE)_get_osfhandle(_fileno(stderr)));
+                g_log_to_file = 1;
+            }
+        }
+    }
 
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -369,6 +462,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 _putenv_s(defaults[di], "1");
     }
 
+    /* Sound: on when playing, off for the headless tests unless they ask
+     * (RECOMP_SOUND=1 or 0 says so outright; RECOMP_AC97_READY is the
+     * runtime's own switch and still works). RECOMP_APU_MUTE=1 runs the
+     * whole audio path with no device. This title's DirectSound posts
+     * commands to the GP DSP at scratch offset 0x810 and spins until they
+     * are taken (0x37E38E, 0x37E3F3); the DSP is a stub, so the runtime
+     * answers them. */
+    {
+        const char *snd = getenv("RECOMP_SOUND");
+        int on = (snd && *snd) ? (*snd != '0')
+                               : (g_play_mode || getenv("RECOMP_AC97_READY"));
+        if (on) {
+            _putenv_s("RECOMP_AC97_READY", "1");
+            if (!getenv("RECOMP_APU_DSP_ACK_GPS"))
+                _putenv_s("RECOMP_APU_DSP_ACK_GPS", "0x810");
+            /* Fold the mixbins down as speakers (centre to both sides,
+             * effect sends dropped), not by parity. Measured over a boot to
+             * the armory: bins 0, 1, 2, 6, 7 and 10 carry sound. */
+            if (!getenv("RECOMP_APU_MIXDOWN_ALL"))
+                _putenv_s("RECOMP_APU_MIXDOWN_ALL", "2");
+        } else {
+            _putenv_s("RECOMP_AC97_READY", "");     /* removes it */
+        }
+    }
+
     printf("=== Halo 2 - Static Recompilation ===\n");
     printf("Loading XBE...\n");
 
@@ -379,6 +497,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
+    SetUnhandledExceptionFilter(unhandled_filter);
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {

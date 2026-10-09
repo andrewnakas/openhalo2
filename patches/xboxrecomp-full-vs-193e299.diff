@@ -1,3 +1,1065 @@
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 258048c..5841f53 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -119,6 +119,8 @@ extern uint32_t xbox_AllocThreadTib(void);
+ extern int xbox_IrqlBlocksInterrupts(void);
+ extern int xbox_IrqlEnterInterrupt(int level);
+ extern void xbox_IrqlLeaveInterrupt(int saved);
++extern void xbox_IrqlDispatchLock(void);
++extern void xbox_IrqlDispatchUnlock(void);
+ #if defined(_MSC_VER)
+ #  define APU_TLS __declspec(thread)
+ #else
+@@ -171,7 +173,9 @@ static void apu_deliver_irq(MCPXAPUState *d)
+     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
+     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
+     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
++    xbox_IrqlDispatchLock();
+     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
++    xbox_IrqlDispatchUnlock();
+     xbox_worker_stack_free(slot);
+     qemu_mutex_lock(&d->lock);
+ 
+@@ -232,6 +236,14 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
+         break;
+     case NV_PAPU_FECTL:
+     case NV_PAPU_SECTL:
++        if (addr == NV_PAPU_SECTL && getenv("RECOMP_APU_SECTL_TRACE")) {
++            static unsigned n;
++            extern APU_TLS uint32_t g_esp;
++            if (++n > 20 && n < 80)
++                fprintf(stderr, "[APU] SECTL <- %08X (was %08X) tid %lu guest esp %08X ret %08X%c",
++                        (uint32_t)val, d->regs[addr], (unsigned long)GetCurrentThreadId(),
++                        g_esp, g_esp ? *(uint32_t *)(g_apu_ram_ptr + g_esp) : 0, 10);
++        }
+         qatomic_set(&d->regs[addr], (uint32_t)val);
+         /* Starting the APU has to start the frame thread.
+          *
+@@ -312,6 +324,24 @@ typedef struct {
+ 
+ static WaveOutState g_waveout = { 0 };
+ 
++/* Front-end traps the frame thread waited out, for the report. */
++static uint64_t g_apu_trap_waits, g_apu_trap_wait_us, g_apu_trap_unanswered;
++/* Sub-frames the voice processor did not run, by why: counter off, front
++ * end halted, front end trapped. */
++static uint64_t g_apu_idle_sub[3];
++
++/* RECOMP_APU_MUTE=1: run the whole APU, tap and report included, and open
++ * no audio device. For tests on a machine somebody is sitting at. */
++static int apu_out_muted(void)
++{
++    static int m = -1;
++    if (m < 0) {
++        const char *e = getenv("RECOMP_APU_MUTE");
++        m = (e && *e && *e != '0') ? 1 : 0;
++    }
++    return m;
++}
++
+ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
+ {
+     (void)errp;
+@@ -319,156 +349,195 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
+     d->monitor.queued_bytes_low = 1024;
+     d->monitor.queued_bytes_high = 3072;
+ 
+-    /* Try XAudio2 first (lower latency) */
+-    if (xa2_init()) {
+-        fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
++    if (apu_out_muted()) {
++        fprintf(stderr, "[APU] RECOMP_APU_MUTE: no audio device opened\n");
+         return;
+     }
+-    fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
+-
+-    WAVEFORMATEX wfx = { 0 };
+-    wfx.wFormatTag      = WAVE_FORMAT_PCM;
+-    wfx.nChannels       = 2;
+-    wfx.nSamplesPerSec  = 48000;
+-    wfx.wBitsPerSample  = 16;
+-    wfx.nBlockAlign     = wfx.nChannels * wfx.wBitsPerSample / 8;
+-    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
+-
+-    MMRESULT mr = waveOutOpen(&g_waveout.hwo, WAVE_MAPPER, &wfx,
+-                               0, 0, CALLBACK_NULL);
+-    if (mr != MMSYSERR_NOERROR) {
+-        fprintf(stderr, "[APU] waveOutOpen failed (error %u)\n", mr);
+-        g_waveout.initialized = false;
++    if (xa2_init()) {
++        fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+         return;
+     }
+-
+-    /* Prepare all headers */
+-    for (int i = 0; i < WAVEOUT_NUM_BUFS; i++) {
+-        memset(&g_waveout.hdrs[i], 0, sizeof(WAVEHDR));
+-        g_waveout.hdrs[i].lpData = (LPSTR)g_waveout.bufs[i];
+-        g_waveout.hdrs[i].dwBufferLength = WAVEOUT_BUF_SAMPLES * 2 * sizeof(int16_t);
+-        waveOutPrepareHeader(g_waveout.hwo, &g_waveout.hdrs[i], sizeof(WAVEHDR));
+-    }
+-
+-    g_waveout.next_buf = 0;
+-    g_waveout.initialized = true;
+-    g_waveout.frames_written = 0;
+-
+-    fprintf(stderr, "[APU] waveOut audio output initialized (48kHz stereo 16-bit, %d buffers)\n",
+-            WAVEOUT_NUM_BUFS);
++    fprintf(stderr, "[APU] XAudio2 unavailable: the APU runs silent\n");
+ }
+ 
+ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
+ {
+     (void)d;
+-    if (xa2_is_active()) {
++    if (xa2_is_active())
+         xa2_shutdown();
+-        return;
+-    }
+-    if (!g_waveout.initialized) return;
+-
+-    waveOutReset(g_waveout.hwo);
+-    for (int i = 0; i < WAVEOUT_NUM_BUFS; i++) {
+-        waveOutUnprepareHeader(g_waveout.hwo, &g_waveout.hdrs[i], sizeof(WAVEHDR));
+-    }
+-    waveOutClose(g_waveout.hwo);
+-    g_waveout.initialized = false;
+-    fprintf(stderr, "[APU] waveOut audio output shut down (%d frames written)\n",
+-            g_waveout.frames_written);
+ }
+ 
+-void mcpx_apu_monitor_frame(MCPXAPUState *d)
++/* The mix on its way out: a level report, an optional WAV tap, the device.
++ *
++ * RECOMP_APU_WAV=<file>[,<seconds>] writes the first <seconds> (default 20)
++ * of the mix that follows the first non-silent block as a 48 kHz stereo
++ * 16-bit WAV; the header is kept valid as it grows, so a killed run still
++ * leaves a readable file. RECOMP_APU_WAV_FROM_START=1 starts at the first
++ * block instead.
++ *
++ * Every five seconds, one line: blocks produced, peak and RMS of the
++ * interval, how many blocks were not silent, the voices playing, and the
++ * device queue with its underrun and drop counts. */
++static void apu_out_block(MCPXAPUState *d, const int16_t (*buf)[2], int n)
+ {
+-    if ((d->ep_frame_div + 1) % 8) {
+-        return;
++    static FILE *wav;
++    static int wav_state;               /* 0 unopened, 1 armed, 2 writing, 3 done */
++    static uint32_t wav_frames, wav_limit;
++    static uint64_t blocks, loud_blocks, sumsq, nsamp;
++    static int peak;
++    static DWORD last_report;
++    int i, block_peak = 0;
++    DWORD now;
++
++    for (i = 0; i < n; i++) {
++        int l = buf[i][0], r = buf[i][1];
++        if (l < 0) l = -l;
++        if (r < 0) r = -r;
++        if (l > block_peak) block_peak = l;
++        if (r > block_peak) block_peak = r;
++        sumsq += (uint64_t)((int64_t)buf[i][0] * buf[i][0])
++               + (uint64_t)((int64_t)buf[i][1] * buf[i][1]);
+     }
+-
+-    /* XAudio2 path: render and submit a buffer */
+-    if (xa2_is_active()) {
+-        int buf_size = xa2_get_buffer_size();
+-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
+-        int remaining = buf_size;
+-        int out_offset = 0;
+-
+-        while (remaining > 0) {
+-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
+-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+-
+-            if (g_test_tone.active && !g_audio_muted) {
+-                for (int i = 0; i < chunk; i++) {
+-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+-                    d->monitor.frame_buf[i][0] = s;
+-                    d->monitor.frame_buf[i][1] = s;
+-                    g_test_tone.phase += g_test_tone.phase_inc;
+-                    if (g_test_tone.phase >= 2.0 * M_PI)
+-                        g_test_tone.phase -= 2.0 * M_PI;
+-                }
++    nsamp += (uint64_t)n * 2;
++    blocks++;
++    if (block_peak > 8)
++        loud_blocks++;
++    if (block_peak > peak)
++        peak = block_peak;
++
++    if (wav_state == 0) {
++        const char *spec = getenv("RECOMP_APU_WAV");
++        wav_state = 3;
++        if (spec && *spec) {
++            char path[512];
++            const char *comma = strrchr(spec, ',');
++            size_t len = comma ? (size_t)(comma - spec) : strlen(spec);
++            double secs = comma ? atof(comma + 1) : 20.0;
++            if (len >= sizeof path) len = sizeof path - 1;
++            memcpy(path, spec, len);
++            path[len] = 0;
++            if (secs <= 0.0) secs = 20.0;
++            wav_limit = (uint32_t)(secs * 48000.0);
++            wav = fopen(path, "wb");
++            if (wav) {
++                uint8_t hdr[44];
++                memset(hdr, 0, sizeof hdr);
++                fwrite(hdr, 1, sizeof hdr, wav);
++                wav_state = getenv("RECOMP_APU_WAV_FROM_START") ? 2 : 1;
+             }
+-
+-            if (!g_audio_muted)
+-                mixer_render(d->monitor.frame_buf, chunk);
+-
+-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
+-            out_offset += chunk;
+-            remaining -= chunk;
+         }
+-
+-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+-        return;
++    }
++    if (wav_state == 1 && block_peak > 8)
++        wav_state = 2;
++    if (wav_state == 2) {
++        fwrite(buf, 4, (size_t)n, wav);
++        wav_frames += (uint32_t)n;
++        if ((wav_frames % 48000u) < (uint32_t)n || wav_frames >= wav_limit) {
++            uint32_t data = wav_frames * 4u, v;
++            uint16_t w;
++            long pos = ftell(wav);
++            fseek(wav, 0, SEEK_SET);
++            fwrite("RIFF", 1, 4, wav); v = 36u + data; fwrite(&v, 4, 1, wav);
++            fwrite("WAVEfmt ", 1, 8, wav); v = 16; fwrite(&v, 4, 1, wav);
++            w = 1; fwrite(&w, 2, 1, wav); w = 2; fwrite(&w, 2, 1, wav);
++            v = 48000; fwrite(&v, 4, 1, wav); v = 192000; fwrite(&v, 4, 1, wav);
++            w = 4; fwrite(&w, 2, 1, wav); w = 16; fwrite(&w, 2, 1, wav);
++            fwrite("data", 1, 4, wav); fwrite(&data, 4, 1, wav);
++            fseek(wav, pos, SEEK_SET);
++            fflush(wav);
++        }
++        if (wav_frames >= wav_limit) {
++            fclose(wav);
++            wav = NULL;
++            wav_state = 3;
++            fprintf(stderr, "[APU] WAV tap complete (%u frames)\n", wav_frames);
++        }
+     }
+ 
+-    if (!g_waveout.initialized) return;
+-
+-    int idx = g_waveout.next_buf;
+-    WAVEHDR *hdr = &g_waveout.hdrs[idx];
+-
+-    /* Wait if this buffer is still playing (with timeout) */
+-    int wait_loops = 0;
+-    while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
+-        qemu_mutex_unlock(&d->lock);
+-        Sleep(1);
+-        qemu_mutex_lock(&d->lock);
+-        if (++wait_loops > 50) break;
++    if (xa2_is_active())
++        xa2_submit_samples((const int16_t *)buf, n);
++
++    now = GetTickCount();
++    if (!last_report)
++        last_report = now;
++    if (now - last_report >= 5000) {
++        unsigned xb = 0, xu = 0, xd = 0;
++        int xq = 0, voices = 0, v;
++        double rms = nsamp ? sqrt((double)sumsq / (double)nsamp) : 0.0;
++        static uint64_t blocks_prev, loud_prev;
++        xa2_get_stats(&xb, &xu, &xd, &xq);
++        /* Voices the processor serviced since the last report. */
++        for (v = 0; v < 256; v++)
++            if (g_dbg.vp.v[v].active) {
++                voices++;
++                g_dbg.vp.v[v].active = false;
++            }
++        fprintf(stderr, "[APU] out: %.1f blocks/s (48000 Hz, %d samples each), "
++                "%llu of %llu blocks not silent, peak %d rms %.0f, voices %d | "
++                "device queue %d, underruns %u, dropped %u | pauses waited out %llu "
++                "(%.1f ms, %llu unanswered)\n",
++                (double)(blocks - blocks_prev) * 1000.0 / (double)(now - last_report),
++                n, (unsigned long long)(loud_blocks - loud_prev),
++                (unsigned long long)(blocks - blocks_prev), peak, rms, voices,
++                xq, xu, xd, (unsigned long long)g_apu_trap_waits,
++                (double)g_apu_trap_wait_us / 1000.0,
++                (unsigned long long)g_apu_trap_unanswered);
++        g_apu_trap_waits = 0; g_apu_trap_wait_us = 0; g_apu_trap_unanswered = 0;
++        if (g_apu_idle_sub[0] | g_apu_idle_sub[1] | g_apu_idle_sub[2])
++            fprintf(stderr, "[APU] idle sub-frames: counter off %llu, halted %llu, trapped %llu%c",
++                    (unsigned long long)g_apu_idle_sub[0],
++                    (unsigned long long)g_apu_idle_sub[1],
++                    (unsigned long long)g_apu_idle_sub[2], 10);
++        g_apu_idle_sub[0] = g_apu_idle_sub[1] = g_apu_idle_sub[2] = 0;
++        { extern void mcpx_apu_dsp_bin_report(void); mcpx_apu_dsp_bin_report(); }
++        fflush(stderr);
++        blocks_prev = blocks;
++        loud_prev = loud_blocks;
++        last_report = now;
++        peak = 0; sumsq = 0; nsamp = 0;
+     }
++}
+ 
+-    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
+-    int16_t *out = (int16_t *)g_waveout.bufs[idx];
+-    int remaining = WAVEOUT_BUF_SAMPLES;
+-    int out_offset = 0;
++void mcpx_apu_monitor_frame(MCPXAPUState *d)
++{
++    int i;
+ 
+-    while (remaining > 0) {
+-        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
++    if ((d->ep_frame_div + 1) % 8) {
++        return;
++    }
+ 
++    /* frame_buf now holds one whole block: mcpx_apu_dsp_frame wrote each of
++     * its eight 32-sample slices from the voice processor's mixbins (or the
++     * frame thread zeroed them while the APU was halted).
++     *
++     * This used to clear the block here and then send only the test tone
++     * and the software mixer to the device, so everything the voice
++     * processor produced -- which is all of a title's sound when it drives
++     * the APU through its own DirectSound -- was computed and thrown away. */
++    if (g_audio_muted)
+         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+ 
+-        /* Test tone (skip if muted) */
+-        if (g_test_tone.active && !g_audio_muted) {
+-            for (int i = 0; i < chunk; i++) {
+-                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+-                d->monitor.frame_buf[i][0] = s;
+-                d->monitor.frame_buf[i][1] = s;
+-                g_test_tone.phase += g_test_tone.phase_inc;
+-                if (g_test_tone.phase >= 2.0 * M_PI)
+-                    g_test_tone.phase -= 2.0 * M_PI;
+-            }
++    if (g_test_tone.active && !g_audio_muted) {
++        for (i = 0; i < MIXER_FRAME_SAMPLES; i++) {
++            int s = (int)(sin(g_test_tone.phase) * g_test_tone.amplitude);
++            int l = d->monitor.frame_buf[i][0] + s;
++            int r = d->monitor.frame_buf[i][1] + s;
++            if (l > 32767) l = 32767; if (l < -32768) l = -32768;
++            if (r > 32767) r = 32767; if (r < -32768) r = -32768;
++            d->monitor.frame_buf[i][0] = (int16_t)l;
++            d->monitor.frame_buf[i][1] = (int16_t)r;
++            g_test_tone.phase += g_test_tone.phase_inc;
++            if (g_test_tone.phase >= 2.0 * M_PI)
++                g_test_tone.phase -= 2.0 * M_PI;
+         }
+-
+-        /* Mix software voices (skip if muted) */
+-        if (!g_audio_muted)
+-            mixer_render(d->monitor.frame_buf, chunk);
+-
+-        /* Copy to waveOut buffer */
+-        memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
+-        out_offset += chunk;
+-        remaining -= chunk;
+     }
+ 
+-    /* Submit to waveOut */
+-    hdr->dwFlags &= ~WHDR_DONE;
+-    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
++    /* Software voices (the DirectSound bridge's) mix on top. */
++    if (!g_audio_muted)
++        mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
+ 
+-    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
+-    g_waveout.frames_written++;
++    apu_out_block(d, (const int16_t (*)[2])d->monitor.frame_buf,
++                  MIXER_FRAME_SAMPLES);
+ }
+ 
+ /* ============================================================
+@@ -483,8 +552,11 @@ static void throttle(MCPXAPUState *d)
+ 
+     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+ 
++    /* Up to 40 ms behind is made up by running without a wait (the device
++     * queue holds that much); further behind than that, the clock restarts.
++     * It restarted after a single block, so every stall was a gap. */
+     if (d->next_frame_time_us == 0 ||
+-        now_us - d->next_frame_time_us > EP_FRAME_US) {
++        now_us - d->next_frame_time_us > 40000) {
+         d->next_frame_time_us = now_us;
+     }
+ 
+@@ -570,6 +642,66 @@ static void *mcpx_apu_frame_thread(void *arg)
+         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                                 NV_PAPU_SECTL_XCNTMODE);
+         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
++
++        /* A paused APU is not a silent one.
++         *
++         * Halo 2's DirectSound stops the sample counter around its edits of
++         * the voice lists and starts it again at once: SECTL goes 0xF -> 0x7
++         * -> 0xF from the title's main thread, about forty times a second
++         * while a Bink movie plays. On the console that is microseconds
++         * during which the processor produces nothing and the clock does
++         * not move. This thread wakes once a block, takes the lock the
++         * title's next register write then waits for, sees the counter off
++         * for all eight sub-frames, and used to emit them as silence:
++         * measured, 1,600 of 7,500 sub-frames per five seconds ("counter
++         * off"), 22% of the mix as whole 256-sample blocks of zeroes.
++         *
++         * So a counter that was running and is now off, or a front end that
++         * is trapped (the voice processor asked the title to service an idle
++         * voice), is waited out: the lock is released, the interrupt raised
++         * and the timer thread woken for the deferred routine, and the next
++         * sub-frame is produced when the title lets the APU go on. Bounded,
++         * and after a wait nobody answered the state is taken at its word
++         * until it changes -- a title that really switches the APU off gets
++         * silence. The time is made up afterwards (see throttle). */
++        {
++            static int was_running, gave_up;
++            int paused = (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF && was_running)
++                      || (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF
++                          && (fectl & NV_PAPU_FECTL_FEMETHMODE)
++                             == NV_PAPU_FECTL_FEMETHMODE_TRAPPED);
++            if (!paused)
++                gave_up = 0;
++            if (paused && !gave_up) {
++                extern void xbox_TimerThreadWake(void);
++                int tries;
++                int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++                for (tries = 0; tries < 25 && paused; tries++) {
++                    if (d->set_irq) {
++                        update_irq(d);
++                        d->set_irq = false;
++                    }
++                    apu_deliver_irq(d);
++                    xbox_TimerThreadWake();
++                    qemu_cond_timedwait(&d->cond, &d->lock, 1);
++                    xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
++                                        NV_PAPU_SECTL_XCNTMODE);
++                    fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
++                    paused = xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF
++                          || (fectl & NV_PAPU_FECTL_FEMETHMODE)
++                             == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
++                }
++                g_apu_trap_waits++;
++                g_apu_trap_wait_us +=
++                    (uint64_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0);
++                if (paused) {
++                    g_apu_trap_unanswered++;
++                    gave_up = 1;
++                }
++            }
++            was_running = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF);
++        }
++
+         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
+                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+@@ -578,7 +710,13 @@ static void *mcpx_apu_frame_thread(void *arg)
+             /* Full pipeline: VP voices → DSP → monitor → waveOut */
+             se_frame(d);
+         } else {
+-            /* Lightweight: just monitor frame (test tone + software mixer) */
++            /* Lightweight: just monitor frame (test tone + software mixer).
++             * No voice processor ran, so its slice of the block is silence. */
++            g_apu_idle_sub[xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF ? 0
++                           : (fectl & NV_PAPU_FECTL_FEMETHMODE)
++                             == NV_PAPU_FECTL_FEMETHMODE_TRAPPED ? 2 : 1]++;
++            memset(d->monitor.frame_buf[(d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME],
++                   0, NUM_SAMPLES_PER_FRAME * 2 * sizeof(int16_t));
+             mcpx_apu_monitor_frame(d);
+             d->ep_frame_div++;
+         }
+diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
+index 7156be9..996aa97 100644
+--- a/src/apu/apu_dsp.c
++++ b/src/apu/apu_dsp.c
+@@ -89,17 +89,84 @@ static int mcpx_apu_mixdown_all(void)
+     static int on = -1;
+     if (on < 0) {
+         const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
+-        on = (e && *e) ? (atoi(e) != 0) : 1;
++        on = (e && *e) ? atoi(e) : 1;
+     }
+     return on;
+ }
+ 
++/* RECOMP_APU_MIXDOWN_ALL=2: fold the bins down by what DirectSound uses them
++ * for instead of by parity.
++ *
++ *   0 front left    1 front right   2 centre   3 low frequency
++ *   4 back left     5 back right    6-9 the same four speakers for 3D voices
++ *   10 and up       sends to the effects the GP DSP would run
++ *
++ * Parity puts the centre in the left ear only and the low-frequency channel
++ * in the right, and plays the dry feed of every effect send as if it were a
++ * speaker. This is the ordinary stereo fold-down: centre and back at -3 dB
++ * to both or their own side, low frequency at -6 dB to both, sends dropped
++ * (there is no reverb to return them). */
++static void mixdown_speakers(float m[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int i,
++                             float *left, float *right)
++{
++    const float c = 0.7071f;
++    float lfe = 0.5f * m[3][i];
++    *left  = m[0][i] + m[6][i] + c * (m[2][i] + m[4][i] + m[8][i]) + lfe;
++    *right = m[1][i] + m[7][i] + c * (m[2][i] + m[5][i] + m[9][i]) + lfe;
++}
++
++/* RECOMP_APU_BINS=1: energy per mixbin, printed with the APU's report. */
++static double s_bin_energy[NUM_MIXBINS];
++
++void mcpx_apu_dsp_bin_report(void)
++{
++    static int on = -1;
++    int b;
++    if (on < 0)
++        on = getenv("RECOMP_APU_BINS") != NULL;
++    if (!on)
++        return;
++    fprintf(stderr, "[APU] mixbin energy:");
++    for (b = 0; b < NUM_MIXBINS; b++) {
++        if (s_bin_energy[b] > 0.0)
++            fprintf(stderr, " %d:%.3g", b, s_bin_energy[b]);
++        s_bin_energy[b] = 0.0;
++    }
++    fprintf(stderr, "%c", 10);
++}
++
++/* RECOMP_APU_DSP_ACK_GPS=<offset>[,<offset>...]: the same acknowledgement
++ * for a doorbell that lives in the GP's scratch memory, found through the
++ * APU's own page table instead of by a fixed guest address.
++ *
++ * Halo 2's DirectSound (0x37E38E, 0x37E3F3) writes its command word at
++ * scratch offset 0x810 and spins until it reads zero. The scratch is
++ * contiguous memory whose address differs from title to title and could
++ * differ from boot to boot, but the title tells the APU where it is: GPSADDR
++ * holds the physical address of a table of 8-byte entries, one per 4 KB
++ * scratch page, page address first. Offset 0x810 is in the first page. */
++#define APU_DSP_ACK_GPS_MAX 4
++static uint32_t s_gps_ack[APU_DSP_ACK_GPS_MAX];
++static int s_gps_ack_count = -1;
++
+ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
+ {
+     int i;
+ 
+     if (s_dsp_ack_count < 0)
+         dsp_ack_init();
++    if (s_gps_ack_count < 0) {
++        const char *spec = getenv("RECOMP_APU_DSP_ACK_GPS");
++        char *end;
++        s_gps_ack_count = 0;
++        while (spec && *spec && s_gps_ack_count < APU_DSP_ACK_GPS_MAX) {
++            unsigned long v = strtoul(spec, &end, 0);
++            if (end == spec)
++                break;
++            s_gps_ack[s_gps_ack_count++] = (uint32_t)v;
++            spec = (*end == ',') ? end + 1 : end;
++        }
++    }
+     if (!d->ram_ptr)
+         return;
+     for (i = 0; i < s_dsp_ack_count; i++) {
+@@ -112,6 +179,29 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
+             *slot = 0;
+         }
+     }
++    if (s_gps_ack_count) {
++        uint32_t table = d->regs[NV_PAPU_GPSADDR];
++        uint32_t maxsge = d->regs[NV_PAPU_GPSMAXSGE];
++        for (i = 0; table && i < s_gps_ack_count; i++) {
++            uint32_t page = s_gps_ack[i] >> 12, off = s_gps_ack[i] & 0xFFCu;
++            uint32_t phys;
++            volatile uint32_t *slot;
++            if (page > maxsge)
++                continue;
++            phys = *(uint32_t *)mcpx_apu_phys((uint64_t)table + page * 8u);
++            if (!phys)
++                continue;
++            slot = (volatile uint32_t *)mcpx_apu_phys((uint64_t)(phys & ~0xFFFu) + off);
++            if (*slot) {
++                static int shown;
++                if (shown++ < 6)
++                    fprintf(stderr, "[APU] GP scratch doorbell +0x%X (page 0x%08X):"
++                                    " command 0x%08X acknowledged\n",
++                            s_gps_ack[i], phys, *slot);
++                *slot = 0;
++            }
++        }
++    }
+ }
+ 
+ void mcpx_apu_dsp_init(MCPXAPUState *d)
+@@ -187,7 +277,11 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+              * counts. This is not what a real EP does; it is the cheapest
+              * mixdown that stops discarding audio. */
+             float left, right;
+-            if (mcpx_apu_mixdown_all()) {
++            for (int b = 0; b < NUM_MIXBINS; ++b)
++                s_bin_energy[b] += (double)mixbins[b][i] * mixbins[b][i];
++            if (mcpx_apu_mixdown_all() == 2) {
++                mixdown_speakers(mixbins, i, &left, &right);
++            } else if (mcpx_apu_mixdown_all()) {
+                 left = 0.0f;
+                 right = 0.0f;
+                 for (int b = 0; b < NUM_MIXBINS; ++b) {
+diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
+index cd69e57..7d67821 100644
+--- a/src/apu/apu_xaudio2.c
++++ b/src/apu/apu_xaudio2.c
+@@ -1,9 +1,12 @@
+ /**
+  * XAudio2 Audio Output Backend
+  *
+- * Provides low-latency audio output via XAudio2 (Win7+).
+- * Called from the APU monitor frame to submit mixed samples.
+- * Falls back gracefully if XAudio2 is unavailable.
++ * The host end of the APU: 48 kHz stereo 16-bit blocks from the frame thread
++ * go to one XAudio2 source voice. The frame thread is paced by the wall
++ * clock and the device by its own crystal, so the queue between them is
++ * kept shallow and bounded: a block that would deepen it past the limit is
++ * dropped, and an empty queue is refilled with a short cushion of silence
++ * before the next block. Both are counted.
+  */
+ 
+ #include <stdint.h>
+@@ -24,8 +27,10 @@
+ 
+ #define XA2_SAMPLE_RATE   48000
+ #define XA2_CHANNELS      2
+-#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
+-#define XA2_NUM_BUFS      3
++#define XA2_BUF_SAMPLES   256    /* one APU block, 5.33 ms */
++#define XA2_NUM_BUFS      32
++#define XA2_MAX_QUEUED    16     /* 85 ms: past this a block is dropped */
++#define XA2_CUSHION       4      /* blocks of silence after running dry */
+ 
+ static IXAudio2               *g_xa2 = NULL;
+ static IXAudio2MasteringVoice *g_xa2_master = NULL;
+@@ -33,7 +38,8 @@ static IXAudio2SourceVoice    *g_xa2_source = NULL;
+ static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
+ static int                     g_xa2_next_buf = 0;
+ static int                     g_xa2_initialized = 0;
+-static int                     g_xa2_frames_written = 0;
++static unsigned                g_xa2_blocks, g_xa2_underruns, g_xa2_drops;
++static int                     g_xa2_last_queued;
+ 
+ int xa2_init(void)
+ {
+@@ -85,10 +91,10 @@ int xa2_init(void)
+ 
+     g_xa2_next_buf = 0;
+     g_xa2_initialized = 1;
+-    g_xa2_frames_written = 0;
+ 
+-    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
+-            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
++    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d-sample blocks,"
++                    " queue limit %d)\n", XA2_SAMPLE_RATE, XA2_BUF_SAMPLES,
++            XA2_MAX_QUEUED);
+     return 1;
+ 
+ fail:
+@@ -116,7 +122,7 @@ void xa2_shutdown(void)
+     }
+ 
+     if (g_xa2_initialized)
+-        fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
++        fprintf(stderr, "[XA2] Shut down (%u blocks written)\n", g_xa2_blocks);
+     g_xa2_initialized = 0;
+ }
+ 
+@@ -125,34 +131,55 @@ int xa2_is_active(void)
+     return g_xa2_initialized;
+ }
+ 
+-/* Submit a buffer of mixed samples to XAudio2.
+- * Called from APU frame thread. Returns 1 if buffer was submitted. */
++static int xa2_queue_one(const int16_t *samples, int num_samples)
++{
++    XAUDIO2_BUFFER xbuf;
++    int idx = g_xa2_next_buf;
++
++    if (num_samples > XA2_BUF_SAMPLES)
++        num_samples = XA2_BUF_SAMPLES;
++    if (samples)
++        memcpy(g_xa2_bufs[idx], samples,
++               (size_t)num_samples * XA2_CHANNELS * sizeof(int16_t));
++    else
++        memset(g_xa2_bufs[idx], 0,
++               (size_t)num_samples * XA2_CHANNELS * sizeof(int16_t));
++    memset(&xbuf, 0, sizeof(xbuf));
++    xbuf.AudioBytes = (UINT32)(num_samples * XA2_CHANNELS * sizeof(int16_t));
++    xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
++    if (FAILED(IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL)))
++        return 0;
++    g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
++    return 1;
++}
++
++/* Submit one block of mixed samples. Called from the APU frame thread.
++ * Returns 1 if the block was queued, 0 if it was dropped. */
+ int xa2_submit_samples(const int16_t *samples, int num_samples)
+ {
+     XAUDIO2_VOICE_STATE state;
+-    XAUDIO2_BUFFER xbuf;
+-    int idx;
+-    int copy_samples;
+-    HRESULT hr;
++    int queued, k;
+ 
+     if (!g_xa2_initialized || !g_xa2_source) return 0;
+ 
+     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+-
+-    idx = g_xa2_next_buf;
+-    copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
+-    memcpy(g_xa2_bufs[idx], samples, copy_samples * XA2_CHANNELS * sizeof(int16_t));
+-
+-    memset(&xbuf, 0, sizeof(xbuf));
+-    xbuf.AudioBytes = copy_samples * XA2_CHANNELS * sizeof(int16_t);
+-    xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
+-
+-    hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+-    if (FAILED(hr)) return 0;
+-
+-    g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
+-    g_xa2_frames_written++;
++    queued = (int)state.BuffersQueued;
++    g_xa2_last_queued = queued;
++    if (queued >= XA2_MAX_QUEUED) {
++        g_xa2_drops++;
++        return 0;
++    }
++    if (queued == 0) {
++        /* Dry: the device has been playing nothing. Not counted before the
++         * first block, when it is simply the start. */
++        if (g_xa2_blocks)
++            g_xa2_underruns++;
++        for (k = 0; k < XA2_CUSHION; k++)
++            xa2_queue_one(NULL, XA2_BUF_SAMPLES);
++    }
++    if (!xa2_queue_one(samples, num_samples))
++        return 0;
++    g_xa2_blocks++;
+     return 1;
+ }
+ 
+@@ -161,6 +188,15 @@ int xa2_get_buffer_size(void)
+     return XA2_BUF_SAMPLES;
+ }
+ 
++void xa2_get_stats(unsigned *blocks, unsigned *underruns, unsigned *drops,
++                   int *queued)
++{
++    *blocks = g_xa2_blocks;
++    *underruns = g_xa2_underruns;
++    *drops = g_xa2_drops;
++    *queued = g_xa2_last_queued;
++}
++
+ #else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+ 
+ int  xa2_init(void)                                   { return 0; }
+@@ -168,5 +204,7 @@ void xa2_shutdown(void)                               {}
+ int  xa2_is_active(void)                              { return 0; }
+ int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
+ int  xa2_get_buffer_size(void)                        { return 0; }
++void xa2_get_stats(unsigned *b, unsigned *u, unsigned *d, int *q)
++{ *b = 0; *u = 0; *d = 0; *q = 0; }
+ 
+ #endif /* _WIN32 */
+diff --git a/src/apu/apu_xaudio2.h b/src/apu/apu_xaudio2.h
+index 83e652d..a413366 100644
+--- a/src/apu/apu_xaudio2.h
++++ b/src/apu/apu_xaudio2.h
+@@ -21,4 +21,9 @@ int xa2_submit_samples(const int16_t *samples, int num_samples);
+ /* Get the preferred buffer size in samples. */
+ int xa2_get_buffer_size(void);
+ 
++/* Blocks queued so far, times the queue ran dry, blocks dropped because the
++ * queue was full, and the queue depth seen at the last submit. */
++void xa2_get_stats(unsigned *blocks, unsigned *underruns, unsigned *drops,
++                   int *queued);
++
+ #endif /* APU_XAUDIO2_H */
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index a91edbe..4766861 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -13,6 +13,7 @@
+ #include "xinput_xbox.h"
+ #include <stdlib.h>
+ #include <string.h>
++#include <math.h>
+ 
+ /* ======================================================================== */
+ #if defined(_WIN32)
+@@ -25,69 +26,127 @@
+ static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
+ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+ 
+-/* ---- keyboard, when there is no pad --------------------------------------
++/* ---- keyboard and mouse, when there is no pad ------------------------------
+  *
+  * A title that waits on PRESS START is unreachable on a machine with no
+  * controller plugged in, which is most machines someone brings this up on.
+- * The whole point of a recompilation is to be able to look at the thing
+- * running, and a build nobody can press a button in cannot be looked at.
+  *
+- * Off by default, because a keyboard silently acting as player 1 is
+- * surprising when a real pad is what you meant to use. RECOMP_KEYBOARD=1
+- * turns it on. It only ever answers for port 0, and is merged on top of a
+- * pad connected there, so a real controller keeps working.
++ * On when the game window is open (RECOMP_WINDOW), or with RECOMP_KEYBOARD=1
++ * for the read-back framebuffer window; RECOMP_KEYBOARD=0 turns it off. It
++ * only ever answers for port 0 and is merged on top of a pad connected
++ * there, so a real controller keeps working.
+  *
+- * The keys are the ones a Dreamcast or Saturn emulator would pick, which is
+- * the closest thing to a convention here:
++ * The map is the one a PC first-person shooter would pick:
+  *
+- *   arrows        d-pad             Enter      START
+- *   Z X A S       A B X Y           Backspace  BACK
+- *   Q E           white black       1 3        triggers
+- *   numpad 8/2/4/6 left thumb       I/K/J/L    right thumb
++ *   W A S D        left stick (Shift held: half deflection)
++ *   mouse          right stick, once the pointer is captured (click in the
++ *                  window; F1 or Alt+Tab releases it); I J K L also move it
++ *   left button    right trigger          right button   left trigger
++ *   middle button  right stick click      (O and U are the triggers too)
++ *   Space          A                      F, Backspace   B
++ *   E, R           X                      Tab            Y
++ *   Q              white                  G              black
++ *   Ctrl, C        left stick click       Z              right stick click
++ *   Enter, Esc     START                  F2             BACK
++ *   arrows         d-pad
+  *
+- * Keys come from the framebuffer window, which only receives them while it
+- * has the focus, so typing in another window does not drive the game.
++ * Keys come from the window that has the focus, so typing in another window
++ * does not drive the game.
+  */
++extern int xbox_GameWindowActive(void);
++extern int xbox_GameWindowKeyDown(int vk);
++extern int xbox_GameWindowMouse(int *dx, int *dy, unsigned *buttons);
++
+ static BOOL keyboard_enabled(void)
+ {
+     static int on = -1;
+     if (on < 0) {
+         const char *v = getenv("RECOMP_KEYBOARD");
+-        on = (v && *v && *v != '0') ? 1 : 0;
++        if (v && *v)
++            on = (*v != '0') ? 1 : 0;
++        else
++            return xbox_GameWindowActive() ? TRUE : FALSE;   /* not cached:
++                                                the window opens later */
+     }
+     return on ? TRUE : FALSE;
+ }
+ 
+-/* The framebuffer window records what is held; see src/video/fb_present.c.
+- *
+- * GetAsyncKeyState was the first attempt and reads nothing here -- under
+- * Wine it answers about a state a GDI-drawing guest never touches. Going
+- * through the window is also the better gate: a window only receives keys
+- * while it has the focus, so there is no separate focus check to get wrong
+- * and no way for typing in another application to drive the game.
+- *
+- * Declared rather than included so src/input does not depend on the video
+- * module's include path. */
++/* The read-back framebuffer window records what is held too; see
++ * src/video/fb_present.c. Declared rather than included so src/input does
++ * not depend on the video module's include path. */
+ extern int xbox_FramebufferKeyDown(int vk);
+ 
+ static BOOL key_down(int vk)
+ {
+-    return xbox_FramebufferKeyDown(vk) ? TRUE : FALSE;
++    return (xbox_GameWindowKeyDown(vk) || xbox_FramebufferKeyDown(vk))
++         ? TRUE : FALSE;
+ }
+ 
+ /* A thumb axis from two keys, at the full deflection a digital key implies. */
+-static SHORT axis_from_keys(int negative, int positive)
++static SHORT axis_from_keys(int negative, int positive, int scale)
+ {
+     int v = 0;
+-    if (key_down(negative)) v -= 32767;
+-    if (key_down(positive)) v += 32767;
++    if (key_down(negative)) v -= scale;
++    if (key_down(positive)) v += scale;
+     return (SHORT)v;
+ }
+ 
++/* Mouse movement as a right-stick deflection.
++ *
++ * A stick is a rate and a mouse is a distance, so the counts are turned into
++ * a speed (counts per millisecond, smoothed over about a frame, because the
++ * title samples the pad 30 times a second and the mouse reports hundreds of
++ * times) and the speed into a deflection. The deflection starts just past
++ * the dead zone a title applies to a stick, or slow movement would do
++ * nothing. RECOMP_MOUSE_SENS scales it (default 1: full deflection at 2.5
++ * counts per millisecond); RECOMP_MOUSE_DEADZONE is the starting deflection
++ * (default 0.2 of full).
++ *
++ * xbox_InputSynthMouse feeds the same filter from a test. */
++static double s_mouse_fx, s_mouse_fy;
++
++static void mouse_to_stick(int dx, int dy, double dt_ms, SHORT *rx, SHORT *ry)
++{
++    static double sens = -1.0, dz;
++    const double tau = 30.0;
++    double a, v[2];
++    int k;
++
++    if (sens < 0.0) {
++        const char *e = getenv("RECOMP_MOUSE_SENS");
++        const char *d = getenv("RECOMP_MOUSE_DEADZONE");
++        sens = e ? atof(e) : 1.0;
++        if (sens <= 0.0) sens = 1.0;
++        dz = d ? atof(d) : 0.2;
++        if (dz < 0.0 || dz > 0.9) dz = 0.2;
++    }
++    if (dt_ms < 0.5) dt_ms = 0.5;
++    if (dt_ms > 100.0) dt_ms = 100.0;
++    a = 1.0 - exp(-dt_ms / tau);
++    s_mouse_fx += ((double)dx / dt_ms - s_mouse_fx) * a;
++    s_mouse_fy += ((double)dy / dt_ms - s_mouse_fy) * a;
++    v[0] = s_mouse_fx * sens / 2.5;
++    v[1] = -s_mouse_fy * sens / 2.5;        /* mouse down is stick down */
++    for (k = 0; k < 2; k++) {
++        double m = fabs(v[k]), o = 0.0;
++        if (m > 0.01) {
++            if (m > 1.0) m = 1.0;
++            o = dz + (1.0 - dz) * m;
++            if (v[k] < 0.0) o = -o;
++        }
++        *(k ? ry : rx) = (SHORT)(o * 32767.0);
++    }
++}
++
+ static void keyboard_state(XBOX_INPUT_STATE *pState)
+ {
+     static DWORD packet;
++    static LARGE_INTEGER last, freq;
++    LARGE_INTEGER now;
+     WORD b = 0;
++    int mdx, mdy, walk = key_down(VK_SHIFT) ? 16383 : 32767;
++    unsigned mb = 0;
++    double dt_ms;
+ 
+     memset(pState, 0, sizeof(*pState));
+ 
+@@ -95,29 +154,47 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
+     if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
+     if (key_down(VK_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
+     if (key_down(VK_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
+-    if (key_down(VK_RETURN)) b |= XBOX_GAMEPAD_START;
+-    if (key_down(VK_BACK))   b |= XBOX_GAMEPAD_BACK;
+-    if (key_down(VK_SHIFT))  b |= XBOX_GAMEPAD_LEFT_THUMB;
+-    if (key_down(VK_CONTROL))b |= XBOX_GAMEPAD_RIGHT_THUMB;
+-    pState->Gamepad.wButtons = b;
++    if (key_down(VK_RETURN) || key_down(VK_ESCAPE)) b |= XBOX_GAMEPAD_START;
++    if (key_down(VK_F2))     b |= XBOX_GAMEPAD_BACK;
++    if (key_down(VK_CONTROL) || key_down('C')) b |= XBOX_GAMEPAD_LEFT_THUMB;
++    if (key_down('Z'))       b |= XBOX_GAMEPAD_RIGHT_THUMB;
+ 
+     /* Analog on the console, so a key is 255 rather than a flag -- a title
+      * that reads these as a pressure never sees a press if they are 1. */
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = key_down('Z') ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = key_down('X') ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = key_down('A') ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = key_down('S') ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = key_down(VK_SPACE) ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = (key_down('F') || key_down(VK_BACK)) ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = (key_down('E') || key_down('R')) ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = key_down(VK_TAB) ? 255 : 0;
+     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = key_down('Q') ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = key_down('E') ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down('1') ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = key_down('3') ? 255 : 0;
+-
+-    /* W/A/S/D would collide with the face buttons above, so the left thumb
+-     * shares the arrow keys' row on the numeric pad instead. */
+-    pState->Gamepad.sThumbLX = axis_from_keys(VK_NUMPAD4, VK_NUMPAD6);
+-    pState->Gamepad.sThumbLY = axis_from_keys(VK_NUMPAD2, VK_NUMPAD8);
+-    pState->Gamepad.sThumbRX = axis_from_keys('J', 'L');
+-    pState->Gamepad.sThumbRY = axis_from_keys('K', 'I');
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = key_down('G') ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down('U') ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = key_down('O') ? 255 : 0;
++
++    pState->Gamepad.sThumbLX = axis_from_keys('A', 'D', walk);
++    pState->Gamepad.sThumbLY = axis_from_keys('S', 'W', walk);
++    pState->Gamepad.sThumbRX = axis_from_keys('J', 'L', 32767);
++    pState->Gamepad.sThumbRY = axis_from_keys('K', 'I', 32767);
++
++    /* The mouse, while the window holds it. */
++    if (!freq.QuadPart)
++        QueryPerformanceFrequency(&freq);
++    QueryPerformanceCounter(&now);
++    dt_ms = last.QuadPart
++          ? (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)freq.QuadPart
++          : 4.0;
++    last = now;
++    if (xbox_GameWindowMouse(&mdx, &mdy, &mb)) {
++        SHORT rx, ry;
++        mouse_to_stick(mdx, mdy, dt_ms, &rx, &ry);
++        if (rx) pState->Gamepad.sThumbRX = rx;
++        if (ry) pState->Gamepad.sThumbRY = ry;
++        if (mb & 1u) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = 255;
++        if (mb & 2u) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = 255;
++        if (mb & 4u) pState->Gamepad.wButtons |= XBOX_GAMEPAD_RIGHT_THUMB;
++    } else {
++        s_mouse_fx = s_mouse_fy = 0.0;
++    }
++    pState->Gamepad.wButtons |= b;
+ 
+     /* The title's input layer looks for button edges, so the packet number
+      * has to move whenever the state does or a press is never noticed. */
+@@ -141,7 +218,19 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+         return ERROR_DEVICE_NOT_CONNECTED;
+ 
+-    result = XInputGetState(dwPort, &xi_state);
++    /* An empty XInput slot is slow to ask (the call enumerates devices), and
++     * this runs at the pad's report rate: ask an empty slot once a second. */
++    {
++        static DWORD next_probe[XBOX_MAX_CONTROLLERS];
++        DWORD tick = GetTickCount();
++        if (!g_controller_connected[dwPort] && next_probe[dwPort]
++            && (LONG)(tick - next_probe[dwPort]) < 0) {
++            result = ERROR_DEVICE_NOT_CONNECTED;
++        } else {
++            result = XInputGetState(dwPort, &xi_state);
++            next_probe[dwPort] = (tick + 1000u) | 1u;
++        }
++    }
+     if (result != ERROR_SUCCESS) {
+         g_controller_connected[dwPort] = FALSE;
+         if (dwPort == 0 && keyboard_enabled()) {
+@@ -166,9 +255,11 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+         (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
+     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
+         (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
++    /* White on the left bumper and black on the right, as the Xbox 360 maps
++     * them for original-Xbox titles. */
+     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
++        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
+         (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
+     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
+     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
 diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
 index a045752..8987665 100644
 --- a/src/kernel/CMakeLists.txt
@@ -25,8 +1087,25 @@ index a045752..8987665 100644
  else()
      # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
      find_package(OpenSSL REQUIRED)
+diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
+index b9a02bc..69e4715 100644
+--- a/src/kernel/kernel.h
++++ b/src/kernel/kernel.h
+@@ -796,6 +796,12 @@ int     xbox_IrqlBlocksInterrupts(void);
+ int     xbox_IrqlRaisedCount(void);
+ int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
+ void    xbox_IrqlLeaveInterrupt(int saved);
++/* The dispatch lock (kernel_hal.c): one thread at DISPATCH_LEVEL at a time. */
++void    xbox_IrqlDispatchLock(void);
++void    xbox_IrqlDispatchUnlock(void);
++int     xbox_IrqlDispatchSuspend(void);         /* around a blocking wait */
++void    xbox_IrqlDispatchResume(int held);
++void    xbox_IrqlDispatchReport(void);
+ 
+ /* Total crossings of the DISPATCH boundary, and who is holding it up.
+  * A depth that is non-zero while this stops moving is stuck, not busy. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..589f11f 100644
+index c65ba43..e2b4204 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
@@ -42,7 +1121,41 @@ index c65ba43..589f11f 100644
          /* The console hands out zeroed pages here, and titles rely on it:
           * pool headers and free-list roots are assumed clear, so whatever the
           * backing view happened to contain shows up later as structures that
-@@ -2251,6 +2257,8 @@ static int kernel_raise_interrupt(uint32_t vector)
+@@ -1568,9 +1574,13 @@ static void bridge_KeWaitForSingleObject(void)
+             } else {
+                 SetEvent(ge);                          /* set by a header write */
+             }
+-            g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+-                ge, wait_reason, wait_mode,
+-                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
++            {   /* A wait at raised IRQL must not hold DPCs out. */
++                int dl = xbox_IrqlDispatchSuspend();
++                g_eax = (uint32_t)xbox_KeWaitForSingleObject(
++                    ge, wait_reason, wait_mode,
++                    (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
++                xbox_IrqlDispatchResume(dl);
++            }
+             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
+                 BRIDGE_MEM32(object + 4) = 0;
+             return;
+@@ -1583,9 +1593,13 @@ static void bridge_KeWaitForSingleObject(void)
+     if (!h)
+         h = XBOX_TO_NATIVE(object);
+ 
+-    g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+-        h, wait_reason, wait_mode,
+-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
++    {
++        int dl = xbox_IrqlDispatchSuspend();
++        g_eax = (uint32_t)xbox_KeWaitForSingleObject(
++            h, wait_reason, wait_mode,
++            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
++        xbox_IrqlDispatchResume(dl);
++    }
+ }
+ 
+ /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
+@@ -2251,6 +2265,8 @@ static int kernel_raise_interrupt(uint32_t vector)
  #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
  #define NV2A_VECTOR            3u
  
@@ -51,7 +1164,7 @@ index c65ba43..589f11f 100644
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
-@@ -2262,16 +2270,30 @@ static void kernel_vblank_tick(void)
+@@ -2262,16 +2278,30 @@ static void kernel_vblank_tick(void)
      if (!enabled)
          return;
  
@@ -86,7 +1199,7 @@ index c65ba43..589f11f 100644
  
      {
          static unsigned n;
-@@ -2284,6 +2306,68 @@ static void kernel_vblank_tick(void)
+@@ -2284,6 +2314,68 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -155,7 +1268,7 @@ index c65ba43..589f11f 100644
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2566,12 +2650,22 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2566,12 +2658,22 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          g_fs_base = tib;
      }
  
@@ -179,7 +1292,7 @@ index c65ba43..589f11f 100644
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -2619,6 +2713,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -2619,6 +2721,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      if (!g_timer_started) {
          InitializeCriticalSection(&g_timer_lock);
          g_timer_started = 1;
@@ -187,7 +1300,7 @@ index c65ba43..589f11f 100644
          CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
      }
  
-@@ -3880,6 +3975,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3880,6 +3983,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
@@ -204,7 +1317,7 @@ index c65ba43..589f11f 100644
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
-@@ -9391,24 +9496,45 @@ void guest_cpu_part(void)
+@@ -9391,24 +9504,45 @@ void guest_cpu_part(void)
      t_guest_thread = 0;
  }
  
@@ -250,7 +1363,7 @@ index c65ba43..589f11f 100644
      }
      (void)held;
  }
-@@ -9473,6 +9599,28 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9473,6 +9607,28 @@ static void kernel_thunk_dispatch_body(void)
                      fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
                              (unsigned long long)g_ordinal_calls[best]);
                  }
@@ -358,6 +1471,204 @@ index 42135e0..9b87ad8 100644
              ctx->find_handle = NULL;
              IoStatusBlock->Status = STATUS_NO_MORE_FILES;
              return STATUS_NO_MORE_FILES;
+diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
+index 1ad4fff..0af83a3 100644
+--- a/src/kernel/kernel_hal.c
++++ b/src/kernel/kernel_hal.c
+@@ -167,6 +167,151 @@ void xbox_IrqlDumpHolders(void)
+     fflush(stderr);
+ }
+ 
++/* The dispatch lock: one thread at DISPATCH_LEVEL at a time.
++ *
++ * The console has one processor. Code that raises to DISPATCH_LEVEL cannot be
++ * preempted by another thread or by a DPC, and a DPC cannot start until the
++ * level drops, so XDK drivers protect their lists with nothing but the raise.
++ * Here a raise was a thread-local number: the title's main thread sat "at
++ * DISPATCH_LEVEL" inside the USB driver while the timer thread ran that
++ * driver's DPC, and both popped transfer descriptors off one unlocked free
++ * list and edited the same endpoint queues. Measured on Halo 2: 3 boots in 15
++ * crashed in the DPC following a garbage descriptor link, and 3 more came up
++ * with the gamepad's interrupt endpoint pointing at 0xFFFFFFF0 (a dead pad).
++ *
++ * So crossing into DISPATCH_LEVEL takes this lock and crossing out releases
++ * it: guest raises (KfRaiseIrql, KeRaiseIrqlToDpcLevel), DPCs run by the host
++ * (xbox_IrqlEnterInterrupt(2)), and device ISRs that ask for it
++ * (xbox_IrqlDispatchLock). An ISR delivered at device level by
++ * xbox_IrqlEnterInterrupt(>2) does NOT take it: on hardware it interrupts
++ * DISPATCH_LEVEL code, and D3D waits at raised IRQL for exactly that.
++ *
++ * Bounded, like every other gate on this model: a raise that is never lowered
++ * (a thread that exits raised, a calling-convention fault upstream) must not
++ * stop every DPC for good. After DISPATCH_LOCK_WAIT_MS the waiter goes ahead
++ * without the lock, says so, and nobody waits on that same hold again.
++ *
++ * RECOMP_IRQL_LOCK=0 turns it off (the old behaviour); RECOMP_IRQL_LOCK=2
++ * also prints every contended acquisition. */
++#define DISPATCH_LOCK_WAIT_MS 2000
++static volatile LONG s_dl_owner;            /* thread id, 0 = free          */
++static volatile LONG s_dl_seq;              /* bumped on every acquisition  */
++static volatile LONG s_dl_stuck_seq = -1;   /* the hold that timed out      */
++static volatile LONG s_dl_contended, s_dl_timeouts, s_dl_taken, s_dl_overlaps;
++static volatile uint32_t s_dl_owner_ra;     /* guest return address of the holder */
++static XBOX_THREAD_LOCAL int t_dl_held;
++static int s_dl_mode = -1;
++
++static uint32_t irql_guest_ra(void)
++{
++    return g_esp ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
++}
++
++static void dispatch_lock_acquire(void)
++{
++    LONG me = (LONG)GetCurrentThreadId();
++
++    if (s_dl_mode < 0) {
++        const char *e = getenv("RECOMP_IRQL_LOCK");
++        s_dl_mode = e ? atoi(e) : 1;
++    }
++    if (!s_dl_mode)
++        return;
++    if (t_dl_held) {                        /* nested on the same thread */
++        t_dl_held++;
++        return;
++    }
++    if (InterlockedCompareExchange(&s_dl_owner, me, 0) != 0) {
++        LONG n = InterlockedIncrement(&s_dl_contended);
++        DWORD t0 = GetTickCount();
++        unsigned spins = 0;
++
++        if (n <= 8 || s_dl_mode > 1) {
++            fprintf(stderr, "  [IRQL] dispatch lock contended: tid %lu "
++                    "(guest ret %08X) waits for tid %ld (guest ret %08X)\n",
++                    (unsigned long)me, irql_guest_ra(),
++                    (long)s_dl_owner, s_dl_owner_ra);
++            fflush(stderr);
++        }
++        for (;;) {
++            if (InterlockedCompareExchange(&s_dl_owner, me, 0) == 0)
++                break;
++            if (s_dl_stuck_seq == s_dl_seq)
++                return;                     /* a hold already given up on */
++            if (++spins < 4000) {
++                YieldProcessor();
++                if ((spins & 63) == 0)
++                    SwitchToThread();
++            } else {
++                Sleep(1);
++                if (GetTickCount() - t0 > DISPATCH_LOCK_WAIT_MS) {
++                    LONG k = InterlockedIncrement(&s_dl_timeouts);
++                    s_dl_stuck_seq = s_dl_seq;
++                    if (k <= 8) {
++                        fprintf(stderr, "  [IRQL] dispatch lock held over "
++                                "%d ms by tid %ld (guest ret %08X); tid %lu "
++                                "goes ahead without it\n",
++                                DISPATCH_LOCK_WAIT_MS, (long)s_dl_owner,
++                                s_dl_owner_ra, (unsigned long)me);
++                        fflush(stderr);
++                    }
++                    return;
++                }
++            }
++        }
++    }
++    InterlockedIncrement(&s_dl_seq);
++    InterlockedIncrement(&s_dl_taken);
++    s_dl_owner_ra = irql_guest_ra();
++    t_dl_held = 1;
++}
++
++static void dispatch_lock_release(void)
++{
++    if (!t_dl_held)
++        return;
++    if (--t_dl_held == 0)
++        InterlockedExchange(&s_dl_owner, 0);
++}
++
++/* For a device model's ISR that must not run beside DISPATCH_LEVEL code. */
++void xbox_IrqlDispatchLock(void)   { dispatch_lock_acquire(); }
++void xbox_IrqlDispatchUnlock(void) { dispatch_lock_release(); }
++
++/* Around a blocking wait: a thread that sleeps while raised would hold every
++ * DPC out until the wait ends, and the wait is often for one of them.
++ * Returns what to hand back to xbox_IrqlDispatchResume. */
++int xbox_IrqlDispatchSuspend(void)
++{
++    int held = t_dl_held;
++    if (held) {
++        t_dl_held = 0;
++        InterlockedExchange(&s_dl_owner, 0);
++    }
++    return held;
++}
++
++void xbox_IrqlDispatchResume(int held)
++{
++    if (held) {
++        dispatch_lock_acquire();
++        if (t_dl_held)
++            t_dl_held = held;
++    }
++}
++
++void xbox_IrqlDispatchReport(void)
++{
++    fprintf(stderr, "  [IRQL] dispatch lock: %ld taken, %ld contended, "
++            "%ld timed out, %ld unprotected overlaps\n", (long)s_dl_taken,
++            (long)s_dl_contended, (long)s_dl_timeouts, (long)s_dl_overlaps);
++    fflush(stderr);
++}
++
++/* Set while xbox_IrqlEnterInterrupt delivers above DISPATCH_LEVEL: such an
++ * ISR preempts DISPATCH_LEVEL code on hardware and takes no lock. */
++static XBOX_THREAD_LOCAL int t_irql_no_lock;
++
+ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+ {
+     int was = (old_level >= DISPATCH_LEVEL);
+@@ -176,6 +321,31 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+     if (now == was)
+         return;
+ 
++    if (now && !t_irql_no_lock)
++        dispatch_lock_acquire();
++    else if (!now)
++        dispatch_lock_release();
++
++    /* Two threads at or above DISPATCH_LEVEL at once: cannot happen on the
++     * console. Counted whether or not the lock is on, so a run with
++     * RECOMP_IRQL_LOCK=0 shows what the lock prevents. Device-level ISRs are
++     * left out: they are allowed to overlap. */
++    if (now && !t_irql_no_lock && g_irql_raised_count > 0 && !t_dl_held) {
++        LONG n = InterlockedIncrement(&s_dl_overlaps);
++        if (n <= 8) {
++            int i;
++            fprintf(stderr, "  [IRQL] overlap %ld: tid %lu raises (guest ret "
++                    "%08X) while", (long)n,
++                    (unsigned long)GetCurrentThreadId(), irql_guest_ra());
++            for (i = 0; i < IRQL_HOLDERS; i++)
++                if (s_holders[i].tid)
++                    fprintf(stderr, " tid %ld is raised (guest ret %08X)",
++                            (long)s_holders[i].tid, s_holders[i].guest_ra);
++            fprintf(stderr, "\n");
++            fflush(stderr);
++        }
++    }
++
+     d = now ? InterlockedIncrement(&g_irql_raised_count)
+             : InterlockedDecrement(&g_irql_raised_count);
+     InterlockedIncrement(&s_transitions);
+@@ -213,7 +383,9 @@ int xbox_IrqlEnterInterrupt(int level)
+ {
+     int saved = (int)g_current_irql;
+     if (g_current_irql != (KIRQL)level) {
++        t_irql_no_lock = (level > DISPATCH_LEVEL);
+         irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
++        t_irql_no_lock = 0;
+         g_current_irql = (KIRQL)level;
+         irql_publish();
+     }
 diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
 index caf6390..6d79f72 100644
 --- a/src/kernel/kernel_path.c
@@ -412,10 +1723,10 @@ index caf6390..6d79f72 100644
          return TRUE;
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..52a6390
+index 0000000..0272041
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,2152 @@
+@@ -0,0 +1,2699 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -528,6 +1839,9 @@ index 0000000..52a6390
 +#define GL_DEPTH_ATTACHMENT             0x8D00
 +#define GL_FRAMEBUFFER                  0x8D40
 +#define GL_FUNC_ADD                     0x8006
++#define GL_READ_FRAMEBUFFER             0x8CA8
++#define GL_DRAW_FRAMEBUFFER             0x8CA9
++#define GL_SYNC_GPU_COMMANDS_COMPLETE   0x9117
 +
 +#define GLFUNCS(X) \
 +    X(GLuint, CreateShader, (GLenum)) \
@@ -572,7 +1886,11 @@ index 0000000..52a6390
 +    X(void,   GenQueries, (GLsizei, GLuint *)) \
 +    X(void,   BeginQuery, (GLenum, GLuint)) \
 +    X(void,   EndQuery, (GLenum)) \
-+    X(void,   GetQueryObjectuiv, (GLuint, GLenum, GLuint *))
++    X(void,   GetQueryObjectuiv, (GLuint, GLenum, GLuint *)) \
++    X(void,   BlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)) \
++    X(void *, FenceSync, (GLenum, GLbitfield)) \
++    X(GLenum, ClientWaitSync, (void *, GLbitfield, unsigned long long)) \
++    X(void,   DeleteSync, (void *))
 +
 +#define X(ret, name, args) static ret (APIENTRY *gl##name) args;
 +GLFUNCS(X)
@@ -1754,6 +3072,522 @@ index 0000000..52a6390
 +    return p;
 +}
 +
++/* ---- The game window ---------------------------------------------------- */
++/*
++ * RECOMP_WINDOW=1 (with the backend on). The picture goes from the surface
++ * the title presented to the screen without leaving the GPU:
++ *
++ *   executor thread, at the flip:  blit the surface into one of three shared
++ *       textures, fence, publish its index;
++ *   window thread:  wait for the fence, blit that texture into the window's
++ *       back buffer scaled to the largest 4:3 rectangle that fits, SwapBuffers
++ *       with swap interval 1.
++ *
++ * Two threads because the swap waits for the display: on the executor thread
++ * that wait would come out of a frame budget that is 80% spent in a level,
++ * and a frame that misses a vertical blank would cost a whole one. Three
++ * textures so the executor always has one that is neither published nor on
++ * screen. The window thread also owns the message queue, so the window stays
++ * responsive while the title is loading and not flipping.
++ *
++ * Closing the window ends the process: there is no title-side quit to ask.
++ *
++ * Keys and the mouse are recorded here and read by src/input (the keyboard
++ * stand-in for a controller); see xbox_GameWindowKeyDown / Mouse.
++ */
++#ifndef WM_INPUT
++#define WM_INPUT 0x00FF
++#endif
++
++static struct {
++    HWND   hwnd;
++    HDC    hdc;
++    HGLRC  rc;
++    HANDLE ready, have_rc, frame;
++    CRITICAL_SECTION cs;
++    GLuint tex[3];
++    int    tw[3], th[3];
++    int    ready_idx, ui_idx;           /* -1 = none */
++    void  *ready_sync;
++    volatile LONG on;                   /* presenting */
++    int    fullscreen;
++    WINDOWPLACEMENT placement;
++    int    captured;
++    volatile unsigned char key[256];
++    volatile LONG mdx, mdy, mbuttons;
++    volatile LONG presented, shown;
++    char   title[64];
++} s_win = { .ready_idx = -1, .ui_idx = -1 };
++
++static int win_wanted(void)
++{
++    const char *e = getenv("RECOMP_WINDOW");
++    return e && *e && *e != '0';
++}
++
++int xbox_GameWindowActive(void)
++{
++    return s_win.hwnd != NULL;
++}
++
++int xbox_GameWindowKeyDown(int vk)
++{
++    return (unsigned)vk < 256 && s_win.key[vk] != 0;
++}
++
++int xbox_GameWindowMouse(int *dx, int *dy, unsigned *buttons)
++{
++    *dx = (int)InterlockedExchange(&s_win.mdx, 0);
++    *dy = (int)InterlockedExchange(&s_win.mdy, 0);
++    *buttons = (unsigned)s_win.mbuttons;
++    return s_win.captured;
++}
++
++static void win_release_mouse(void)
++{
++    if (!s_win.captured)
++        return;
++    s_win.captured = 0;
++    InterlockedExchange(&s_win.mbuttons, 0);
++    ClipCursor(NULL);
++    ReleaseCapture();
++    ShowCursor(TRUE);
++}
++
++static void win_capture_mouse(HWND h)
++{
++    RECT r;
++    POINT a, b;
++
++    if (s_win.captured)
++        return;
++    GetClientRect(h, &r);
++    a.x = r.left; a.y = r.top; b.x = r.right; b.y = r.bottom;
++    ClientToScreen(h, &a);
++    ClientToScreen(h, &b);
++    r.left = a.x; r.top = a.y; r.right = b.x; r.bottom = b.y;
++    ClipCursor(&r);
++    SetCapture(h);
++    ShowCursor(FALSE);
++    InterlockedExchange(&s_win.mdx, 0);
++    InterlockedExchange(&s_win.mdy, 0);
++    s_win.captured = 1;
++}
++
++static void win_toggle_fullscreen(HWND h)
++{
++    int recapture = s_win.captured;
++
++    win_release_mouse();
++    if (!s_win.fullscreen) {
++        MONITORINFO mi;
++        mi.cbSize = sizeof mi;
++        s_win.placement.length = sizeof s_win.placement;
++        GetWindowPlacement(h, &s_win.placement);
++        if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
++            return;
++        SetWindowLongPtrA(h, GWL_STYLE, WS_POPUP | WS_VISIBLE);
++        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
++                     mi.rcMonitor.right - mi.rcMonitor.left,
++                     mi.rcMonitor.bottom - mi.rcMonitor.top,
++                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
++        s_win.fullscreen = 1;
++    } else {
++        SetWindowLongPtrA(h, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
++        SetWindowPlacement(h, &s_win.placement);
++        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
++                     | SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
++        s_win.fullscreen = 0;
++    }
++    if (recapture)
++        win_capture_mouse(h);
++}
++
++static volatile LONG s_win_redraw;
++
++static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l)
++{
++    switch (m) {
++    case WM_CLOSE:
++        /* No title-side quit exists, and unwinding a dozen threads that are
++         * inside the driver and the guest is not worth attempting. */
++        fprintf(stderr, "[WIN] window closed; exiting\n");
++        fflush(NULL);
++        TerminateProcess(GetCurrentProcess(), 0);
++        return 0;
++
++    case WM_KEYDOWN:
++    case WM_SYSKEYDOWN:
++        if (w == VK_F11 || (w == VK_RETURN && (l & (1L << 29)))) {
++            if (!(l & (1L << 30)))              /* not an auto-repeat */
++                win_toggle_fullscreen(h);
++            return 0;
++        }
++        if (w == VK_F1) {
++            win_release_mouse();
++            return 0;
++        }
++        if (w == VK_F4 && m == WM_SYSKEYDOWN)
++            return DefWindowProcA(h, m, w, l);  /* Alt+F4 */
++        if ((unsigned)w < 256)
++            s_win.key[w] = 1;
++        return 0;
++
++    case WM_KEYUP:
++    case WM_SYSKEYUP:
++        if ((unsigned)w < 256)
++            s_win.key[w] = 0;
++        return 0;
++
++    case WM_SYSCOMMAND:
++        if ((w & 0xFFF0) == SC_KEYMENU)         /* Alt must not open the menu */
++            return 0;
++        break;
++
++    case WM_KILLFOCUS:
++        memset((void *)s_win.key, 0, sizeof s_win.key);
++        win_release_mouse();
++        return 0;
++
++    case WM_LBUTTONDOWN:
++        if (!s_win.captured) {
++            win_capture_mouse(h);               /* this click only captures */
++            return 0;
++        }
++        InterlockedOr(&s_win.mbuttons, 1);
++        return 0;
++    case WM_LBUTTONUP:
++        InterlockedAnd(&s_win.mbuttons, ~1L);
++        return 0;
++    case WM_RBUTTONDOWN:
++        if (s_win.captured) InterlockedOr(&s_win.mbuttons, 2);
++        return 0;
++    case WM_RBUTTONUP:
++        InterlockedAnd(&s_win.mbuttons, ~2L);
++        return 0;
++    case WM_MBUTTONDOWN:
++        if (s_win.captured) InterlockedOr(&s_win.mbuttons, 4);
++        return 0;
++    case WM_MBUTTONUP:
++        InterlockedAnd(&s_win.mbuttons, ~4L);
++        return 0;
++
++    case WM_INPUT:
++        if (s_win.captured) {
++            RAWINPUT ri;
++            UINT sz = sizeof ri;
++            if (GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &sz,
++                                sizeof(RAWINPUTHEADER)) != (UINT)-1
++                && ri.header.dwType == RIM_TYPEMOUSE
++                && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
++                InterlockedExchangeAdd(&s_win.mdx, ri.data.mouse.lLastX);
++                InterlockedExchangeAdd(&s_win.mdy, ri.data.mouse.lLastY);
++            }
++        }
++        break;
++
++    case WM_SETCURSOR:
++        if (s_win.captured && LOWORD(l) == HTCLIENT) {
++            SetCursor(NULL);
++            return TRUE;
++        }
++        break;
++
++    case WM_ERASEBKGND:
++        return 1;
++    case WM_PAINT:
++        ValidateRect(h, NULL);
++        InterlockedExchange(&s_win_redraw, 1);
++        return 0;
++    case WM_SIZE:
++        InterlockedExchange(&s_win_redraw, 1);
++        return 0;
++    }
++    return DefWindowProcA(h, m, w, l);
++}
++
++/* The largest 4:3 rectangle in the client area, into the back buffer. Guest
++ * row 0 is texture row 0, and GL's window origin is the bottom left, so the
++ * destination runs top to bottom. */
++static void win_draw(GLuint fbo)
++{
++    RECT r;
++    int cw, ch, dw, dh, x0, y0, idx = s_win.ui_idx;
++
++    GetClientRect(s_win.hwnd, &r);
++    cw = r.right - r.left;
++    ch = r.bottom - r.top;
++    if (cw <= 0 || ch <= 0)
++        return;                                 /* minimised */
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++    glDisable(GL_SCISSOR_TEST);
++    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++    glClear(GL_COLOR_BUFFER_BIT);
++    if (idx >= 0 && s_win.tex[idx]) {
++        if (cw * 3 >= ch * 4) { dh = ch; dw = ch * 4 / 3; }
++        else                  { dw = cw; dh = cw * 3 / 4; }
++        x0 = (cw - dw) / 2;
++        y0 = (ch - dh) / 2;
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
++        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                               GL_TEXTURE_2D, s_win.tex[idx], 0);
++        glBlitFramebuffer(0, 0, s_win.tw[idx], s_win.th[idx],
++                          x0, y0 + dh, x0 + dw, y0,
++                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
++    }
++    /* RECOMP_WINDOW_SHOT=<file>: while <file>.req exists, write what is
++     * about to be swapped (the back buffer, client size) to <file> as a BMP
++     * and remove the request. */
++    {
++        static const char *shot = (const char *)-1;
++        if (shot == (const char *)-1)
++            shot = getenv("RECOMP_WINDOW_SHOT");
++        if (shot) {
++            char req[600];
++            FILE *f;
++            snprintf(req, sizeof req, "%s.req", shot);
++            f = fopen(req, "rb");
++            if (f) {
++                uint32_t row = ((uint32_t)cw * 3u + 3u) & ~3u;
++                uint32_t img = row * (uint32_t)ch, total = 54u + img;
++                uint8_t hdr[54], *px = (uint8_t *)malloc(img);
++                fclose(f);
++                remove(req);
++                f = px ? fopen(shot, "wb") : NULL;
++                if (f) {
++                    memset(hdr, 0, sizeof hdr);
++                    hdr[0] = 'B'; hdr[1] = 'M';
++                    memcpy(hdr + 2, &total, 4);
++                    hdr[10] = 54; hdr[14] = 40;
++                    memcpy(hdr + 18, &cw, 4);
++                    memcpy(hdr + 22, &ch, 4);
++                    hdr[26] = 1; hdr[28] = 24;
++                    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++                    glReadBuffer(GL_BACK);
++                    glPixelStorei(GL_PACK_ALIGNMENT, 4);
++                    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++                    glReadPixels(0, 0, cw, ch, 0x80E0 /* GL_BGR */,
++                                 GL_UNSIGNED_BYTE, px);
++                    fwrite(hdr, 1, sizeof hdr, f);
++                    fwrite(px, 1, img, f);
++                    fclose(f);
++                    fprintf(stderr, "[WIN] wrote %s (%dx%d)\n", shot, cw, ch);
++                }
++                free(px);
++            }
++        }
++    }
++    SwapBuffers(s_win.hdc);
++    InterlockedIncrement(&s_win.shown);
++}
++
++static DWORD WINAPI win_thread(LPVOID arg)
++{
++    const PIXELFORMATDESCRIPTOR *pfd = (const PIXELFORMATDESCRIPTOR *)arg;
++    WNDCLASSA wc;
++    RECT r, work;
++    DWORD style = WS_OVERLAPPEDWINDOW;
++    GLuint fbo = 0;
++    int pf, cw = 1280, ch = 960, have_gl = 0;
++    const char *t = getenv("RECOMP_WINDOW_TITLE");
++
++    /* Real pixels, not a bitmap the desktop stretches. */
++    {
++        HMODULE u = GetModuleHandleA("user32.dll");
++        typedef BOOL (WINAPI *SetCtx)(HANDLE);
++        SetCtx f = u ? (SetCtx)(void *)GetProcAddress(u, "SetProcessDpiAwarenessContext") : NULL;
++        if (f)
++            f((HANDLE)(intptr_t)-4);            /* per monitor, version 2 */
++    }
++    memset(&wc, 0, sizeof wc);
++    wc.style = CS_OWNDC;
++    wc.lpfnWndProc = win_proc;
++    wc.hInstance = GetModuleHandleA(NULL);
++    wc.hCursor = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
++    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
++    wc.lpszClassName = "xboxrecomp_game_window";
++    RegisterClassA(&wc);
++
++    /* Twice the title's 640x480 if the desktop has room, else what fits. */
++    SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
++    for (;;) {
++        r.left = 0; r.top = 0; r.right = cw; r.bottom = ch;
++        AdjustWindowRect(&r, style, FALSE);
++        if ((r.right - r.left <= work.right - work.left
++             && r.bottom - r.top <= work.bottom - work.top) || cw <= 640)
++            break;
++        cw -= 320; ch -= 240;
++    }
++    snprintf(s_win.title, sizeof s_win.title, "%s", t && *t ? t : "Xbox Recomp");
++    s_win.hwnd = CreateWindowExA(0, wc.lpszClassName, s_win.title, style,
++        work.left + ((work.right - work.left) - (r.right - r.left)) / 2,
++        work.top + ((work.bottom - work.top) - (r.bottom - r.top)) / 2,
++        r.right - r.left, r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
++    if (s_win.hwnd) {
++        s_win.hdc = GetDC(s_win.hwnd);
++        pf = ChoosePixelFormat(s_win.hdc, pfd);
++        if (!pf || !SetPixelFormat(s_win.hdc, pf, pfd)) {
++            DestroyWindow(s_win.hwnd);
++            s_win.hwnd = NULL;
++        }
++    }
++    if (s_win.hwnd) {
++        RAWINPUTDEVICE rid;
++        rid.usUsagePage = 1; rid.usUsage = 2;   /* generic desktop, mouse */
++        rid.dwFlags = 0; rid.hwndTarget = s_win.hwnd;
++        RegisterRawInputDevices(&rid, 1, sizeof rid);
++        ShowWindow(s_win.hwnd, SW_SHOW);
++        SetForegroundWindow(s_win.hwnd);
++    }
++    SetEvent(s_win.ready);
++    if (!s_win.hwnd)
++        return 0;
++
++    for (;;) {
++        MSG msg;
++        HANDLE hs[2];
++        DWORD w;
++        int fresh = 0;
++
++        hs[0] = s_win.frame;
++        hs[1] = s_win.have_rc;
++        w = MsgWaitForMultipleObjects(have_gl ? 1 : 2, hs, FALSE, 100,
++                                      QS_ALLINPUT);
++        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
++            TranslateMessage(&msg);
++            DispatchMessageA(&msg);
++        }
++        if (!have_gl) {
++            typedef BOOL (WINAPI *SwapInterval)(int);
++            SwapInterval si;
++            if (w != WAIT_OBJECT_0 + 1 && WaitForSingleObject(s_win.have_rc, 0) != WAIT_OBJECT_0)
++                continue;
++            if (!s_win.rc || !wglMakeCurrent(s_win.hdc, s_win.rc)) {
++                fprintf(stderr, "[WIN] no shared context for the window (error %lu);"
++                                " the window stays black\n", GetLastError());
++                s_win.rc = NULL;
++                InterlockedExchange(&s_win.on, 0);
++                have_gl = -1;
++                continue;
++            }
++            si = (SwapInterval)(void *)wglGetProcAddress("wglSwapIntervalEXT");
++            if (si)
++                si(1);
++            glGenFramebuffers(1, &fbo);
++            glDisable(GL_DITHER);
++            have_gl = 1;
++            InterlockedExchange(&s_win.on, 1);
++            fprintf(stderr, "[WIN] game window open, %s\n",
++                    si ? "vertical sync on" : "no swap-interval control");
++            fflush(stderr);
++        }
++        if (have_gl <= 0)
++            continue;
++
++        {
++            void *sync = NULL;
++            EnterCriticalSection(&s_win.cs);
++            if (s_win.ready_idx >= 0) {
++                s_win.ui_idx = s_win.ready_idx;
++                s_win.ready_idx = -1;
++                sync = s_win.ready_sync;
++                s_win.ready_sync = NULL;
++                fresh = 1;
++            }
++            LeaveCriticalSection(&s_win.cs);
++            if (sync) {
++                glClientWaitSync(sync, 0, 100000000ull);    /* 100 ms */
++                glDeleteSync(sync);
++            }
++        }
++        if (fresh || InterlockedExchange(&s_win_redraw, 0))
++            win_draw(fbo);
++    }
++}
++
++/* Executor thread: start the window thread and wait for the window. */
++static int win_start(const PIXELFORMATDESCRIPTOR *pfd)
++{
++    static PIXELFORMATDESCRIPTOR keep;
++    HANDLE th;
++
++    keep = *pfd;
++    InitializeCriticalSection(&s_win.cs);
++    s_win.ready   = CreateEventA(NULL, TRUE, FALSE, NULL);
++    s_win.have_rc = CreateEventA(NULL, TRUE, FALSE, NULL);
++    s_win.frame   = CreateEventA(NULL, FALSE, FALSE, NULL);
++    th = CreateThread(NULL, 0, win_thread, &keep, 0, NULL);
++    if (!th)
++        return 0;
++    CloseHandle(th);
++    WaitForSingleObject(s_win.ready, 10000);
++    if (!s_win.hwnd)
++        fprintf(stderr, "[WIN] could not create the game window\n");
++    return s_win.hwnd != NULL;
++}
++
++static void win_give_context(HGLRC rc)
++{
++    s_win.rc = rc;
++    SetEvent(s_win.have_rc);
++}
++
++void nv2a_gl_present(uint32_t color_base)
++{
++    GlSurface *s;
++    GLuint rf, df;
++    void *sync, *stale = NULL;
++    int w;
++
++    if (s_state <= 0 || !s_win.on)
++        return;
++    s = surf_find(color_base);
++    if (!s)
++        return;
++    EnterCriticalSection(&s_win.cs);
++    for (w = 0; w < 3; w++)
++        if (w != s_win.ready_idx && w != s_win.ui_idx)
++            break;
++    LeaveCriticalSection(&s_win.cs);
++
++    if (!s_win.tex[w] || s_win.tw[w] != s->w || s_win.th[w] != s->h) {
++        if (s_win.tex[w]) {
++            fbo_forget(s_win.tex[w]);
++            glDeleteTextures(1, &s_win.tex[w]);
++        }
++        glGenTextures(1, &s_win.tex[w]);
++        bind_scratch(GL_TEXTURE_2D, s_win.tex[w]);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s->w, s->h, 0, GL_BGRA,
++                     GL_UNSIGNED_BYTE, NULL);
++        tex_params(GL_TEXTURE_2D);
++        s_win.tw[w] = s->w;
++        s_win.th[w] = s->h;
++    }
++    /* Twice: making the second may have emptied the cache holding the first. */
++    df = fbo_for(s_win.tex[w], 0);
++    rf = fbo_for(s->tex, 0);
++    df = fbo_for(s_win.tex[w], 0);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, rf);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, df);
++    glDisable(GL_SCISSOR_TEST);
++    glBlitFramebuffer(0, 0, s->w, s->h, 0, 0, s->w, s->h, GL_COLOR_BUFFER_BIT,
++                      GL_NEAREST);
++    sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++    glFlush();
++
++    EnterCriticalSection(&s_win.cs);
++    if (s_win.ready_idx >= 0)
++        stale = s_win.ready_sync;       /* a frame the window never took */
++    s_win.ready_idx = w;
++    s_win.ready_sync = sync;
++    LeaveCriticalSection(&s_win.cs);
++    if (stale)
++        glDeleteSync(stale);
++    InterlockedIncrement(&s_win.presented);
++    SetEvent(s_win.frame);
++    gl_check("present");
++}
++
 +/* ---- Context ------------------------------------------------------------ */
 +
 +static int gl_init(void)
@@ -1803,6 +3637,22 @@ index 0000000..52a6390
 +        wglDeleteContext(rc);
 +        if (!wglMakeCurrent(s_hdc, rc2))
 +            return 0;
++        rc = rc2;
++    }
++    /* The game window: its own thread and its own context, sharing this
++     * one's textures. Created while neither context is current anywhere,
++     * which is the one arrangement every driver accepts for sharing. */
++    if (win_wanted() && create && win_start(&pfd)) {
++        HGLRC wrc;
++        wglMakeCurrent(NULL, NULL);
++        wrc = create(s_win.hdc, rc, attribs);
++        if (!wglMakeCurrent(s_hdc, rc))
++            return 0;
++        win_give_context(wrc);
++        if (!wrc)
++            _putenv_s("RECOMP_FB_WINDOW", "1");     /* the read-back window */
++    } else if (win_wanted()) {
++        _putenv_s("RECOMP_FB_WINDOW", "1");
 +    }
 +
 +#define X(ret, name, args) \
@@ -1894,6 +3744,9 @@ index 0000000..52a6390
 +                fprintf(stderr, "  [GL] no usable OpenGL 3.3 context; staying on"
 +                                " the software rasteriser\n");
 +        }
++        /* No backend, no direct window: the read-back one still works. */
++        if (s_state < 0 && win_wanted() && !s_win.hwnd)
++            _putenv_s("RECOMP_FB_WINDOW", "1");
 +    }
 +    return s_state > 0;
 +}
@@ -2566,14 +4419,19 @@ index 0000000..52a6390
 +void nv2a_gl_tex_touched(int stage) { (void)stage; }
 +void nv2a_gl_flip(void) {}
 +void nv2a_gl_report(void) {}
++void nv2a_gl_present(uint32_t color_base) { (void)color_base; }
++int  xbox_GameWindowActive(void) { return 0; }
++int  xbox_GameWindowKeyDown(int vk) { (void)vk; return 0; }
++int  xbox_GameWindowMouse(int *dx, int *dy, unsigned *buttons)
++{ *dx = 0; *dy = 0; *buttons = 0; return 0; }
 +
 +#endif
 diff --git a/src/kernel/nv2a_gl.h b/src/kernel/nv2a_gl.h
 new file mode 100644
-index 0000000..cd79f5a
+index 0000000..3e21c69
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,141 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor (nv2a_pb_exec.c).
 + *
@@ -2693,6 +4551,20 @@ index 0000000..cd79f5a
 +/* One line of counters for the periodic report. */
 +void nv2a_gl_report(void);
 +
++/* The game window (RECOMP_WINDOW=1; needs the backend). The surface at
++ * `color_base` was presented: hand it to the window, which scales it into its
++ * own swap chain at 4:3 on its own thread. Does nothing with no window. */
++void nv2a_gl_present(uint32_t color_base);
++
++/* What the window's keyboard and mouse hold, for the pad stand-in in
++ * src/input. KeyDown takes a virtual-key code. Mouse returns 0 unless the
++ * pointer is captured (click in the window; F1 or losing focus releases it);
++ * *dx/*dy are the counts moved since the last call, *buttons bit 0 left,
++ * bit 1 right, bit 2 middle. */
++int  xbox_GameWindowActive(void);
++int  xbox_GameWindowKeyDown(int vk);
++int  xbox_GameWindowMouse(int *dx, int *dy, unsigned *buttons);
++
 +/* Supplied by the executor: its own texel decoder and layout helpers, so
 + * there is one implementation of every texture format. */
 +int      nv2a_exec_sample_tex(const Nv2aTexture *t, uint32_t face_offset,
@@ -2702,7 +4574,7 @@ index 0000000..cd79f5a
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..cef23ab 100644
+index c65632c..10f3a8b 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -37,6 +37,7 @@
@@ -3629,7 +5501,7 @@ index c65632c..cef23ab 100644
          break;
  
      case NV097_SET_BEGIN_END:
-@@ -3119,6 +3772,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3119,6 +3772,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -3643,6 +5515,8 @@ index c65632c..cef23ab 100644
 +                }
 +                if (want)
 +                    nv2a_gl_download(dma_resolve(done));
++                /* The game window takes the surface straight off the GPU. */
++                nv2a_gl_present(dma_resolve(done));
 +                if (nv2a_gl_verify())
 +                    nv2a_gl_verify_compare(dma_resolve(done), s_gpu.drawn_x,
 +                                           s_gpu.drawn_y, s_gpu.drawn_w,
@@ -3651,7 +5525,7 @@ index c65632c..cef23ab 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-@@ -3146,6 +3814,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3146,6 +3816,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -3660,7 +5534,7 @@ index c65632c..cef23ab 100644
  
          if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
              static unsigned n;
-@@ -3181,6 +3851,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3181,6 +3853,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
      case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
      case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
@@ -3685,7 +5559,7 @@ index c65632c..cef23ab 100644
  
      default:
          if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
-@@ -3449,6 +4137,20 @@ void nv2a_pb_exec_report(void)
+@@ -3449,6 +4139,20 @@ void nv2a_pb_exec_report(void)
      /* Drawn and skipped separately: "nothing appeared" and "every batch needed
       * a vertex program we do not run" look identical on screen, and only one
       * of them means the rasteriser is broken. */
@@ -4834,6 +6708,64 @@ index 72d5131..8cc7bb8 100644
  uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  {
      uint32_t result = 0;
+diff --git a/src/usb/ohci.c b/src/usb/ohci.c
+index 641a94d..4d81468 100644
+--- a/src/usb/ohci.c
++++ b/src/usb/ohci.c
+@@ -830,6 +830,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
+                 }
+             }
+             fprintf(stderr, "\n");
++            xbox_IrqlDispatchReport();
+             /* A raised IRQL that never drops holds every interrupt off until
+              * the forced-delivery timeout, which looks like a slow pad. Name
+              * who is holding it. */
+@@ -896,7 +897,12 @@ static int ohci_call_isr(OhciController *hc)
+     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
+     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
+ 
++    /* Under the dispatch lock: the caller's "is anyone raised" test is a
++     * sample, and a guest thread can raise between it and this call. The
++     * routine queues a DPC and edits the same driver state the raise guards. */
++    xbox_IrqlDispatchLock();
+     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
++    xbox_IrqlDispatchUnlock();
+ 
+     xbox_worker_stack_free(slot);
+     return (int)(g_eax & 1u);
+diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
+index bd00f3f..da7f020 100644
+--- a/src/usb/usb_gamepad.c
++++ b/src/usb/usb_gamepad.c
+@@ -628,5 +628,28 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
+     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+     pad_script_apply(pad, out);
++
++    /* RECOMP_INPUT_DIAG=2: the report itself, each time it changes -- what
++     * the title is actually handed for a key, a mouse movement or a pad. */
++    {
++        static int diag2 = -1;
++        static uint8_t last[20];
++        static unsigned shown;
++        if (diag2 < 0) {
++            const char *e = getenv("RECOMP_INPUT_DIAG");
++            diag2 = e && atoi(e) >= 2;
++        }
++        if (diag2 && pad == 0 && memcmp(last, out, 20) != 0 && shown < 2000) {
++            int16_t ax[4];
++            memcpy(last, out, 20);
++            memcpy(ax, &out[12], sizeof ax);
++            shown++;
++            fprintf(stderr, "  [REPORT] dig %02X A %3u B %3u X %3u Y %3u blk %3u "
++                    "wht %3u LT %3u RT %3u | L %6d %6d R %6d %6d\n", out[2],
++                    out[4], out[5], out[6], out[7], out[8], out[9], out[10],
++                    out[11], ax[0], ax[1], ax[2], ax[3]);
++            fflush(stderr);
++        }
++    }
+     return 20;
+ }
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
 index 8e9325e..6fc89a1 100644
 --- a/templates/runtime/recomp_types.h
