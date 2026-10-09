@@ -1,5 +1,5 @@
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..94bdce9 100644
+index c65632c..aac3212 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -679,12 +679,44 @@ static void clear_surface(uint32_t param)
@@ -58,7 +58,7 @@ index c65632c..94bdce9 100644
                  p[x] = v;
          }
      }
-@@ -2855,8 +2887,117 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2855,8 +2887,152 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          record_tex_reg(method, param);
  }
  
@@ -166,13 +166,48 @@ index c65632c..94bdce9 100644
  void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  {
 +    /* NV097_NO_OPERATION with a non-zero parameter: see nv2a_swi_post. */
-+    if (method == 0x0100u && param != 0) {
++    /* The last methods seen, for the moment one of them is nonsense. A clip
++     * 44925 pixels wide says the stream was mis-read some way back; the
++     * methods before it say where. */
++    {
++        static struct { uint8_t subch; uint16_t method; uint32_t param; } ring[48];
++        static unsigned ring_n, dumped;
++        ring[ring_n % 48].subch = (uint8_t)subch;
++        ring[ring_n % 48].method = (uint16_t)method;
++        ring[ring_n % 48].param = param;
++        ring_n++;
++        if (subch == 0 && (method == 0x0200u || method == 0x0204u)
++                && ((param >> 16) & 0xFFFFu) > 4096u && dumped < 2) {
++            unsigned i, n = ring_n < 48 ? ring_n : 48;
++            dumped++;
++            fprintf(stderr, "  [GPU] implausible clip %04X=%08X; the %u methods before it:" "\n",
++                    method, param, n - 1);
++            for (i = ring_n - n; i < ring_n; i++)
++                fprintf(stderr, "  [GPU]    %u:%04X = %08X" "\n", ring[i % 48].subch,
++                        ring[i % 48].method, ring[i % 48].param);
++            {
++                extern uint32_t g_nv2a_pb_cur_va, g_nv2a_pb_seg_va;
++                const uint8_t *m8 = (const uint8_t *)xbox_GetMemoryOffset();
++                uint32_t a, lo = g_nv2a_pb_cur_va - 0xC0u;
++                if (lo < g_nv2a_pb_seg_va) lo = g_nv2a_pb_seg_va;
++                fprintf(stderr, "  [GPU]  raw words, segment start 0x%08X, reading at 0x%08X:" "\n",
++                        g_nv2a_pb_seg_va, g_nv2a_pb_cur_va);
++                for (a = lo; a < g_nv2a_pb_cur_va + 0x20u; a += 4)
++                    fprintf(stderr, "  [GPU]  raw %08X: %08X" "\n", a,
++                            *(const uint32_t *)(m8 + a));
++            }
++            fflush(stderr);
++        }
++    }
++    /* Fence methods belong to the 3D class, which is on subchannel 0. The
++     * same numbers on another subchannel are another object's methods. */
++    if (subch == 0 && method == 0x0100u && param != 0) {
 +        nv2a_swi_post(param);
 +        return;
 +    }
-+    if (method == 0x01A4u) { s_sem_handle = param; return; }   /* SET_CONTEXT_DMA_SEMAPHORE */
-+    if (method == 0x1D6Cu) { s_sem_offset = param; return; }   /* SET_SEMAPHORE_OFFSET */
-+    if (method == 0x1D70u) { semaphore_release(param); return; }
++    if (subch == 0 && method == 0x01A4u) { s_sem_handle = param; return; }   /* SET_CONTEXT_DMA_SEMAPHORE */
++    if (subch == 0 && method == 0x1D6Cu) { s_sem_offset = param; return; }   /* SET_SEMAPHORE_OFFSET */
++    if (subch == 0 && method == 0x1D70u) { semaphore_release(param); return; }
      static int inited;
      if (!inited) {
          inited = 1;

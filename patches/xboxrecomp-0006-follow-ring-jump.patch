@@ -1,8 +1,8 @@
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index 65bbedb..a158d14 100644
+index 65bbedb..79987e1 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
-@@ -163,6 +163,17 @@ void nv2a_pb_scan_report(void)
+@@ -163,9 +163,23 @@ void nv2a_pb_scan_report(void)
   * The NV2A has one level of subroutine, so a CALL inside a call is not
   * followed. Addresses are physical, like PUT's, and reach guest memory the
   * same way: through the contiguous window. */
@@ -17,10 +17,16 @@ index 65bbedb..a158d14 100644
 +    return t;
 +}
 +
++uint32_t g_nv2a_pb_cur_va, g_nv2a_pb_seg_va;
++
  static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                          uint32_t *jumps, uint32_t *unknown)
  {
-@@ -178,8 +189,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
++    const uint32_t seg_start = va;
+     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+     uint32_t words = 0;
+ 
+@@ -178,8 +192,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
              uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                               : (w & 0x1FFFFFFCu);
              (*jumps)++;
@@ -36,6 +42,15 @@ index 65bbedb..a158d14 100644
              va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
              end_va = va + 0x400000u;
              continue;
+@@ -205,6 +224,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+ 
+             for (uint32_t i = 0; i < count && va < end_va; i++) {
+                 uint32_t m = noninc ? method : method + i * 4;
++                g_nv2a_pb_cur_va = va;       /* for diagnostics in the executor */
++                g_nv2a_pb_seg_va = seg_start;
+                 note(subch, m);
+                 /* Same walk, two consumers: the survey counts, the executor
+                  * acts. Keeping them on one decode means they can never
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
 index 72d5131..7c0c56c 100644
 --- a/src/kernel/xbox_memory_layout.c
