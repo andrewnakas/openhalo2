@@ -1,5 +1,5 @@
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index e7ab880..16b5658 100644
+index e7ab880..371188b 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
 @@ -127,6 +127,11 @@ def _fmt_reg(name, size=4):
@@ -23,3 +23,34 @@ index e7ab880..16b5658 100644
  
      SET_MAP = {
          "al": f"SET_LO8(eax, {value_expr})",
+@@ -1677,6 +1684,30 @@ class Lifter:
+         # The runtime scales the host's counter to the console's clock rate
+         # rather than returning the host TSC, so the guest's own division by
+         # its hardcoded frequency yields real seconds.
++        # ── CPU identification and the flags register ──
++        # All three used to fall to RECOMP_UNIMPL, and the damage was not just
++        # a missing answer. MSVC-era feature checks are
++        #     pushfd; pop eax; ...; push eax; popfd; pushfd; pop eax; push ebx; popfd
++        # so with pushfd/popfd as no-ops the ordinary pops read words nobody
++        # pushed and the pushes were never popped: the test compared stack
++        # garbage and the function returned with a callee-saved register
++        # replaced. Then cpuid left edx as it was, so "is MMX there" was
++        # answered by whatever edx held. Bink read that as "no MMX", never
++        # installed its row converters, and called null pointers every scanline.
++        #
++        # pushfd/popfd carry one flags word (g_recomp_eflags) so the ID-bit
++        # toggle that asks "does cpuid exist" gets a yes. The arithmetic flags
++        # in it are not the lifter's lazily tracked ones: a popfd is not a way
++        # to hand CF or ZF to a following jcc here.
++        if m == "cpuid":
++            return ["recomp_cpuid(&eax, &ebx, &ecx, &edx); /* cpuid */"]
++        if m in ("pushfd", "pushf"):
++            return ["PUSH32(esp, g_recomp_eflags); /* pushfd */"]
++        if m in ("popfd", "popf"):
++            return ["{ uint32_t _fl; POP32(esp, _fl);"
++                    " g_recomp_eflags = (_fl & 0x00240DD5u) | 0x00000202u; }"
++                    " /* popfd */"]
++
+         if m == "rdtsc":
+             return [
+                 "{ uint64_t _tsc = xbox_ReadTimeStampCounter();",

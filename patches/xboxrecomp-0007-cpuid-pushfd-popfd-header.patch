@@ -1,0 +1,28 @@
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 8e9325e..406b38c 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -1431,6 +1431,23 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
+  * state, and with RECOMP_UNIMPL_TRAP=1 it stops at the first one. The lifter
+  * keeps the comment beside the call so `grep TODO:` over a gen tree still
+  * enumerates every site whether or not it is ever reached. */
++/* pushfd/popfd state; see the lifter's note on cpuid. */
++extern RECOMP_TLS uint32_t g_recomp_eflags;
++
++/* cpuid as the console answers it: an Intel Pentium III (Coppermine core,
++ * family 6 model 8), which has MMX and SSE and nothing later. Titles and the
++ * libraries linked into them pick their code paths from this -- Bink installs
++ * no colour converters at all without the MMX bit. */
++static inline void recomp_cpuid(uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d)
++{
++    switch (*a) {
++    case 0:  *a = 2; *b = 0x756E6547u; *d = 0x49656E69u; *c = 0x6C65746Eu; break; /* "GenuineIntel" */
++    case 1:  *a = 0x0000068Au; *b = 0; *c = 0; *d = 0x0383F9FFu; break;
++    case 2:  *a = 0x03020101u; *b = 0; *c = 0; *d = 0x0C040841u; break;
++    default: *a = 0; *b = 0; *c = 0; *d = 0; break;
++    }
++}
++
+ void recomp_unimpl(const char *text, uint32_t va);
+ #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
+ 

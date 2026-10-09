@@ -1,5 +1,5 @@
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..aac3212 100644
+index c65632c..a1c5393 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -679,12 +679,44 @@ static void clear_surface(uint32_t param)
@@ -58,7 +58,7 @@ index c65632c..aac3212 100644
                  p[x] = v;
          }
      }
-@@ -2855,8 +2887,152 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2855,8 +2887,174 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          record_tex_reg(method, param);
  }
  
@@ -93,6 +93,28 @@ index c65632c..aac3212 100644
 +    }
 +    s_swi_param[t % NV2A_SWI_QUEUE] = param;
 +    s_swi_tail = t + 1;
++
++    /* The hardware raises this interrupt when it reaches the method, and the
++     * FIFO does not move on until the title's service routine has run. Here
++     * the handler runs on the timer thread, so the executor has to wait for
++     * it: carrying on let the rest of the segment execute, GET advance and the
++     * fences be written while the interrupt was still queued. D3D then saw an
++     * idle GPU, tore its device down, and the late handler ran against freed
++     * state -- a wild write that killed Halo 2 at its device re-creation.
++     *
++     * Bounded, because a handler that itself waits on the GPU would otherwise
++     * wait on this thread forever. */
++    {
++        int waited = 0;
++        while (s_swi_head != s_swi_tail && waited++ < 200)
++            Sleep(1);
++        if (s_swi_head != s_swi_tail) {
++            static unsigned said;
++            if (said++ < 4)
++                fprintf(stderr, "  [NV2A] software interrupt 0x%08X not serviced within 200 ms;"
++                                " continuing" "\n", param);
++        }
++    }
 +}
 +
 +/* The fence itself.

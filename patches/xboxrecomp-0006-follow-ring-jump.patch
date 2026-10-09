@@ -52,7 +52,7 @@ index 65bbedb..79987e1 100644
                  /* Same walk, two consumers: the survey counts, the executor
                   * acts. Keeping them on one decode means they can never
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..7c0c56c 100644
+index 72d5131..2b309fe 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -966,18 +966,57 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -122,7 +122,18 @@ index 72d5131..7c0c56c 100644
                          if (getenv("RECOMP_PB_WRAP_TRACE")) {
                              static unsigned wraps;
                              if (wraps++ < 8)
-@@ -3094,6 +3133,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+@@ -1176,6 +1215,10 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+ /* SEH frame pointer bridge (see recomp_types.h for explanation) */
+ RECOMP_TLS uint32_t g_seh_ebp = 0;
+ RECOMP_TLS double g_fp_stack[8];
++
++/* The flags word pushfd reads and popfd writes. Reserved bit 1 and IF set,
++ * as a title sees them on the console. */
++RECOMP_TLS uint32_t g_recomp_eflags = 0x00000202u;
+ RECOMP_TLS int g_fp_top = 0;
+ 
+ /* Set once at startup. The generated code reads it at the ret of every
+@@ -3094,6 +3137,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
      g_contig_block_count++;
  }
  
