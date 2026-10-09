@@ -1,5 +1,5 @@
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
-index 42135e0..c7b5d83 100644
+index 42135e0..9b87ad8 100644
 --- a/src/kernel/kernel_file.c
 +++ b/src/kernel/kernel_file.c
 @@ -503,6 +503,37 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
@@ -49,6 +49,34 @@ index 42135e0..c7b5d83 100644
                  ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                  info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                  info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
+@@ -675,7 +706,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+         WCHAR* clean_path = dir_path;
+         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
+             clean_path += 4;
+-        if (FileName && FileName->Buffer) {
++        /* An empty pattern means every file, as a null one does: XAPI's
++         * FindFirstFile on "z:\fonts\\" passes a zero-length string. Appending
++         * it gave a search for "<dir>\\", which matches nothing, so a title
++         * clearing out a directory saw it as already empty. */
++        if (FileName && FileName->Buffer && FileName->Length) {
+             WCHAR pattern_wide[MAX_PATH];
+             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
+                                 pattern_wide, MAX_PATH);
+@@ -686,6 +721,14 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+         }
+         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
+         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
++            {
++                static unsigned shown;
++                if (shown++ < 12) {
++                    fprintf(stderr, "  [FILE] NtQueryDirectoryFile: no match for '%ls' (win32 err=%lu)" "\n",
++                            search_path, GetLastError());
++                    fflush(stderr);
++                }
++            }
+             ctx->find_handle = NULL;
+             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+             return STATUS_NO_MORE_FILES;
 diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
 index caf6390..6d79f72 100644
 --- a/src/kernel/kernel_path.c
