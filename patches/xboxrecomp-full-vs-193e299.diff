@@ -1,5 +1,17 @@
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index a045752..880f260 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -24,6 +24,7 @@ set(KERNEL_SOURCES
+     icall_feedback.c
+     recomp_trace.c
+     nv2a_pb_scan.c
++    nv2a_reg_trap.c
+     nv2a_pb_exec.c
+     nv2a_vsh_interp.c
+     nv2a_combiner.c
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..9e9596f 100644
+index c65ba43..e51fa1b 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
@@ -15,7 +27,29 @@ index c65ba43..9e9596f 100644
          /* The console hands out zeroed pages here, and titles rely on it:
           * pool headers and free-list roots are assumed clear, so whatever the
           * backing view happened to contain shows up later as structures that
-@@ -2284,6 +2290,53 @@ static void kernel_vblank_tick(void)
+@@ -2251,6 +2257,8 @@ static int kernel_raise_interrupt(uint32_t vector)
+ #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
+ #define NV2A_VECTOR            3u
+ 
++void xbox_Nv2aRaiseVblank(void);
++
+ static void kernel_vblank_tick(void)
+ {
+     static int enabled = -1;
+@@ -2270,8 +2278,10 @@ static void kernel_vblank_tick(void)
+     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+         return;
+ 
+-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
++    /* Through the register model when it is trapping these pages (then
++     * PMC_INTR_0 is derived and the acknowledge is exact); plain memory
++     * otherwise. */
++    xbox_Nv2aRaiseVblank();
+ 
+     {
+         static unsigned n;
+@@ -2284,6 +2294,53 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -60,7 +94,7 @@ index c65ba43..9e9596f 100644
 +    while (budget-- > 0 && nv2a_swi_take(&param)) {
 +        g_ecx = BRIDGE_MEM32(kint + 4);
 +        g_eax = param;
-+        { static unsigned n; if (n++ < 12) { fprintf(stderr, "  [NV2A] software interrupt 0x%08X -> handler (this=0x%08X)\n", param, g_ecx); fflush(stderr); } }
++        { static unsigned n; static int tr = -1; if (tr < 0) tr = getenv("RECOMP_SWI_TRACE") != NULL; if (n++ < 12 || tr) { fprintf(stderr, "  [NV2A] software interrupt 0x%08X -> handler (this=0x%08X)\n", param, g_ecx); fflush(stderr); } }
 +        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
 +        { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
 +    }
@@ -69,7 +103,7 @@ index c65ba43..9e9596f 100644
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2572,6 +2625,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2572,6 +2629,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
  
          Sleep(10);
          kernel_vblank_tick();  /* the GPU's frame clock */
@@ -77,7 +111,7 @@ index c65ba43..9e9596f 100644
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -3880,6 +3934,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3880,6 +3938,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
@@ -94,6 +128,81 @@ index c65ba43..9e9596f 100644
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
+@@ -9391,24 +9459,45 @@ void guest_cpu_part(void)
+     t_guest_thread = 0;
+ }
+ 
++/* Wall time spent inside each kernel call, and waiting to get the guest CPU
++ * back afterwards. Call counts say what a title asks for; they do not say
++ * where a run that sits at 2% CPU is waiting, and that is the question when
++ * the same boot plays a video at 15 fps one time and 2 fps the next. Printed
++ * with the periodic [KERNEL] summary. Units: QueryPerformanceCounter ticks. */
++static volatile LONG64 g_ordinal_ticks[XBOX_KERNEL_THUNK_TABLE_SIZE];
++static volatile LONG64 g_guest_cpu_wait_ticks;
++
+ /* A guest thread lets go of the guest CPU for the length of every kernel
+  * call. */
+ static void kernel_thunk_dispatch(void)
+ {
+     int held = t_guest_held;
++    LARGE_INTEGER t0, t1, t2;
++    int tslot = g_kernel_dispatch_slot;
++    ULONG tord = (tslot >= 0 && tslot < XBOX_KERNEL_THUNK_TABLE_SIZE)
++                     ? g_slot_ordinals[tslot] : 0;
++    int outer = (t_dispatch_depth == 0);
+     if (held) {                        /* let other guest threads run meanwhile */
+         t_guest_held = 0;
+         LeaveCriticalSection(&g_guest_cpu);
+     }
++    QueryPerformanceCounter(&t0);
+     t_dispatch_depth++;
+     kernel_thunk_dispatch_body();
+     t_dispatch_depth--;
++    QueryPerformanceCounter(&t1);
++    if (outer && tord < XBOX_KERNEL_THUNK_TABLE_SIZE)
++        InterlockedExchangeAdd64(&g_ordinal_ticks[tord],
++                                 t1.QuadPart - t0.QuadPart);
+     /* Back to guest code: take the CPU again. Only at the outermost call --
+      * a guest callback a bridge runs (an APC) returns into the bridge, not to
+      * the thread's own code -- and only if the thread still exists as one. */
+     if (t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
+         EnterCriticalSection(&g_guest_cpu);
+         t_guest_held = 1;
++        QueryPerformanceCounter(&t2);
++        InterlockedExchangeAdd64(&g_guest_cpu_wait_ticks,
++                                 t2.QuadPart - t1.QuadPart);
+     }
+     (void)held;
+ }
+@@ -9473,6 +9562,28 @@ static void kernel_thunk_dispatch_body(void)
+                     fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
+                             (unsigned long long)g_ordinal_calls[best]);
+                 }
++                /* The same, ranked by time (all threads summed, so it can
++                 * exceed the wall clock). */
++                {
++                    LARGE_INTEGER qf;
++                    QueryPerformanceFrequency(&qf);
++                    memset(shown_ord, 0, sizeof shown_ord);
++                    fprintf(stderr, "  [KERNEL]   time:");
++                    for (shown = 0; shown < 6; shown++) {
++                        int best = -1;
++                        for (r = 0; r < XBOX_KERNEL_THUNK_TABLE_SIZE; r++)
++                            if (g_ordinal_ticks[r] && !shown_ord[r]
++                                && (best < 0 || g_ordinal_ticks[r] > g_ordinal_ticks[best]))
++                                best = r;
++                        if (best < 0)
++                            break;
++                        shown_ord[best] = 1;
++                        fprintf(stderr, " ord %d %.1fs", best,
++                                (double)g_ordinal_ticks[best] / (double)qf.QuadPart);
++                    }
++                    fprintf(stderr, " | waiting for guest CPU %.1fs\n",
++                            (double)g_guest_cpu_wait_ticks / (double)qf.QuadPart);
++                }
+             }
+             fflush(stderr);
+             last_summary_tick = now;
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
 index 42135e0..9b87ad8 100644
 --- a/src/kernel/kernel_file.c
@@ -226,7 +335,7 @@ index caf6390..6d79f72 100644
          fflush(stderr);
          return TRUE;
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..a1c5393 100644
+index c65632c..9c2a038 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -679,12 +679,44 @@ static void clear_surface(uint32_t param)
@@ -285,7 +394,7 @@ index c65632c..a1c5393 100644
                  p[x] = v;
          }
      }
-@@ -2855,8 +2887,174 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2855,8 +2887,233 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          record_tex_reg(method, param);
  }
  
@@ -320,6 +429,11 @@ index c65632c..a1c5393 100644
 +    }
 +    s_swi_param[t % NV2A_SWI_QUEUE] = param;
 +    s_swi_tail = t + 1;
++    {
++        static int tr = -1;
++        if (tr < 0) tr = getenv("RECOMP_SWI_TRACE") != NULL;
++        if (tr) fprintf(stderr, "  [NV2A] software interrupt 0x%08X posted\n", param);
++    }
 +
 +    /* The hardware raises this interrupt when it reaches the method, and the
 +     * FIFO does not move on until the title's service routine has run. Here
@@ -448,6 +562,41 @@ index c65632c..a1c5393 100644
 +            fflush(stderr);
 +        }
 +    }
++    /* The two clear values are also how D3D passes arguments to its own
++     * software-interrupt handler. PGRAPH latches them in registers
++     * (ZSTENCILCLEARVALUE 0x401A88, COLORCLEARVALUE 0x40186C) and the handler
++     * reads those back: Halo 2's, at 0x3FF240, does
++     *
++     *     type 9:    reg[[0x401A88]] = [0x40186C]     ; write a register
++     *     type 6/7:  call [0x401A88]([0x40186C])      ; run a callback
++     *
++     * in step with the pushbuffer. The aperture is plain memory, so unless
++     * the methods are mirrored there the handler reads zeroes: it then wrote
++     * 0 to register 0 nine times a boot, never ran a callback, and the wait at
++     * 0x3FA910 for a tile register it had "written" (0x400B10) never ended
++     * once the ring filled. */
++    if (subch == 0 && (method == 0x1D8Cu || method == 0x1D90u)) {
++        volatile uint32_t *reg = (volatile uint32_t *)
++            ((uintptr_t)xbox_GetMemoryOffset() + 0xFD000000u
++             + (method == 0x1D8Cu ? 0x00401A88u : 0x0040186Cu));
++        *reg = param;
++    }
++    /* D3D's front-end fence. Beside each back-end semaphore write, the
++     * library (Halo 2 0x3FA69E) sends method 0x310 on its subchannel 5 with
++     * the fence's low five bits in bits 2..6, and its "wait until the GPU has
++     * caught up" loop (0x3FA910) reads PGRAPH register 0x400B10 until those
++     * bits match the fence page:
++     *
++     *     eax = [regs+0x400B10]; ecx = [fence] << 2; test (ecx ^ eax), 0x7C
++     *
++     * The register is where the hardware latches that method. With nothing
++     * writing it the loop only ended when the fence happened to be a multiple
++     * of 32, and it is entered whenever the ring fills. */
++    if (subch != 0 && method == 0x0310u) {
++        *(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()
++                               + 0xFD000000u + 0x00400B10u) = param;
++        return;
++    }
 +    /* Fence methods belong to the 3D class, which is on subchannel 0. The
 +     * same numbers on another subchannel are another object's methods. */
 +    if (subch == 0 && method == 0x0100u && param != 0) {
@@ -456,15 +605,34 @@ index c65632c..a1c5393 100644
 +    }
 +    if (subch == 0 && method == 0x01A4u) { s_sem_handle = param; return; }   /* SET_CONTEXT_DMA_SEMAPHORE */
 +    if (subch == 0 && method == 0x1D6Cu) { s_sem_offset = param; return; }   /* SET_SEMAPHORE_OFFSET */
-+    if (subch == 0 && method == 0x1D70u) { semaphore_release(param); return; }
++    if (subch == 0 && method == 0x1D70u) {
++        /* Fences are numbered consecutively by the title. One that does not
++         * follow the last means commands were skipped or read twice, which is
++         * the cheapest possible check that the stream is being read in order
++         * (RECOMP_PB_WRAP_TRACE). */
++        static int tr = -1;
++        static uint32_t last;
++        if (tr < 0) tr = getenv("RECOMP_PB_WRAP_TRACE") != NULL;
++        if (tr && last && param != last + 2u && param != last + 1u) {
++            extern uint32_t g_nv2a_pb_cur_va, g_nv2a_pb_seg_va;
++            static unsigned said;
++            if (said++ < 40)
++                fprintf(stderr, "  [NV2A] fence 0x%X follows 0x%X (at 0x%08X,"
++                        " segment 0x%08X)\n", param, last,
++                        g_nv2a_pb_cur_va, g_nv2a_pb_seg_va);
++        }
++        last = param;
++        semaphore_release(param);
++        return;
++    }
      static int inited;
      if (!inited) {
          inited = 1;
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index 65bbedb..79987e1 100644
+index 65bbedb..172cd5c 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
-@@ -163,9 +163,23 @@ void nv2a_pb_scan_report(void)
+@@ -163,14 +163,53 @@ void nv2a_pb_scan_report(void)
   * The NV2A has one level of subroutine, so a CALL inside a call is not
   * followed. Addresses are physical, like PUT's, and reach guest memory the
   * same way: through the contiguous window. */
@@ -488,7 +656,38 @@ index 65bbedb..79987e1 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      uint32_t words = 0;
  
-@@ -178,8 +192,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+     while (va < end_va && words < 0x100000u) {
+-        uint32_t w = *(const uint32_t *)(mem + va);
++        uint32_t w;
++        /* The stream lives in the 64 MB contiguous window. An address
++         * outside it came from a word that was not a command -- a CALL or
++         * JUMP decoded out of data -- and reading there faults in the
++         * executor thread, which takes the whole title down. Stop and say
++         * where the walk had got to instead. */
++        if (va < XBOX_CONTIG_BASE || va >= XBOX_CONTIG_BASE + 0x04000000u - 4u) {
++            static unsigned said;
++            if (said++ < 8)
++                fprintf(stderr, "  [PB] walk left guest RAM at 0x%08X (segment"
++                        " 0x%08X, %u words in, %s); stopped\n",
++                        va, seg_start, words, in_call ? "in a CALL" : "top level");
++            break;
++        }
++        /* DMA_GET follows the walk, as it follows the hardware's read
++         * pointer. It used to move once per tick, to the PUT the tick started
++         * with, however long the tick took to execute. D3D reads GET to
++         * decide whether the GPU has already passed a fence it is about to
++         * patch a notification into (Halo 2 0x3FAA14: it writes
++         * NO_OPERATION(5) over the fence's spare slots, then waits for the
++         * interrupt only if GET is still well short of them). With GET stale
++         * it waited for an interrupt whose slot had been executed before it
++         * was patched: a wait with nobody left to end it. */
++        if (!in_call && s_exec_enabled)
++            *(volatile uint32_t *)(mem + 0xFD800044u) = va & 0x0FFFFFFFu;
++        w = *(const uint32_t *)(mem + va);
+         va += 4;
+         words++;
+ 
+@@ -178,8 +217,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
              uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                               : (w & 0x1FFFFFFCu);
              (*jumps)++;
@@ -504,7 +703,7 @@ index 65bbedb..79987e1 100644
              va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
              end_va = va + 0x400000u;
              continue;
-@@ -205,6 +224,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+@@ -205,6 +249,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
  
              for (uint32_t i = 0; i < count && va < end_va; i++) {
                  uint32_t m = noninc ? method : method + i * 4;
@@ -513,11 +712,324 @@ index 65bbedb..79987e1 100644
                  note(subch, m);
                  /* Same walk, two consumers: the survey counts, the executor
                   * acts. Keeping them on one decode means they can never
+diff --git a/src/kernel/nv2a_reg_trap.c b/src/kernel/nv2a_reg_trap.c
+new file mode 100644
+index 0000000..a021daa
+--- /dev/null
++++ b/src/kernel/nv2a_reg_trap.c
+@@ -0,0 +1,251 @@
++/*
++ * nv2a_reg_trap.c -- exact behaviour for the few NV2A registers a title
++ * handshakes with.
++ *
++ * The register aperture is plain memory, and nv2a_ack_thread clears "busy"
++ * and "interrupt pending" bits from the side. That thread also runs the
++ * pushbuffer executor, so an acknowledgement arrives only between rasterised
++ * frames. Halo 2 shows what that costs (sampled, 2026-10-09): its main thread
++ * sat in
++ *
++ *     or   [regs+0x100410], 0x10000        ; PFB flush
++ *  L: test [regs+0x100410], 0x10000
++ *     jne  L
++ *
++ * for 95% of its time, and the vertical-blank service routine sat in
++ *
++ *  L: mov  [regs+0x600100], 1              ; acknowledge PCRTC
++ *     test [regs+0x000100], 0x01000000     ; PMC still reports PCRTC?
++ *     jne  L
++ *
++ * on the timer thread for the rest of each frame. Polling also cannot model
++ * write-one-to-clear at all: the acknowledging write stores the value that is
++ * already there, and a faster poll would clear a pending bit before the
++ * service routine had read it.
++ *
++ * So the three pages those registers live in are left inaccessible and every
++ * access is serviced here (the same scheme as the OHCI and APU models):
++ *
++ *   PMC    0x000000  INTR_0 (0x100) is derived: bit 24 while PCRTC is pending
++ *   PFB    0x100000  0x100410 bit 16 (flush) completes at once
++ *   PCRTC  0x600000  INTR_0 (0x100) is write-one-to-clear
++ *
++ * Every other register in those pages is stored and read back unchanged.
++ * Off unless a title calls xbox_Nv2aRegTrapInit; RECOMP_NO_NV2A_TRAP keeps the
++ * old polling for comparison.
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#if defined(_WIN32)
++#include <windows.h>
++#include "../platform/mmio_decode.h"
++#endif
++
++#include "nv2a_reg_trap.h"
++
++ptrdiff_t xbox_GetMemoryOffset(void);
++
++#define NV2A_APERTURE   0xFD000000u
++#define TRAP_PAGES      3
++#define PAGE_BYTES      0x1000u
++
++#define OFF_PMC_INTR    0x000100u
++#define OFF_PFB_FLUSH   0x100410u
++#define OFF_PCRTC_INTR  0x600100u
++
++static const uint32_t s_page_off[TRAP_PAGES] = { 0x000000u, 0x100000u, 0x600000u };
++static volatile uint32_t s_shadow[TRAP_PAGES][PAGE_BYTES / 4];
++static int s_active;
++static volatile LONG s_faults, s_undecoded;
++
++static int page_of(uint32_t off)
++{
++    int i;
++    for (i = 0; i < TRAP_PAGES; i++)
++        if (off >= s_page_off[i] && off < s_page_off[i] + PAGE_BYTES)
++            return i;
++    return -1;
++}
++
++int xbox_Nv2aRegTrapActive(void)
++{
++    return s_active;
++}
++
++int xbox_Nv2aRegTrapOwns(uint32_t xbox_va)
++{
++    return s_active && xbox_va >= NV2A_APERTURE
++        && page_of(xbox_va - NV2A_APERTURE) >= 0;
++}
++
++static uint32_t reg_read32(uint32_t off)
++{
++    int p = page_of(off);
++    off &= ~3u;
++    if (off == OFF_PMC_INTR)
++        return s_shadow[2][(OFF_PCRTC_INTR & 0xFFFu) / 4] ? (1u << 24) : 0u;
++    return s_shadow[p][(off & 0xFFFu) / 4];
++}
++
++static void reg_write32(uint32_t off, uint32_t v)
++{
++    int p = page_of(off);
++    off &= ~3u;
++    if (off == OFF_PMC_INTR)
++        return;                                  /* derived, read-only */
++    if (off == OFF_PCRTC_INTR) {
++#if defined(_WIN32)
++        _InterlockedAnd((volatile LONG *)&s_shadow[p][(off & 0xFFFu) / 4],
++                        (LONG)~v);
++#else
++        s_shadow[p][(off & 0xFFFu) / 4] &= ~v;
++#endif
++        return;
++    }
++    if (off == OFF_PFB_FLUSH)
++        v &= ~0x00010000u;                       /* the flush is already done */
++    s_shadow[p][(off & 0xFFFu) / 4] = v;
++}
++
++uint32_t xbox_Nv2aRegRead(uint32_t off)
++{
++    if (s_active && page_of(off) >= 0)
++        return reg_read32(off);
++    return *(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()
++                                  + NV2A_APERTURE + off);
++}
++
++void xbox_Nv2aRegWrite(uint32_t off, uint32_t v)
++{
++    if (s_active && page_of(off) >= 0) {
++        reg_write32(off, v);
++        return;
++    }
++    *(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()
++                           + NV2A_APERTURE + off) = v;
++}
++
++void xbox_Nv2aRaiseVblank(void)
++{
++    if (s_active) {
++#if defined(_WIN32)
++        _InterlockedOr((volatile LONG *)&s_shadow[2][(OFF_PCRTC_INTR & 0xFFFu) / 4], 1);
++#else
++        s_shadow[2][(OFF_PCRTC_INTR & 0xFFFu) / 4] |= 1u;
++#endif
++        return;
++    }
++    /* Plain memory: both bits, as before; the acknowledge thread clears them. */
++    *(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()
++                           + NV2A_APERTURE + OFF_PCRTC_INTR) |= 1u;
++    *(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()
++                           + NV2A_APERTURE + OFF_PMC_INTR) |= (1u << 24);
++}
++
++#if defined(_WIN32)
++
++/* mmio_decode callbacks: off is the aperture offset; sizes 1, 2 and 4. */
++static uint64_t trap_rd(void *dev, uint32_t off, int size)
++{
++    uint32_t v = reg_read32(off) >> ((off & 3u) * 8);
++    (void)dev;
++    if (size == 1) return v & 0xFFu;
++    if (size == 2) return v & 0xFFFFu;
++    return v;
++}
++
++static void trap_wr(void *dev, uint32_t off, uint64_t val, int size)
++{
++    (void)dev;
++    if (size >= 4) {
++        reg_write32(off, (uint32_t)val);
++    } else {
++        /* A narrow write changes only its own bytes. For the write-one-to-
++         * clear register that means the other bytes are written as zero. */
++        uint32_t shift = (off & 3u) * 8;
++        uint32_t mask = (size == 1 ? 0xFFu : 0xFFFFu) << shift;
++        uint32_t part = ((uint32_t)val << shift) & mask;
++        if ((off & ~3u) == OFF_PCRTC_INTR)
++            reg_write32(off, part);
++        else
++            reg_write32(off, (reg_read32(off) & ~mask) | part);
++    }
++}
++
++int xbox_Nv2aRegTrapHandle(void *ctx, uint32_t xbox_va)
++{
++    uint32_t off = xbox_va - NV2A_APERTURE;
++    int ok;
++
++    if (!xbox_Nv2aRegTrapOwns(xbox_va))
++        return 0;
++    InterlockedIncrement(&s_faults);
++    ok = mmio_emulate((PCONTEXT)ctx, off, NULL, trap_rd, trap_wr);
++    if (!ok && InterlockedIncrement(&s_undecoded) <= 20) {
++        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
++        fprintf(stderr, "  [NV2A-REG] undecoded access at +0x%06X: "
++                        "%02X %02X %02X %02X %02X %02X %02X %02X\n",
++                off, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]);
++        fflush(stderr);
++    }
++    return ok;
++}
++
++void xbox_Nv2aRegTrapInit(void)
++{
++    uintptr_t base = (uintptr_t)xbox_GetMemoryOffset() + NV2A_APERTURE;
++    int i;
++
++    if (s_active || getenv("RECOMP_NO_NV2A_TRAP"))
++        return;
++    if (!xbox_GetMemoryOffset()) {
++        fprintf(stderr, "  [NV2A-REG] guest memory not mapped yet; trap off\n");
++        return;
++    }
++    /* Whatever start-up seeded there (chip identification and the like) is
++     * what the title must go on reading. */
++    for (i = 0; i < TRAP_PAGES; i++)
++        memcpy((void *)s_shadow[i], (const void *)(base + s_page_off[i]),
++               PAGE_BYTES);
++    s_shadow[0][(OFF_PMC_INTR & 0xFFFu) / 4] = 0;
++    s_shadow[2][(OFF_PCRTC_INTR & 0xFFFu) / 4] = 0;
++    s_shadow[1][(OFF_PFB_FLUSH & 0xFFFu) / 4] &= ~0x00010000u;
++    /* Active before the first page goes away: another thread (the
++     * acknowledge thread polls these registers) can fault the instant a page
++     * is protected, and must find the model already answering. */
++    s_active = 1;
++    for (i = 0; i < TRAP_PAGES; i++) {
++        DWORD old_protect;
++        if (!VirtualProtect((LPVOID)(base + s_page_off[i]), PAGE_BYTES,
++                            PAGE_NOACCESS, &old_protect)) {
++            fprintf(stderr, "  [NV2A-REG] cannot trap +0x%06X (error %lu); "
++                            "trap off\n", s_page_off[i], GetLastError());
++            while (i-- > 0)
++                VirtualProtect((LPVOID)(base + s_page_off[i]), PAGE_BYTES,
++                               PAGE_READWRITE, &old_protect);
++            s_active = 0;
++            return;
++        }
++    }
++    fprintf(stderr, "  [NV2A-REG] PMC, PFB and PCRTC register pages trapped "
++                    "(flush and interrupt acknowledge are exact)\n");
++    fflush(stderr);
++}
++
++void xbox_Nv2aRegTrapReport(void)
++{
++    if (s_active)
++        fprintf(stderr, "  [NV2A-REG] %ld trapped accesses, %ld undecoded\n",
++                (long)s_faults, (long)s_undecoded);
++}
++
++#else
++
++int  xbox_Nv2aRegTrapHandle(void *ctx, uint32_t xbox_va) { (void)ctx; (void)xbox_va; return 0; }
++void xbox_Nv2aRegTrapInit(void) {}
++void xbox_Nv2aRegTrapReport(void) {}
++
++#endif
+diff --git a/src/kernel/nv2a_reg_trap.h b/src/kernel/nv2a_reg_trap.h
+new file mode 100644
+index 0000000..59f8da2
+--- /dev/null
++++ b/src/kernel/nv2a_reg_trap.h
+@@ -0,0 +1,30 @@
++/* Exact behaviour for the NV2A flush and interrupt-acknowledge registers.
++ * See nv2a_reg_trap.c. */
++#ifndef NV2A_REG_TRAP_H
++#define NV2A_REG_TRAP_H
++
++#include <stdint.h>
++
++/* Start trapping. A title calls this once guest memory is mapped and its
++ * start-up register values are in place; without the call nothing changes. */
++void xbox_Nv2aRegTrapInit(void);
++int  xbox_Nv2aRegTrapActive(void);
++
++/* 1 if the address is in a trapped register page. */
++int  xbox_Nv2aRegTrapOwns(uint32_t xbox_va);
++
++/* Service a trapped access from the title's exception handler. Returns 1 if
++ * the faulting instruction was decoded and stepped over. `ctx` is a PCONTEXT. */
++int  xbox_Nv2aRegTrapHandle(void *ctx, uint32_t xbox_va);
++
++/* For the runtime's own reads and writes of NV2A registers (offset from the
++ * start of the aperture). Works whether or not the page is trapped. */
++uint32_t xbox_Nv2aRegRead(uint32_t off);
++void     xbox_Nv2aRegWrite(uint32_t off, uint32_t value);
++
++/* Mark the vertical blank pending, before its service routine is called. */
++void xbox_Nv2aRaiseVblank(void);
++
++void xbox_Nv2aRegTrapReport(void);
++
++#endif /* NV2A_REG_TRAP_H */
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..d8faa25 100644
+index 72d5131..b6bb8ca 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
-@@ -966,18 +966,57 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -152,6 +152,9 @@ static size_t xbox_TiledApertureSize(void)
+     return g_memory_size < max ? g_memory_size : max;
+ }
+ 
++int      xbox_Nv2aRegTrapOwns(uint32_t xbox_va);
++uint32_t xbox_Nv2aRegRead(uint32_t off);
++
+ static HANDLE g_nv2a_ack_thread = NULL;
+ static volatile LONG g_nv2a_ack_stop = 0;
+ 
+@@ -880,6 +883,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+             volatile uint32_t *r =
+                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
++            /* Trapped pages answer for themselves (nv2a_reg_trap.c). */
++            if (xbox_Nv2aRegTrapOwns(XBOX_NV2A_BASE + NV2A_ACK[i].offset))
++                continue;
+             if (*r & NV2A_ACK[i].busy_mask) {
+                 *r &= ~NV2A_ACK[i].busy_mask;
+             }
+@@ -966,18 +972,96 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      static uint32_t put_lo, put_hi;
                      if (!put_lo || put < put_lo) put_lo = put;
                      if (put > put_hi) put_hi = put;
@@ -538,6 +1050,9 @@ index 72d5131..d8faa25 100644
 +                                    " a different pushbuffer, gap not scanned" "\n",
 +                                    last_put, put);
 +                    } else if (last_put && put > last_put) {
++                        if (getenv("RECOMP_PB_WRAP_TRACE") && put - last_put > 0x10000u)
++                            fprintf(stderr, "  [NV2A] forward 0x%08X..0x%08X\n",
++                                    last_put, put);
                          nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                       XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                      } else if (last_put && put < last_put) {
@@ -563,10 +1078,46 @@ index 72d5131..d8faa25 100644
 +                        uint32_t tgt;
 +
 +                        (void)nv2a_pb_take_ring_jump();
-+                        /* Bounded: the JUMP is at most one submission past
-+                         * the last PUT. Further than that there is no JUMP,
-+                         * only whatever lies beyond the ring. */
-+                        nv2a_pb_scan(from, from + 0x20000u);   /* runs to the JUMP */
++                        /* Find the JUMP first, without executing anything.
++                         *
++                         * The tail between the last PUT this thread saw and
++                         * the JUMP used to be assumed shorter than 128 KB --
++                         * "one submission". It is as long as whatever the
++                         * title submitted while this thread was busy drawing,
++                         * and once Halo 2's main thread stopped spinning on
++                         * register handshakes that was 477 KB: no JUMP inside
++                         * the bound, so the tail AND everything after the wrap
++                         * were dropped, among them the NO_OPERATION(5) the
++                         * title then waited on for good.
++                         *
++                         * Walking the headers costs nothing and executes
++                         * nothing, so the bound can be a whole ring; if there
++                         * is no JUMP (PUT was reset, not wrapped) nothing is
++                         * run, as before. */
++                        {
++                            const uint8_t *m8 = (const uint8_t *)g_memory_offset;
++                            uint32_t a = from, lim = from + 0x00100000u;
++                            uint32_t jump_at = 0;
++                            while (a < lim) {
++                                uint32_t w = *(const uint32_t *)(m8 + a);
++                                if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
++                                    jump_at = a; break;                         /* JUMP */
++                                }
++                                /* Stepped exactly as pb_walk steps: only a
++                                 * method header owns the words after it. */
++                                a += 4u;
++                                if ((w & 0x00030003u) == 0u)
++                                    a += 4u * ((w >> 18) & 0x7FFu);
++                            }
++                            if (jump_at)
++                                nv2a_pb_scan(from, jump_at + 4u);   /* runs to the JUMP */
++                            if (getenv("RECOMP_PB_WRAP_TRACE"))
++                                fprintf(stderr, "  [NV2A] wrap: tail 0x%08X.."
++                                        "0x%08X (JUMP word 0x%08X), new PUT 0x%08X\n",
++                                        from, jump_at,
++                                        jump_at ? *(const uint32_t *)(m8 + jump_at) : 0u,
++                                        to);
++                        }
 +                        tgt = nv2a_pb_take_ring_jump();
 +                        if (tgt) {
 +                            if (tgt < to && to - tgt <= 0x00200000u)
@@ -584,7 +1135,16 @@ index 72d5131..d8faa25 100644
                          if (getenv("RECOMP_PB_WRAP_TRACE")) {
                              static unsigned wraps;
                              if (wraps++ < 8)
-@@ -1176,6 +1215,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+@@ -1032,7 +1116,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+         }
+         if (s_nv2a_trace) {
+             static uint32_t last_start = 0xFFFFFFFFu;
+-            uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
++            uint32_t start = xbox_Nv2aRegRead(0x600800);
+             if (start != last_start) {
+                 last_start = start;
+                 fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
+@@ -1176,6 +1260,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  /* SEH frame pointer bridge (see recomp_types.h for explanation) */
  RECOMP_TLS uint32_t g_seh_ebp = 0;
  RECOMP_TLS double g_fp_stack[8];
@@ -597,7 +1157,7 @@ index 72d5131..d8faa25 100644
  RECOMP_TLS int g_fp_top = 0;
  
  /* Set once at startup. The generated code reads it at the ret of every
-@@ -3094,6 +3139,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+@@ -3094,6 +3184,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
      g_contig_block_count++;
  }
  

@@ -235,10 +235,27 @@ int  xbox_OhciOwnsAddress(uint32_t xbox_va);
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 void xbox_OhciReport(void);
 
+/* Exact NV2A flush and interrupt-acknowledge registers
+ * (xboxrecomp src/kernel/nv2a_reg_trap.c). */
+void xbox_Nv2aRegTrapInit(void);
+int  xbox_Nv2aRegTrapOwns(uint32_t xbox_va);
+int  xbox_Nv2aRegTrapHandle(void *ctx, uint32_t xbox_va);
+void xbox_Nv2aRegTrapReport(void);
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
         uintptr_t fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
+
+        /* NV2A registers with real semantics. Before the blanket
+         * 0xFD000000 pass-through below, which would hide them. */
+        {
+            uint32_t reg_va =
+                (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+            if (xbox_Nv2aRegTrapOwns(reg_va)
+                    && xbox_Nv2aRegTrapHandle(ep->ContextRecord, reg_va))
+                return EXCEPTION_CONTINUE_EXECUTION;
+        }
 
         /*
          * GPU register probe at 0xFD000000 range.
@@ -333,6 +350,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+    /* What this title needs to run at all, so a plain launch works. Each can
+     * still be overridden from the environment (set it to 0 or empty where
+     * the runtime tests the value; RECOMP_H2_NO_DEFAULTS skips them all).
+     *   RECOMP_PB_EXEC, RECOMP_VBLANK  D3D init never finishes without both
+     *   RECOMP_TITLE_KEVENTS           D3D waits on an event it builds itself
+     *                                  (miniport + 0x1A4), set by software
+     *                                  interrupt 5; without this the wait
+     *                                  fails at once and is retried forever
+     *   RECOMP_USB                     the controller */
+    if (!getenv("RECOMP_H2_NO_DEFAULTS")) {
+        static const char *const defaults[] = {
+            "RECOMP_PB_EXEC", "RECOMP_VBLANK", "RECOMP_TITLE_KEVENTS",
+            "RECOMP_USB",
+        };
+        size_t di;
+        for (di = 0; di < sizeof defaults / sizeof defaults[0]; di++)
+            if (!getenv(defaults[di]))
+                _putenv_s(defaults[di], "1");
+    }
+
     printf("=== Halo 2 - Static Recompilation ===\n");
     printf("Loading XBE...\n");
 
@@ -387,6 +424,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 3: Initialize Xbox kernel */
     printf("Initializing Xbox kernel replacement...\n");
     xbox_kernel_init();
+
+    /* After start-up has seeded the register aperture. */
+    xbox_Nv2aRegTrapInit();
+    atexit(xbox_Nv2aRegTrapReport);
 
     /* Step 4: Set game directory for file I/O path translation */
     {
