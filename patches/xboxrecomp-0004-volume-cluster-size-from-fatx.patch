@@ -1,0 +1,83 @@
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index 42135e0..c7b5d83 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -503,6 +503,37 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
+     }
+ }
+ 
++extern const wchar_t *xbox_last_partition_image(void);
++
++/* Sectors per cluster of the volume just opened. A partition the title has
++ * formatted carries a FATX header (magic, volume id, sectors per cluster);
++ * XAPI's mount check multiplies this by the sector size and fails the hard
++ * disk when it differs from the size it formatted with. */
++static ULONG xbox_volume_sectors_per_cluster(void)
++{
++    const wchar_t *img = xbox_last_partition_image();
++    ULONG spc = XBOX_SECTORS_PER_CLUSTER;
++
++    if (img && img[0]) {
++        HANDLE h = CreateFileW(img, GENERIC_READ,
++                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                               NULL, OPEN_EXISTING, 0, NULL);
++        if (h != INVALID_HANDLE_VALUE) {
++            unsigned char hdr[12];
++            DWORD got = 0;
++            if (ReadFile(h, hdr, sizeof(hdr), &got, NULL) && got == sizeof(hdr)
++                    && memcmp(hdr, "FATX", 4) == 0) {
++                ULONG v = (ULONG)hdr[8] | ((ULONG)hdr[9] << 8)
++                        | ((ULONG)hdr[10] << 16) | ((ULONG)hdr[11] << 24);
++                if (v && v <= 2048 && (v & (v - 1)) == 0)
++                    spc = v;
++            }
++            CloseHandle(h);
++        }
++    }
++    return spc;
++}
++
+ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
+     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
+@@ -517,7 +548,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
+             ULARGE_INTEGER free_bytes, total_bytes, total_free;
+             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+-                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
++                info->SectorsPerAllocationUnit = xbox_volume_sectors_per_cluster();
+                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
+                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
+                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index caf6390..3a5d9b8 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -394,6 +394,17 @@ static void xbox_remember_host_path(const wchar_t *p)
+ 
+ 
+ 
++/* The partition image the last translation resolved to, or empty when the
++ * last translation was not a partition device path. NtQueryVolumeInformationFile
++ * reads the FATX header from it: XAPI formats the utility partition with its
++ * own cluster size and then checks the volume reports that size back. */
++static XBOX_THREAD_LOCAL wchar_t s_last_partition_image[MAX_PATH];
++
++const wchar_t *xbox_last_partition_image(void)
++{
++    return s_last_partition_image;
++}
++
+ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
+ {
+     const char*  remainder = NULL;
+@@ -413,7 +424,9 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
+             return xbox_translate_path(linked, host_path_buf, buf_size);
+     }
+ 
++    s_last_partition_image[0] = 0;
+     if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
++        wcsncpy_s(s_last_partition_image, MAX_PATH, host_path_buf, _TRUNCATE);
+         fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
+         fflush(stderr);
+         return TRUE;

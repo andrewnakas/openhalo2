@@ -1,0 +1,114 @@
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index c65632c..5a171ed 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -2855,8 +2855,109 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+         record_tex_reg(method, param);
+ }
+ 
++/* D3D's software interrupt.
++ *
++ * NV097_NO_OPERATION with a non-zero parameter makes the hardware raise a
++ * PGRAPH interrupt with the method and parameter trapped. The D3D8 library
++ * uses it as a fence: it writes the method into the pushbuffer and blocks
++ * until its interrupt service has run the handler for that parameter. Nothing
++ * delivered it, so a title that waits on a fence during device creation stops
++ * there -- Halo 2 does, inside its first BlockOnTime.
++ *
++ * The parameters are queued here and handed to the title's handler from the
++ * timer thread (kernel_d3d_swi_tick), which has a guest stack. One producer
++ * (the executor) and one consumer, so plain indices are enough on x86. */
++#define NV2A_SWI_QUEUE 64u
++static volatile uint32_t s_swi_head, s_swi_tail;
++static uint32_t s_swi_param[NV2A_SWI_QUEUE];
++
++static void nv2a_swi_post(uint32_t param)
++{
++    uint32_t t = s_swi_tail;
++    if (t - s_swi_head >= NV2A_SWI_QUEUE)
++        return;                               /* full: the fence is lost */
++    s_swi_param[t % NV2A_SWI_QUEUE] = param;
++    s_swi_tail = t + 1;
++}
++
++/* The fence itself.
++ *
++ * D3D numbers its fences and asks the GPU to store the number of each one it
++ * reaches: NV097_SET_CONTEXT_DMA_SEMAPHORE names a DMA object,
++ * NV097_SET_SEMAPHORE_OFFSET an offset inside it, and
++ * NV097_BACK_END_WRITE_SEMAPHORE_RELEASE writes its parameter there. The
++ * library then compares that word with the fence it wants and blocks while the
++ * GPU is behind. Unhandled, the word never moved, so the first wait never
++ * ended.
++ *
++ * The object's base comes from where the hardware gets it: the handle is
++ * looked up in RAMHT (NV_PFIFO_RAMHT gives its place in instance memory) and
++ * the instance holds the frame and adjust. The title wrote both. */
++static uint32_t s_sem_handle, s_sem_offset;
++
++static int dma_object_base(uint32_t handle, uint32_t *base_out)
++{
++    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++    const uint32_t regs = 0xFD000000u, ramin = regs + 0x00700000u;
++    uint32_t ramht = *(const uint32_t *)(mem + regs + 0x2210u);
++    uint32_t ht_base = ((ramht >> 4) & 0x1Fu) << 12;
++    uint32_t ht_size = 0x1000u << ((ramht >> 16) & 3u);
++    uint32_t i;
++
++    for (i = 0; i + 8 <= ht_size; i += 8) {
++        uint32_t h   = *(const uint32_t *)(mem + ramin + ht_base + i);
++        uint32_t ctx = *(const uint32_t *)(mem + ramin + ht_base + i + 4);
++        if (h == handle && (ctx & 0x80000000u)) {
++            uint32_t inst = (ctx & 0xFFFFu) << 4;
++            uint32_t w0 = *(const uint32_t *)(mem + ramin + inst);
++            uint32_t w2 = *(const uint32_t *)(mem + ramin + inst + 8);
++            *base_out = (w2 & 0xFFFFF000u) + (w0 >> 20);
++            return 1;
++        }
++    }
++    return 0;
++}
++
++static void semaphore_release(uint32_t value)
++{
++    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
++    uint32_t base, va;
++    static unsigned shown, missed;
++
++    if (!dma_object_base(s_sem_handle, &base)) {
++        if (missed++ < 3)
++            fprintf(stderr, "  [NV2A] semaphore release %u: DMA object 0x%X not found in RAMHT"
++                            "; the fence word is not written" "\n",
++                    value, s_sem_handle);
++        return;
++    }
++    va = dma_resolve(base + s_sem_offset);
++    *(uint32_t *)(mem + va) = value;
++    if (shown++ < 6)
++        fprintf(stderr, "  [NV2A] semaphore release %u -> 0x%08X (object 0x%X base 0x%08X + 0x%X)" "\n",
++                value, va, s_sem_handle, base, s_sem_offset);
++}
++
++int nv2a_swi_take(uint32_t *param)
++{
++    uint32_t h = s_swi_head;
++    if (h == s_swi_tail)
++        return 0;
++    *param = s_swi_param[h % NV2A_SWI_QUEUE];
++    s_swi_head = h + 1;
++    return 1;
++}
++
+ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ {
++    /* NV097_NO_OPERATION with a non-zero parameter: see nv2a_swi_post. */
++    if (method == 0x0100u && param != 0) {
++        nv2a_swi_post(param);
++        return;
++    }
++    if (method == 0x01A4u) { s_sem_handle = param; return; }   /* SET_CONTEXT_DMA_SEMAPHORE */
++    if (method == 0x1D6Cu) { s_sem_offset = param; return; }   /* SET_SEMAPHORE_OFFSET */
++    if (method == 0x1D70u) { semaphore_release(param); return; }
+     static int inited;
+     if (!inited) {
+         inited = 1;

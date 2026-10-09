@@ -1,0 +1,14 @@
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 3cd9250..3092b7f 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -1377,6 +1377,9 @@ class FunctionTranslator:
+             m = insn.mnemonic
+             if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr"):
+                 return True
++            # lahf copies CF into AH through the same _cf the jb forms read.
++            if m == "lahf" and last_setter is not None:
++                return True
+             cc = None
+             if m.startswith("j") and len(m) > 1:
+                 cc = m[1:]

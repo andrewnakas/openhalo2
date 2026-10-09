@@ -1,0 +1,10 @@
+port/xr/src/recomp/gen/
+port/xr/build*/
+port/xr/game/
+*.xbe
+*.iso
+*.map
+*.bik
+__pycache__/
+*.pyc
+build/

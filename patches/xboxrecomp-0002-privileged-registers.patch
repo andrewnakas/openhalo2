@@ -1,0 +1,25 @@
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index e7ab880..16b5658 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -127,6 +127,11 @@ def _fmt_reg(name, size=4):
+     if name in ("fs", "gs", "cs", "ds", "es", "ss"):
+         return f"0 /* seg:{name} */"
+ 
++    # Debug/control registers are ring 0 only; a title never touches them, so
++    # one showing up means data was decoded as code. Read as 0, like segments.
++    if len(name) == 3 and name[:2] in ("dr", "cr", "tr") and name[2].isdigit():
++        return f"0 /* privileged:{name} */"
++
+     # Map sub-registers to expressions on 32-bit locals
+     SUB_REGS = {
+         "al": "LO8(eax)", "ah": "HI8(eax)", "ax": "LO16(eax)",
+@@ -146,6 +151,8 @@ def _fmt_set_reg(name, value_expr):
+     # Segment registers → no-op
+     if name in ("fs", "gs", "cs", "ds", "es", "ss"):
+         return f"/* mov {name}, {value_expr} - segment register */;"
++    if len(name) == 3 and name[:2] in ("dr", "cr", "tr") and name[2].isdigit():
++        return f"/* mov {name}, {value_expr} - privileged register */;"
+ 
+     SET_MAP = {
+         "al": f"SET_LO8(eax, {value_expr})",
