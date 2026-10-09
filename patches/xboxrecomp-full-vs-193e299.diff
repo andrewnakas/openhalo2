@@ -412,10 +412,10 @@ index caf6390..6d79f72 100644
          return TRUE;
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..a3646ab
+index 0000000..52a6390
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,1800 @@
+@@ -0,0 +1,2152 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -456,14 +456,30 @@ index 0000000..a3646ab
 + *      them (nothing else writes there), so they are uploaded and win. This
 + *      also covers a freed render target whose memory became a texture.
 + *
++ *   5. Two surfaces of different shape at one address (the title's scratch
++ *      render targets: 160x120 and 128x128 share memory in Halo 2 and are
++ *      switched twice a frame) are two GL surfaces, keyed by address, pitch
++ *      and depth. Switching between them moves no pixels: on the console the
++ *      second would start as the first one's bytes read at another pitch,
++ *      which is noise no title can use, and here it starts as whatever it
++ *      held last. Reading guest memory takes the one drawn into last.
++ *   6. A swizzled texture stage naming a surface (render target that is a
++ *      power-of-two texture) also binds the surface's texture: on the
++ *      console both sides address the same Morton-ordered texels, so the
++ *      picture is the same as binding the linear copy.
++ *
 + * Not covered: the title reading a surface out of guest memory by itself
 + * (a screenshot, a thumbnail) sees the last download, not the current frame.
 + * RECOMP_GPU_SYNC=1 downloads the presented surface at every flip for that.
 + *
 + * Ordinary textures are cached by (address, format, size) and validated by a
-+ * hash of their bytes: once per frame, and again whenever the title touches
-+ * that stage's registers, so a texture rewritten in place (video frames, a
-+ * glyph cache) is re-uploaded.
++ * hash of their bytes once per frame. A texture whose bytes have changed in
++ * the last 600 frames, or that is younger than 8 frames, is "dynamic" and is
++ * also validated whenever the title touches that stage's registers, so one
++ * rewritten in place between two draws of a frame (video frames, a glyph
++ * cache) is re-uploaded. The rest are not: the title writes the stage
++ * registers before nearly every draw, and hashing each texture at each use
++ * was 9.5 MB a frame in the first campaign level.
 + */
 +#include "nv2a_gl.h"
 +
@@ -574,6 +590,8 @@ index 0000000..a3646ab
 +    uint64_t mem_hash;                  /* guest bytes when last in agreement */
 +    uint64_t mem_full;                  /* the same, every byte (see surf_download) */
 +    uint32_t checked_flip, last_use;
++    uint64_t draw_seq;                  /* order of the last draw or clear */
++    int      swz;                       /* the title called it swizzled    */
 +    int      used;
 +} GlSurface;
 +
@@ -582,11 +600,12 @@ index 0000000..a3646ab
 +    uint64_t hash;
 +    GLuint   tex;
 +    uint32_t checked_flip, last_use;
++    uint32_t born_flip, changed_flip;   /* see "dynamic" at the top        */
 +    int      supported, used;
 +} GlTexEntry;
 +
 +typedef struct {
-+    uint32_t mode, afunc, kind[4];
++    uint32_t mode, afunc, kind[4], akill;
 +    uint32_t control, stage_program, clip_plane_mode, final0, final1;
 +    uint32_t cicw[8], aicw[8], cocw[8], aocw[8];
 +} ProgKey;
@@ -605,7 +624,7 @@ index 0000000..a3646ab
 +    float  sx, sy, mx, my, afloor;
 +} TexBind;
 +
-+#define GL_MAX_SURFACES 16
++#define GL_MAX_SURFACES 32
 +#define GL_TEX_SLOTS    4096
 +#define GL_PROG_SLOTS   512
 +#define GL_FBO_SLOTS    64
@@ -619,6 +638,7 @@ index 0000000..a3646ab
 +static int        s_nverts;
 +static uint32_t   s_flip = 1;
 +static GlSurface  s_surf[GL_MAX_SURFACES];
++static uint64_t   s_draw_seq;
 +static GlTexEntry *s_tex;
 +static GlProg    *s_prog;
 +static struct { GLuint color, depth, fbo; } s_fbo[GL_FBO_SLOTS];
@@ -638,6 +658,28 @@ index 0000000..a3646ab
 +} s_stat;
 +
 +/* ---- Small helpers ------------------------------------------------------ */
++
++/* Where the executor's time goes, per report interval. */
++enum { PT_DL, PT_UL, PT_SCHK, PT_HASH, PT_DEC, PT_DRAW, PT_QUERY, PT_SNAP,
++       PT_FLIP, PT_RESOLVE, PT_STATE, PT_VBO, PT_CALL, PT_N };
++static struct { double us; uint64_t n; } s_pt[PT_N];
++static uint64_t s_dl_cause[4], s_ul_cause[3];
++static int s_ul_why;
++
++static double now_us(void)
++{
++    static LARGE_INTEGER f;
++    LARGE_INTEGER c;
++    if (!f.QuadPart)
++        QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (double)c.QuadPart * 1e6 / (double)f.QuadPart;
++}
++static void pt_add(int k, double t0)
++{
++    s_pt[k].us += now_us() - t0;
++    s_pt[k].n++;
++}
 +
 +static uint8_t *guest(uint32_t va)
 +{
@@ -799,11 +841,24 @@ index 0000000..a3646ab
 +
 +/* ---- Surfaces ----------------------------------------------------------- */
 +
++/* The surface at `base` that was drawn into last (see (5) at the top). */
 +static GlSurface *surf_find(uint32_t base)
++{
++    GlSurface *best = NULL;
++    int i;
++    for (i = 0; i < GL_MAX_SURFACES; i++)
++        if (s_surf[i].used && s_surf[i].base == base
++            && (!best || s_surf[i].draw_seq > best->draw_seq))
++            best = &s_surf[i];
++    return best;
++}
++
++static GlSurface *surf_find_shape(uint32_t base, uint32_t pitch, uint32_t bpp)
 +{
 +    int i;
 +    for (i = 0; i < GL_MAX_SURFACES; i++)
-+        if (s_surf[i].used && s_surf[i].base == base)
++        if (s_surf[i].used && s_surf[i].base == base
++            && s_surf[i].pitch == pitch && s_surf[i].bpp == bpp)
 +            return &s_surf[i];
 +    return NULL;
 +}
@@ -817,6 +872,10 @@ index 0000000..a3646ab
 +static void surf_upload(GlSurface *s)
 +{
 +    const uint8_t *src = guest(s->base);
++    double t0 = now_us();
++
++    s_ul_cause[s_ul_why]++;
++    s_ul_why = 0;
 +
 +    bind_scratch(GL_TEXTURE_2D, s->tex);
 +    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -846,22 +905,27 @@ index 0000000..a3646ab
 +    s->mem_hash = hash_sampled(src, surf_bytes(s));
 +    s->mem_full = hash_bytes(src, surf_bytes(s));
 +    s_stat.uploads++;
++    pt_add(PT_UL, t0);
 +    gl_check("surface upload");
 +}
 +
 +/* FBO -> guest memory, if the FBO is ahead. */
-+static void surf_download(GlSurface *s)
++static void surf_download(GlSurface *s, int cause)
 +{
 +    uint8_t *dst = guest(s->base);
++    double t0;
 +
 +    if (!s->gpu_newer || s_verify)
 +        return;
++    t0 = now_us();
++    s_dl_cause[cause]++;
 +    /* Never write over bytes the CPU has changed since the two copies last
 +     * agreed. A surface the title freed keeps its entry here, and its memory
 +     * may by now be a texture or a vertex buffer; writing old pixels there
 +     * would corrupt the guest. Changed bytes mean the CPU's copy is the
 +     * current one, so it is taken instead. */
 +    if (hash_bytes(dst, surf_bytes(s)) != s->mem_full) {
++        s_ul_why = 2;
 +        surf_upload(s);
 +        return;
 +    }
@@ -889,7 +953,22 @@ index 0000000..a3646ab
 +    s->gpu_newer = 0;
 +    s->mem_hash = hash_sampled(dst, surf_bytes(s));
 +    s->mem_full = hash_bytes(dst, surf_bytes(s));
++    /* Another surface over these bytes that is itself ahead of memory must
++     * not take what was just written for a CPU write. */
++    {
++        int i;
++        for (i = 0; i < GL_MAX_SURFACES; i++) {
++            GlSurface *o = &s_surf[i];
++            if (o != s && o->used && o->gpu_newer
++                && o->base < s->base + surf_bytes(s)
++                && s->base < o->base + surf_bytes(o)) {
++                o->mem_hash = hash_sampled(guest(o->base), surf_bytes(o));
++                o->mem_full = hash_bytes(guest(o->base), surf_bytes(o));
++            }
++        }
++    }
 +    s_stat.downloads++;
++    pt_add(PT_DL, t0);
 +    gl_check("surface download");
 +}
 +
@@ -909,19 +988,27 @@ index 0000000..a3646ab
 +    if (s->checked_flip == s_flip || s_verify)
 +        return;
 +    s->checked_flip = s_flip;
-+    if (hash_sampled(guest(s->base), surf_bytes(s)) != s->mem_hash)
-+        surf_upload(s);
++    {
++        double t0 = now_us();
++        int diff = hash_sampled(guest(s->base), surf_bytes(s)) != s->mem_hash;
++        pt_add(PT_SCHK, t0);
++        if (diff) {
++            s_ul_why = 1;
++            surf_upload(s);
++        }
++    }
 +}
 +
 +/* The surface a batch or clear draws into, created or reshaped as needed. */
 +static GlSurface *surf_get(uint32_t base, uint32_t pitch, uint32_t bpp,
 +                           uint32_t need_h)
 +{
-+    GlSurface *s = surf_find(base);
++    GlSurface *s;
 +    int w, h, i;
 +
 +    if ((bpp != 4 && bpp != 2) || pitch < bpp || !need_h)
 +        return NULL;
++    s = surf_find_shape(base, pitch, bpp);
 +    w = (int)(pitch / bpp);
 +    if (need_h > 4096)
 +        need_h = 4096;
@@ -934,17 +1021,21 @@ index 0000000..a3646ab
 +        return NULL;
 +    h = (int)need_h;
 +
-+    if (s && s->pitch == pitch && s->bpp == bpp && s->h >= h) {
++    if (s && s->h >= h) {
 +        s->last_use = s_flip;
 +        surf_cpu_check(s);
 +        return s;
 +    }
 +    if (s) {
-+        /* Another shape at the same address: memory gets what was drawn,
-+         * then the new surface starts from memory. */
-+        if (s->pitch == pitch && s->bpp == bpp && s->h > h)
-+            h = s->h;
-+        surf_download(s);
++        /* The same surface, taller: memory gets what was drawn, then the
++         * new surface starts from memory. */
++        {
++            static unsigned said;
++            if (said++ < 30)
++                fprintf(stderr, "  [GL] reshape 0x%08X: pitch %u bpp %u h %d -> pitch %u bpp %u h %d\n",
++                        base, s->pitch, s->bpp, s->h, pitch, bpp, h);
++        }
++        surf_download(s, 2);
 +        surf_destroy(s);
 +    } else {
 +        GlSurface *old = NULL;
@@ -954,7 +1045,7 @@ index 0000000..a3646ab
 +                old = &s_surf[i];
 +        }
 +        if (!s) {
-+            surf_download(old);
++            surf_download(old, 3);
 +            surf_destroy(old);
 +            s = old;
 +        }
@@ -988,6 +1079,7 @@ index 0000000..a3646ab
 +    glBindFramebuffer(GL_FRAMEBUFFER, fbo_for(s->tex, 0));
 +    bind_scratch(GL_TEXTURE_2D, s->snap);
 +    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, s->w, s->h);
++    s_pt[PT_SNAP].n++;
 +    return s->snap;
 +}
 +
@@ -1072,6 +1164,7 @@ index 0000000..a3646ab
 +    uint32_t stride = t->cube ? nv2a_exec_tex_face_stride(t) : 0;
 +    uint32_t *buf = scratch((size_t)w * h), probe;
 +    GLenum target = t->cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
++    double t0 = now_us();
 +
 +    e->supported = buf && nv2a_exec_sample_tex(t, 0, 0, 0, &probe);
 +    if (!e->supported)
@@ -1097,6 +1190,7 @@ index 0000000..a3646ab
 +                     GL_UNSIGNED_BYTE, buf);
 +    }
 +    s_stat.tex_uploads++;
++    pt_add(PT_DEC, t0);
 +    gl_check("texture upload");
 +}
 +
@@ -1126,6 +1220,8 @@ index 0000000..a3646ab
 +    oldest->w = t->width; oldest->h = t->height; oldest->pitch = t->pitch;
 +    oldest->cube = (uint32_t)t->cube;
 +    oldest->checked_flip = 0;
++    oldest->born_flip = s_flip;
++    oldest->changed_flip = s_flip - 100000u;
 +    return oldest;
 +}
 +
@@ -1148,41 +1244,90 @@ index 0000000..a3646ab
 +    if (!range_ok(t->offset, bytes))
 +        return;
 +
-+    s = surf_find(t->offset);
++    /* A surface of this very shape at this address, the one drawn into
++     * last if there are several. Linear formats must agree on the pitch;
++     * swizzled ones have none and agree on the width. */
++    s = NULL;
++    for (i = 0; i < GL_MAX_SURFACES && !t->cube; i++) {
++        GlSurface *o = &s_surf[i];
++        int lin, swz;
++        if (!o->used || o->base != t->offset)
++            continue;
++        lin = !tex_normalised(t->color) && t->pitch == o->pitch
++           && (int)t->width <= o->w && (int)t->height <= o->h
++           && ((o->bpp == 4 && (t->color == 0x12 || t->color == 0x1E))
++            || (o->bpp == 2 && t->color == 0x11));
++        swz = (int)t->width == o->w && (int)t->height <= o->h
++           && ((o->bpp == 4 && (t->color == 0x06 || t->color == 0x07))
++            || (o->bpp == 2 && t->color == 0x05));
++        if ((lin || swz) && (!s || o->draw_seq > s->draw_seq))
++            s = o;
++    }
 +    if (s) {
-+        int same = !t->cube && !tex_normalised(t->color) && t->pitch == s->pitch
-+                && (int)t->width <= s->w && (int)t->height <= s->h
-+                && ((s->bpp == 4 && (t->color == 0x12 || t->color == 0x1E))
-+                 || (s->bpp == 2 && t->color == 0x11));
 +        surf_cpu_check(s);
-+        if (same) {
-+            s->last_use = s_flip;
-+            b->tex = s == target ? surf_snapshot(s) : s->tex;
-+            b->w = (int)t->width; b->h = (int)t->height;
++        s->last_use = s_flip;
++        b->tex = s == target ? surf_snapshot(s) : s->tex;
++        b->w = (int)t->width; b->h = (int)t->height;
++        if (tex_normalised(t->color)) {
++            b->sx = (float)t->width / (float)s->w;
++            b->sy = (float)t->height / (float)s->h;
++            b->mx = (float)t->width; b->my = (float)t->height;
++        } else {
 +            b->sx = 1.0f / (float)s->w; b->sy = 1.0f / (float)s->h;
 +            b->mx = b->my = 1.0f;
-+            b->afloor = t->color == 0x12 ? 0.0f : 1.0f;
-+            b->supported = 1;
-+            return;
 +        }
++        b->afloor = (t->color == 0x12 || t->color == 0x06) ? 0.0f : 1.0f;
++        b->supported = 1;
++        if (!s->swz != !tex_normalised(t->color)) {
++            static unsigned said;
++            if (said++ < 8)
++                fprintf(stderr, "  [GL] stage %d binds surface 0x%08X (%s) as"
++                                " texture format 0x%02X\n", stage, s->base,
++                        s->swz ? "swizzled" : "linear", t->color);
++        }
++        return;
 +    }
 +    /* Read from guest memory: anything drawn into those bytes goes there
-+     * first. */
-+    for (i = 0; i < GL_MAX_SURFACES && !s_verify; i++) {
-+        GlSurface *o = &s_surf[i];
-+        if (o->used && o->gpu_newer && o->base < t->offset + bytes
-+            && t->offset < o->base + surf_bytes(o))
-+            surf_download(o);
++     * first, in the order it was drawn. */
++    for (;;) {
++        GlSurface *o = NULL;
++        if (s_verify)
++            break;
++        for (i = 0; i < GL_MAX_SURFACES; i++) {
++            GlSurface *c = &s_surf[i];
++            if (c->used && c->gpu_newer && c->base < t->offset + bytes
++                && t->offset < c->base + surf_bytes(c)
++                && (!o || c->draw_seq < o->draw_seq))
++                o = c;
++        }
++        if (!o)
++            break;
++        {
++            static unsigned said;
++            if (said++ < 40)
++                fprintf(stderr, "  [GL] stage %d reads surface 0x%08X (pitch %u bpp %u %dx%d)"
++                                " from memory: tex 0x%08X fmt 0x%02X %ux%u pitch %u cube %d\n",
++                        stage, o->base, o->pitch, o->bpp, o->w, o->h, t->offset,
++                        t->color, t->width, t->height, t->pitch, t->cube);
++            surf_download(o, 1);
++            o->gpu_newer = 0;           /* whatever happened: no second try */
++        }
 +    }
 +
 +    e = tex_lookup(t);
 +    e->last_use = s_flip;
-+    if (e->checked_flip != s_flip || touched) {
++    if (e->checked_flip != s_flip
++        || (touched && (s_flip - e->changed_flip < 600
++                        || s_flip - e->born_flip < 8))) {
++        double t0 = now_us();
 +        uint64_t h = hash_bytes(guest(t->offset), (size_t)bytes);
 +        if (t->color == 0x0B && t->palette && range_ok(t->palette, 1024))
 +            h ^= hash_bytes(guest(t->palette), 1024) * 3u;
++        pt_add(PT_HASH, t0);
 +        s_stat.tex_hashed += bytes;
 +        if (!e->checked_flip || h != e->hash) {
++            if (e->checked_flip)
++                e->changed_flip = s_flip;       /* rewritten in place */
 +            e->hash = h;
 +            tex_decode_upload(e, t);
 +        }
@@ -1371,6 +1516,8 @@ index 0000000..a3646ab
 +            snprintf(uv, sizeof uv, "v_t%d.xy / q", st);
 +            emit_sample(sb, st, k->kind[st], uv);
 +            sb_f(sb, "    T.a = max(T.a, u_taf[%d]);\n", st);
++            if (k->akill & (1u << st))
++                sb_f(sb, "    if (T.a == 0.0) discard;\n");
 +            break;
 +        }
 +        case 3:
@@ -1382,6 +1529,8 @@ index 0000000..a3646ab
 +                emit_sample(sb, st, k->kind[st], uv);
 +            }
 +            sb_f(sb, "    T.a = max(T.a, u_taf[%d]);\n", st);
++            if (k->akill & (1u << st))
++                sb_f(sb, "    if (T.a == 0.0) discard;\n");
 +            break;
 +        case 4:
 +            sb_f(sb, "    T = clamp(v_t%d, 0.0, 1.0);\n", st);
@@ -1794,6 +1943,161 @@ index 0000000..a3646ab
 +    o[3] = (float)( c >> 24        ) / 255.0f;
 +}
 +
++/* RECOMP_GL_PROBE=x,y[,file]: describe every batch with a triangle over
++ * that pixel -- which draw put this on the screen, and under what state.
++ * With a file name, only in frames during which the file exists. Each probed
++ * frame also ends with a census of what the whole frame asked for that the
++ * backend does not do: texture stage modes other than 2D/cube lookups, and
++ * texture formats the decoder has no case for. */
++static int s_probe_x = -1, s_probe_y, s_probe_on;
++static const char *s_probe_file;
++static uint32_t s_cen_mode[32], s_cen_fmt[256], s_cen_draws, s_cen_mips;
++static uint32_t s_cen_akill, s_cen_ckey;
++static uint32_t s_cen_mode_tris[32], s_cen_fmt_tris[256];
++
++static void census_batch(const Nv2aGlState *st, int n, const TexBind *tb)
++{
++    int k;
++    s_cen_draws++;
++    if (st->mode != NV2A_GL_MODE_RC)
++        return;
++    for (k = 0; k < 4; k++) {
++        uint32_t mode = (st->rc.stage_program >> (k * 5)) & 0x1F;
++        s_cen_mode[mode]++;
++        s_cen_mode_tris[mode] += (uint32_t)n / 3;
++        if (mode >= 1 && mode <= 3 && st->tex[k].valid) {
++            if (!tb[k].supported) {
++                s_cen_fmt[st->tex[k].color & 0xFF]++;
++                s_cen_fmt_tris[st->tex[k].color & 0xFF] += (uint32_t)n / 3;
++            }
++            if (st->tex[k].levels > 1)
++                s_cen_mips++;
++            if (st->tex[k].control0 & 4u)
++                s_cen_akill++;
++            if (st->tex[k].control0 & 3u)
++                s_cen_ckey++;
++        }
++    }
++}
++
++static void census_print(void)
++{
++    int k;
++    fprintf(stderr, "[CENSUS] %u draws; stage modes (draws/tris):", s_cen_draws);
++    for (k = 0; k < 32; k++)
++        if (s_cen_mode[k])
++            fprintf(stderr, " %d:%u/%u", k, s_cen_mode[k], s_cen_mode_tris[k]);
++    fprintf(stderr, " | unread formats:");
++    for (k = 0; k < 256; k++)
++        if (s_cen_fmt[k])
++            fprintf(stderr, " 0x%02X:%u/%u", k, s_cen_fmt[k], s_cen_fmt_tris[k]);
++    fprintf(stderr, " | stages with mip levels %u, alpha kill %u, colour key"
++                    " (not done) %u\n", s_cen_mips, s_cen_akill, s_cen_ckey);
++    s_cen_akill = s_cen_ckey = 0;
++    memset(s_cen_mode, 0, sizeof s_cen_mode);
++    memset(s_cen_fmt, 0, sizeof s_cen_fmt);
++    memset(s_cen_mode_tris, 0, sizeof s_cen_mode_tris);
++    memset(s_cen_fmt_tris, 0, sizeof s_cen_fmt_tris);
++    s_cen_draws = s_cen_mips = 0;
++}
++
++static void probe_frame(void)
++{
++    static int parsed;
++    if (!parsed) {
++        const char *e = getenv("RECOMP_GL_PROBE");
++        parsed = 1;
++        if (e && sscanf(e, "%d,%d", &s_probe_x, &s_probe_y) == 2) {
++            const char *c = strchr(e, ',');
++            c = c ? strchr(c + 1, ',') : NULL;
++            s_probe_file = c ? c + 1 : NULL;
++        } else {
++            s_probe_x = -1;
++        }
++    }
++    if (s_probe_on)
++        census_print();
++    if (s_probe_x < 0)
++        return;
++    s_probe_on = 1;
++    if (s_probe_file) {
++        /* The file may carry "x,y" to move the probe without a restart. */
++        FILE *f = fopen(s_probe_file, "rb");
++        s_probe_on = f != NULL;
++        if (f) {
++            int x, y;
++            if (fscanf(f, "%d,%d", &x, &y) == 2) {
++                s_probe_x = x;
++                s_probe_y = y;
++            }
++            fclose(f);
++        }
++    }
++    if (s_probe_on)
++        fprintf(stderr, "[PROBE] ---- frame %u\n", s_flip);
++}
++
++static void probe_batch(const Nv2aGlState *st, int n, const TexBind *tb,
++                        const GlSurface *S)
++{
++    float px = (float)s_probe_x + 0.5f, py = (float)s_probe_y + 0.5f;
++    int i, k, hit = -1;
++
++    for (i = 0; i + 2 < n && hit < 0; i += 3) {
++        const float *a = s_q[i].pos, *b = s_q[i + 1].pos, *c = s_q[i + 2].pos;
++        float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
++        float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
++        float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
++        if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0))
++            hit = i;
++    }
++    if (hit < 0)
++        return;
++    fprintf(stderr, "[PROBE] draw #%llu surf 0x%08X %dx%d mode %d tris %d | blend %u"
++                    " s 0x%X d 0x%X eq 0x%X col 0x%08X | mask 0x%08X | atest %u"
++                    " f 0x%X ref %u | ztest %u f 0x%X zmask %u\n",
++            (unsigned long long)s_stat.draws, S->base, S->w, S->h, st->mode,
++            n / 3, st->blend_enable, st->blend_sfactor, st->blend_dfactor,
++            st->blend_equation, st->blend_color, st->color_mask, st->alpha_test,
++            st->alpha_func, st->alpha_ref, st->depth_test, st->depth_func,
++            st->depth_mask);
++    if (st->mode == NV2A_GL_MODE_RC) {
++        uint32_t ns = st->rc.control & 0xFF;
++        fprintf(stderr, "[PROBE]   rc control 0x%08X stage_program 0x%05X final"
++                        " 0x%08X 0x%08X fc 0x%08X 0x%08X\n", st->rc.control,
++                st->rc.stage_program & 0xFFFFFu, st->rc.final0, st->rc.final1,
++                st->rc.final_c0, st->rc.final_c1);
++        for (k = 0; k < (int)ns && k < 8; k++)
++            fprintf(stderr, "[PROBE]   rc%d cicw 0x%08X cocw 0x%08X aicw 0x%08X"
++                            " aocw 0x%08X c0 0x%08X c1 0x%08X\n", k,
++                    st->rc.color_icw[k], st->rc.color_ocw[k], st->rc.alpha_icw[k],
++                    st->rc.alpha_ocw[k], st->rc.factor0[k], st->rc.factor1[k]);
++    }
++    for (k = 0; k < 4; k++) {
++        const Nv2aTexture *t = &st->tex[k];
++        uint32_t mode = (st->rc.stage_program >> (k * 5)) & 0x1F;
++        if (!t->valid && !mode)
++            continue;
++        fprintf(stderr, "[PROBE]   tex%d mode %u valid %d 0x%08X fmt 0x%02X %ux%u"
++                        " pitch %u levels %u cube %d wrap %u,%u filter 0x%08X"
++                        " ctl0 0x%08X -> %s gl %u\n", k, mode, t->valid,
++                t->offset, t->color, t->width, t->height, t->pitch, t->levels,
++                t->cube, t->addr_u, t->addr_v, t->filter, t->control0,
++                tb[k].supported ? "bound" : "WHITE", tb[k].tex);
++    }
++    for (k = 0; k < 3; k++) {
++        const Nv2aGlVertex *v = &s_q[hit + k];
++        fprintf(stderr, "[PROBE]   v%d pos %.1f %.1f %.4f w %.4f d0 %.3f %.3f %.3f"
++                        " %.3f d1 %.3f %.3f %.3f %.3f t0 %.4f %.4f %.4f %.4f"
++                        " t1 %.4f %.4f %.4f %.4f t2 %.4f %.4f t3 %.4f %.4f\n", k,
++                v->pos[0], v->pos[1], v->pos[2], v->pos[3], v->d0[0], v->d0[1],
++                v->d0[2], v->d0[3], v->d1[0], v->d1[1], v->d1[2], v->d1[3],
++                v->tex[0][0], v->tex[0][1], v->tex[0][2], v->tex[0][3],
++                v->tex[1][0], v->tex[1][1], v->tex[1][2], v->tex[1][3],
++                v->tex[2][0], v->tex[2][1], v->tex[3][0], v->tex[3][1]);
++    }
++}
++
 +void nv2a_gl_draw(const Nv2aGlState *st, uint32_t *zpass)
 +{
 +    int n = s_nverts, i, stage, used[4] = {0, 0, 0, 0}, linear[4] = {0, 0, 0, 0};
@@ -1804,6 +2108,7 @@ index 0000000..a3646ab
 +    GlProg *p;
 +    float tsc[16], taf[4];
 +    GLint tsz[16];
++    double t_draw = now_us(), t_part;
 +
 +    s_nverts = 0;
 +    if (zpass)
@@ -1813,6 +2118,8 @@ index 0000000..a3646ab
 +    S = surf_get(st->color_base, st->pitch, st->bpp, st->clip_y + st->clip_h);
 +    if (!S)
 +        return;
++    S->swz = st->swizzled;
++    S->draw_seq = ++s_draw_seq;
 +
 +    /* Program key and textures. */
 +    memset(&key, 0, sizeof key);
@@ -1844,6 +2151,10 @@ index 0000000..a3646ab
 +            used[stage] = 1;
 +            tex_resolve(st, stage, S, &tb[stage]);
 +            linear[stage] = tex_linear(&st->tex[stage]);
++            /* Alpha kill; a cube map read as 2D samples white, never 0. */
++            if ((st->tex[stage].control0 & 4u) && tb[stage].supported
++                && (mode == 3 || !tb[stage].cube))
++                key.akill |= 1u << stage;
 +            if (mode == 3 && tb[stage].cube)
 +                key.kind[stage] = KIND_CUBE;
 +            else if (tb[stage].cube)
@@ -1879,6 +2190,13 @@ index 0000000..a3646ab
 +        return;
 +    if (st->use_depth)
 +        depth = depth_for(st->zeta_offset, S->w, S->h);
++
++    if (s_probe_on) {
++        census_batch(st, n, tb);
++        probe_batch(st, n, tb, S);
++    }
++    pt_add(PT_RESOLVE, t_draw);
++    t_part = now_us();
 +
 +    /* Target and per-fragment state. */
 +    glBindFramebuffer(GL_FRAMEBUFFER, fbo_for(S->tex, depth));
@@ -1968,21 +2286,29 @@ index 0000000..a3646ab
 +    glUniform4iv(p->u_tsz, 4, tsz);
 +    glUniform1fv(p->u_taf, 4, taf);
 +
++    pt_add(PT_STATE, t_part);
++    t_part = now_us();
 +    glBufferData(GL_ARRAY_BUFFER, (ptrdiff_t)sizeof(Nv2aGlVertex) * n, s_q,
 +                 GL_STREAM_DRAW);
++    pt_add(PT_VBO, t_part);
++    t_part = now_us();
 +    if (st->zpass_enable && zpass) {
 +        GLuint r = 0;
++        double tq = now_us();
 +        glBeginQuery(GL_SAMPLES_PASSED, s_query);
 +        glDrawArrays(GL_TRIANGLES, 0, n);
 +        glEndQuery(GL_SAMPLES_PASSED);
 +        glGetQueryObjectuiv(s_query, GL_QUERY_RESULT, &r);
++        pt_add(PT_QUERY, tq);
 +        *zpass = r;
 +    } else {
 +        glDrawArrays(GL_TRIANGLES, 0, n);
 +    }
++    pt_add(PT_CALL, t_part);
 +    S->gpu_newer = 1;
 +    s_stat.draws++;
 +    s_stat.tris += (uint64_t)n / 3;
++    pt_add(PT_DRAW, t_draw);
 +    gl_check("draw");
 +}
 +
@@ -2005,6 +2331,8 @@ index 0000000..a3646ab
 +    glClearColor(c[0], c[1], c[2], S->bpp == 4 ? c[3] : 1.0f);
 +    glClear(GL_COLOR_BUFFER_BIT);
 +    S->gpu_newer = 1;
++    S->swz = st->swizzled;
++    S->draw_seq = ++s_draw_seq;
 +    gl_check("clear");
 +}
 +
@@ -2025,7 +2353,7 @@ index 0000000..a3646ab
 +        return;
 +    s = surf_find(color_base);
 +    if (s)
-+        surf_download(s);
++        surf_download(s, 0);
 +}
 +
 +void nv2a_gl_flip(void)
@@ -2036,7 +2364,12 @@ index 0000000..a3646ab
 +    if (s_state <= 0)
 +        return;
 +    s_flip++;
-+    glFlush();
++    probe_frame();
++    {
++        double t0 = now_us();
++        glFlush();
++        pt_add(PT_FLIP, t0);
++    }
 +    /* The hidden window still has a queue; keep it empty. */
 +    while (PeekMessageA(&msg, s_hwnd, 0, 0, PM_REMOVE))
 +        DispatchMessageA(&msg);
@@ -2190,6 +2523,25 @@ index 0000000..a3646ab
 +            (unsigned long long)(s_stat.tex_hashed >> 20),
 +            (unsigned long long)s_stat.downloads,
 +            (unsigned long long)s_stat.uploads);
++    {
++        static const char *const nm[PT_N] = { "download", "upload", "surfcheck",
++            "texhash", "texdecode", "draw", "query", "snapshot", "flush",
++            "d.resolve", "d.state", "d.vbo", "d.call" };
++        int k;
++        fprintf(stderr, "[GLT]");
++        for (k = 0; k < PT_N; k++) {
++            fprintf(stderr, " %s %.0f ms/%llu", nm[k], s_pt[k].us / 1000.0,
++                    (unsigned long long)s_pt[k].n);
++            s_pt[k].us = 0; s_pt[k].n = 0;
++        }
++        fprintf(stderr, " | dl dump %llu tex %llu reshape %llu evict %llu | ul new %llu cpu %llu dl-diverted %llu\n",
++                (unsigned long long)s_dl_cause[0], (unsigned long long)s_dl_cause[1],
++                (unsigned long long)s_dl_cause[2], (unsigned long long)s_dl_cause[3],
++                (unsigned long long)s_ul_cause[0], (unsigned long long)s_ul_cause[1],
++                (unsigned long long)s_ul_cause[2]);
++        memset(s_dl_cause, 0, sizeof s_dl_cause);
++        memset(s_ul_cause, 0, sizeof s_ul_cause);
++    }
 +}
 +
 +#else  /* not Windows: software only */
@@ -2218,10 +2570,10 @@ index 0000000..a3646ab
 +#endif
 diff --git a/src/kernel/nv2a_gl.h b/src/kernel/nv2a_gl.h
 new file mode 100644
-index 0000000..15c0bc6
+index 0000000..cd79f5a
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.h
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,127 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor (nv2a_pb_exec.c).
 + *
@@ -2253,6 +2605,8 @@ index 0000000..15c0bc6
 +    uint32_t palette;                   /* guest address of the CLUT, P8 */
 +    uint32_t levels;                    /* mip levels, from FORMAT       */
 +    uint32_t filter;                    /* SET_TEXTURE_FILTER            */
++    uint32_t control0;                  /* SET_TEXTURE_CONTROL0: bit 2 =
++                                         * alpha kill, bits 0-1 colour key */
 +    int      cube;                      /* FORMAT: six faces, not one    */
 +    int      valid;
 +} Nv2aTexture;
@@ -2281,6 +2635,7 @@ index 0000000..15c0bc6
 +    float    zmax;          /* largest depth value of the zeta format      */
 +    int      use_depth;
 +    int      depth_clamp;   /* ZMIN_MAX_CONTROL bit 4                      */
++    int      swizzled;      /* SET_SURFACE_FORMAT type 2                   */
 +    /* Per-fragment state. */
 +    uint32_t blend_enable, blend_sfactor, blend_dfactor;
 +    uint32_t blend_equation, blend_color;
@@ -2347,7 +2702,7 @@ index 0000000..15c0bc6
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..f934b90 100644
+index c65632c..cef23ab 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -37,6 +37,7 @@
@@ -2491,7 +2846,40 @@ index c65632c..f934b90 100644
                  p[x] = v;
          }
      }
-@@ -1245,6 +1290,55 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
+@@ -854,6 +899,11 @@ static uint32_t linear_twin(uint32_t fmt)
+ {
+     switch (fmt) {
+     case 0x00: return 0x13;                /* L8        -> LIN_L8        */
++    case 0x01: return 0x1B;                /* AL8       -> LIN_AL8       */
++    case 0x1A: return 0x20;                /* A8L8      -> LIN_A8L8      */
++    case 0x3A: return 0x3F;                /* A8B8G8R8  -> LIN_A8B8G8R8  */
++    case 0x3B: return 0x40;                /* B8G8R8A8  -> LIN_B8G8R8A8  */
++    case 0x3C: return 0x41;                /* R8G8B8A8  -> LIN_R8G8B8A8  */
+     case 0x02: return 0x10;                /* A1R5G5B5  -> LIN_A1R5G5B5  */
+     case 0x03: return 0x1C;                /* X1R5G5B5  -> LIN_X1R5G5B5  */
+     case 0x04: return 0x1D;                /* A4R4G4B4  -> LIN_A4R4G4B4  */
+@@ -1006,6 +1056,20 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+     case 0x1F:                                      /* LIN_A8 */
+         *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
+         return 1;
++    /* One byte that is both alpha and luminance. */
++    case 0x1B: {                                    /* LIN_AL8 */
++        uint32_t t = p[u];
++        *argb = (t << 24) | (t << 16) | (t << 8) | t;
++        return 1;
++    }
++    /* Alpha in the high byte, luminance in the low one. Halo 2's HUD meters
++     * (the shield bar) are A8L8 masks; unread, the stage sampled white and
++     * the meter was a solid rectangle of its tint. */
++    case 0x20: {                                    /* LIN_A8L8 */
++        uint32_t t = ((const uint16_t *)p)[u], l = t & 0xFFu;
++        *argb = ((t >> 8) << 24) | (l << 16) | (l << 8) | l;
++        return 1;
++    }
+ 
+     /* 4:2:2 packed YUV, two texels per four bytes.
+      *
+@@ -1245,6 +1309,55 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
      }
  }
  
@@ -2547,7 +2935,7 @@ index c65632c..f934b90 100644
  /* Half-space fill. Barycentric edge functions rather than scanline slopes:
   * the same test decides both windings, so a title that emits clockwise
   * triangles does not silently render nothing. */
-@@ -1285,6 +1379,15 @@ static void raster_triangle(const float a[2], const float b[2],
+@@ -1285,6 +1398,15 @@ static void raster_triangle(const float a[2], const float b[2],
          return;
      }
  
@@ -2563,7 +2951,41 @@ index c65632c..f934b90 100644
      for (y = miny; y < maxy; y++) {
          for (x = minx; x < maxx; x++) {
              float px = (float)x + 0.5f, py = (float)y + 0.5f;
-@@ -1785,6 +1888,65 @@ static int alpha_test_pass(float a)
+@@ -1620,9 +1742,12 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+ {
+     switch (fmt) {
+     case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
++    case 0x1B:
+         return 1;
+     case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
+-    case 0x1C: case 0x1D:
++    case 0x1C: case 0x1D: case 0x1A: case 0x20:
++    case 0x16: case 0x17: case 0x18: case 0x27: case 0x28: case 0x29:
++    case 0x37:
+         return 2;
+     default:
+         return 4;
+@@ -1702,14 +1827,17 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
+         return 1;
+     case 1: case 2:                               /* PROJECT2D / 3D */
+         rc_texel(t, 0, c[0] / q, c[1] / q, out);
+-        return 1;
++        /* D3DTSS_ALPHAKILL (CONTROL0 bit 2): a texel whose alpha is zero
++         * drops the pixel. Halo 2's HUD meters are drawn as whole padded
++         * textures and rely on it for everything outside the shape. */
++        return !((t->control0 & 4u) && out[3] == 0.0f);
+     case 3: {                                     /* CUBEMAP */
+         float x = c[0], y = c[1], z = c[2];
+         float ax = fabsf(x), ay = fabsf(y), az = fabsf(z), ma, sc, tc;
+         uint32_t face;
+         if (!t->cube) {
+             rc_texel(t, 0, c[0], c[1], out);
+-            return 1;
++            return !((t->control0 & 4u) && out[3] == 0.0f);
+         }
+         if (ax >= ay && ax >= az) {
+             face = x > 0 ? 0 : 1; ma = ax; sc = x > 0 ? -z : z; tc = -y;
+@@ -1785,6 +1913,66 @@ static int alpha_test_pass(float a)
      }
  }
  
@@ -2586,6 +3008,7 @@ index c65632c..f934b90 100644
 +    st->use_depth = mode != NV2A_GL_MODE_2D
 +                 && (s_gpu.depth_test || s_gpu.depth_mask);
 +    st->depth_clamp = (s_gpu.zminmax_control & 0x10) != 0;
++    st->swizzled = ((s_gpu.format >> 8) & 0xF) == 2;
 +    st->blend_enable = s_gpu.blend_enable;
 +    st->blend_sfactor = s_gpu.blend_sfactor;
 +    st->blend_dfactor = s_gpu.blend_dfactor;
@@ -2629,7 +3052,7 @@ index c65632c..f934b90 100644
  /* Everything a triangle's pixels need, computed once per triangle, so the
   * pixel loop can run over any subset of rows on any thread. */
  typedef struct {
-@@ -1794,6 +1956,7 @@ typedef struct {
+@@ -1794,6 +1982,7 @@ typedef struct {
      const float *a, *b, *c;
      float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
      float *zb;
@@ -2637,7 +3060,7 @@ index c65632c..f934b90 100644
      int minx, maxx, miny, maxy, use_rc, textured;
  } XfTri;
  
-@@ -1820,6 +1983,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -1820,6 +2009,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
              /* w1 is opposite a, w2 opposite b, w0 opposite c. */
              l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
              z = l0 * a[2] + l1 * b[2] + l2 * c[2];
@@ -2646,7 +3069,7 @@ index c65632c..f934b90 100644
              {
                  float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
                  int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
-@@ -1904,12 +2069,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -1904,12 +2095,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -2690,7 +3113,7 @@ index c65632c..f934b90 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -1919,7 +2115,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -1919,7 +2141,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -2705,7 +3128,7 @@ index c65632c..f934b90 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -1985,6 +2187,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -1985,6 +2213,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
  }
  #endif
  
@@ -2789,7 +3212,7 @@ index c65632c..f934b90 100644
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                 const Nv2aVshOutput *vc)
  {
-@@ -2004,6 +2283,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2004,6 +2309,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      T.textured = s_gpu.texs[0].valid;
      T.use_rc = s_gpu.rc_seen && !no_rc;
      T.va = va; T.vb = vb; T.vc = vc;
@@ -2798,7 +3221,7 @@ index c65632c..f934b90 100644
  
      v[0] = va; v[1] = vb; v[2] = vc;
      a = va->pos; b = vb->pos; c = vc->pos;
-@@ -2028,7 +2309,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2028,7 +2335,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_seeded = 1;
      if (!surface_begin_batch(T.mem))
          return;
@@ -2808,7 +3231,7 @@ index c65632c..f934b90 100644
          T.zb = zbuf_current(1);
      if (tex_size_from_format(s_gpu.texs[0].color)) {
          su = (float)s_gpu.texs[0].width;
-@@ -2070,7 +2352,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2070,7 +2378,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -2839,7 +3262,7 @@ index c65632c..f934b90 100644
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
      s_gpu.zpass_count += cnt.zpass;
-@@ -2180,9 +2484,30 @@ static void raster_batch_program(void)
+@@ -2180,9 +2510,30 @@ static void raster_batch_program(void)
  {
      uint32_t i, n = s_gpu.idx_count;
  
@@ -2873,7 +3296,17 @@ index c65632c..f934b90 100644
      s_gpu.batches_program++;
      s_gpu.verts_program += n;
      if (s_gpu.blend_enable) {
-@@ -2851,12 +3176,286 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2840,6 +3191,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+     case NV097_SET_TEXTURE_CONTROL1:
+         t->pitch = param >> 16;          /* linear formats only */
+         break;
++    case 0x1B0C:                                  /* SET_TEXTURE_CONTROL0 */
++        t->control0 = param;
++        break;
+     case NV097_SET_TEXTURE_IMAGE_RECT:
+         t->width  = param >> 16;
+         t->height = param & 0xFFFF;
+@@ -2851,12 +3205,305 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          break;
      }
      tex_update_valid(t);
@@ -2916,6 +3349,18 @@ index c65632c..f934b90 100644
 +}
 +
 +static HANDLE s_swi_done_event;        /* set by nv2a_swi_done */
++/* Profile counters, printed and reset by nv2a_pb_exec_report. */
++uint64_t g_nv2a_prof_swi_ticks, g_nv2a_prof_swi_n;
++uint64_t g_nv2a_prof_scan_ticks, g_nv2a_prof_scan_n, g_nv2a_prof_idle_n;
++static LARGE_INTEGER s_prof_scan_t0;
++void nv2a_prof_scan_begin(void) { QueryPerformanceCounter(&s_prof_scan_t0); }
++void nv2a_prof_scan_end(void)
++{
++    LARGE_INTEGER q;
++    QueryPerformanceCounter(&q);
++    g_nv2a_prof_scan_ticks += (uint64_t)(q.QuadPart - s_prof_scan_t0.QuadPart);
++    g_nv2a_prof_scan_n++;
++}
 +
 +static void nv2a_swi_post(uint32_t param)
 +{
@@ -2955,9 +3400,16 @@ index c65632c..f934b90 100644
 +        DWORD t0 = GetTickCount();
 +        if (!s_swi_done_event)
 +            s_swi_done_event = CreateEventA(NULL, FALSE, FALSE, NULL);
-+        xbox_TimerThreadWake();
-+        while (s_swi_head != s_swi_tail && GetTickCount() - t0 < 200)
-+            WaitForSingleObject(s_swi_done_event, 2);
++        {
++            LARGE_INTEGER q0, q1;
++            QueryPerformanceCounter(&q0);
++            xbox_TimerThreadWake();
++            while (s_swi_head != s_swi_tail && GetTickCount() - t0 < 200)
++                WaitForSingleObject(s_swi_done_event, 2);
++            QueryPerformanceCounter(&q1);
++            g_nv2a_prof_swi_ticks += (uint64_t)(q1.QuadPart - q0.QuadPart);
++            g_nv2a_prof_swi_n++;
++        }
 +        if (s_swi_head != s_swi_tail) {
 +            static unsigned said;
 +            if (said++ < 4)
@@ -3160,7 +3612,7 @@ index c65632c..f934b90 100644
      static int inited;
      if (!inited) {
          inited = 1;
-@@ -3004,8 +3603,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3004,8 +3651,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -3177,7 +3629,7 @@ index c65632c..f934b90 100644
          break;
  
      case NV097_SET_BEGIN_END:
-@@ -3119,6 +3724,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3119,6 +3772,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -3199,7 +3651,7 @@ index c65632c..f934b90 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-@@ -3146,6 +3766,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3146,6 +3814,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -3208,7 +3660,7 @@ index c65632c..f934b90 100644
  
          if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
              static unsigned n;
-@@ -3181,6 +3803,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3181,6 +3851,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
      case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
      case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
@@ -3233,16 +3685,29 @@ index c65632c..f934b90 100644
  
      default:
          if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
-@@ -3449,6 +4089,7 @@ void nv2a_pb_exec_report(void)
+@@ -3449,6 +4137,20 @@ void nv2a_pb_exec_report(void)
      /* Drawn and skipped separately: "nothing appeared" and "every batch needed
       * a vertex program we do not run" look identical on screen, and only one
       * of them means the rasteriser is broken. */
 +    nv2a_gl_report();
++    {
++        LARGE_INTEGER f;
++        QueryPerformanceFrequency(&f);
++        fprintf(stderr, "[GPT] swi wait %.0f ms/%llu | scan %.0f ms/%llu segments,"
++                        " %llu idle polls\n",
++                (double)g_nv2a_prof_swi_ticks * 1000.0 / (double)f.QuadPart,
++                (unsigned long long)g_nv2a_prof_swi_n,
++                (double)g_nv2a_prof_scan_ticks * 1000.0 / (double)f.QuadPart,
++                (unsigned long long)g_nv2a_prof_scan_n,
++                (unsigned long long)g_nv2a_prof_idle_n);
++        g_nv2a_prof_swi_ticks = g_nv2a_prof_swi_n = 0;
++        g_nv2a_prof_scan_ticks = g_nv2a_prof_scan_n = g_nv2a_prof_idle_n = 0;
++    }
      fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
      fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
                      " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index 65bbedb..72a4f5f 100644
+index 65bbedb..039dd4f 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
 @@ -163,14 +163,54 @@ void nv2a_pb_scan_report(void)
@@ -3331,7 +3796,7 @@ index 65bbedb..72a4f5f 100644
                  /* Same walk, two consumers: the survey counts, the executor
                   * acts. Keeping them on one decode means they can never
                   * disagree about what the stream said. */
-@@ -228,15 +278,20 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+@@ -228,15 +278,26 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
  
      if (s_exec_enabled < 0)
          s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
@@ -3346,12 +3811,18 @@ index 65bbedb..72a4f5f 100644
      if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
          end_va = start_va + 0x400000u;
  
++    {
++        extern void nv2a_prof_scan_begin(void);
++        nv2a_prof_scan_begin();
++    }
      words = pb_walk(start_va, end_va, 0, &jumps, &unknown);
 +    /* Nothing stays queued past the segment: the caller reports the GPU as
 +     * having consumed it. */
 +    if (s_exec_enabled) {
 +        extern void nv2a_pb_exec_flush(void);
++        extern void nv2a_prof_scan_end(void);
 +        nv2a_pb_exec_flush();
++        nv2a_prof_scan_end();
 +    }
  
      s_tot_words += words;
@@ -4163,7 +4634,7 @@ index 8acb0af..5b533f5 100644
  /* Run the program from the start slot on one vertex. Inputs are the ten
   * attribute values as floats. Returns 0 if there is no program to run (no
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..b6bb8ca 100644
+index 72d5131..8cc7bb8 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -152,6 +152,9 @@ static size_t xbox_TiledApertureSize(void)
@@ -4301,7 +4772,15 @@ index 72d5131..b6bb8ca 100644
              if (start != last_start) {
                  last_start = start;
                  fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
-@@ -1176,6 +1260,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+@@ -1057,6 +1141,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                                + g_memory_offset) = GetTickCount();
+ 
++        { extern uint64_t g_nv2a_prof_idle_n; g_nv2a_prof_idle_n++; }
+         Sleep(0);  /* yield; the waiter is spinning on another core */
+     }
+     return 0;
+@@ -1176,6 +1261,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  /* SEH frame pointer bridge (see recomp_types.h for explanation) */
  RECOMP_TLS uint32_t g_seh_ebp = 0;
  RECOMP_TLS double g_fp_stack[8];
@@ -4314,7 +4793,7 @@ index 72d5131..b6bb8ca 100644
  RECOMP_TLS int g_fp_top = 0;
  
  /* Set once at startup. The generated code reads it at the ret of every
-@@ -3094,6 +3184,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+@@ -3094,6 +3185,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
      g_contig_block_count++;
  }
  
