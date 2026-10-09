@@ -1,8 +1,21 @@
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..5530c11 100644
+index c65ba43..9e9596f 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
-@@ -2284,6 +2284,53 @@ static void kernel_vblank_tick(void)
+@@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
+     if (low && high >= low && (high - low + 1) <= size + 0x1000) {
+         xbox_va = XBOX_PHYSICAL_MIRROR_BASE + low;
+ 
++        /* Keep the ordinary arena out of it; see xbox_ContiguousReserve. */
++        {
++            extern void xbox_ContiguousReserve(uint32_t va, uint32_t size);
++            xbox_ContiguousReserve(xbox_va, size);
++        }
++
+         /* The console hands out zeroed pages here, and titles rely on it:
+          * pool headers and free-list roots are assumed clear, so whatever the
+          * backing view happened to contain shows up later as structures that
+@@ -2284,6 +2290,53 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -56,7 +69,7 @@ index c65ba43..5530c11 100644
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2572,6 +2619,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2572,6 +2625,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
  
          Sleep(10);
          kernel_vblank_tick();  /* the GPU's frame clock */
@@ -64,7 +77,7 @@ index c65ba43..5530c11 100644
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -3880,6 +3928,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3880,6 +3934,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);

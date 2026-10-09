@@ -37,10 +37,30 @@ index 65bbedb..a158d14 100644
              end_va = va + 0x400000u;
              continue;
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..c76057a 100644
+index 72d5131..7c0c56c 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
-@@ -970,14 +970,31 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -966,18 +966,57 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                     static uint32_t put_lo, put_hi;
+                     if (!put_lo || put < put_lo) put_lo = put;
+                     if (put > put_hi) put_hi = put;
+-                    if (last_put && put > last_put) {
++                    if (last_put && put > last_put
++                            && put - last_put > 0x00200000u) {
++                        /* Not one submission: PUT has moved to a different
++                         * ring (a title that destroys its device and creates
++                         * another gets a new pushbuffer somewhere else).
++                         * Everything between the two is somebody's memory --
++                         * for Halo 2 its 51 MB pool, movie and all -- and
++                         * walking it as commands produced clears 44925 pixels
++                         * wide and a fault on a pointer read out of the
++                         * movie. Start again from the new position. */
++                        static unsigned said;
++                        if (said++ < 4)
++                            fprintf(stderr, "  [NV2A] PUT moved 0x%08X -> 0x%08X:"
++                                    " a different pushbuffer, gap not scanned" "\n",
++                                    last_put, put);
++                    } else if (last_put && put > last_put) {
                          nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                       XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                      } else if (last_put && put < last_put) {
@@ -49,6 +69,9 @@ index 72d5131..c76057a 100644
 -                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
 -                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
 -                        if (put > put_lo)
+-                            nv2a_pb_scan(
+-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
+-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
 +                        /* Follow the title's own JUMP across the seam rather
 +                         * than the learned bounds. put_lo is the lowest PUT
 +                         * ever seen, and a title that destroys its device and
@@ -63,18 +86,65 @@ index 72d5131..c76057a 100644
 +                        uint32_t tgt;
 +
 +                        (void)nv2a_pb_take_ring_jump();
-+                        nv2a_pb_scan(from, from + 0x400000u);  /* runs to the JUMP */
++                        /* Bounded: the JUMP is at most one submission past
++                         * the last PUT. Further than that there is no JUMP,
++                         * only whatever lies beyond the ring. */
++                        nv2a_pb_scan(from, from + 0x20000u);   /* runs to the JUMP */
 +                        tgt = nv2a_pb_take_ring_jump();
 +                        if (tgt) {
-+                            if (tgt < to)
++                            if (tgt < to && to - tgt <= 0x00200000u)
 +                                nv2a_pb_scan(tgt, to);
-+                        } else if (put > put_lo) {
-+                            /* No JUMP found: the old guess is all there is. */
-                             nv2a_pb_scan(
-                                 XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
--                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-+                                to);
++                        } else {
++                            /* No JUMP: PUT was reset (device teardown), not
++                             * wrapped. Nothing below it is known to be this
++                             * ring, so nothing is scanned. */
++                            static unsigned said;
++                            if (said++ < 4)
++                                fprintf(stderr, "  [NV2A] PUT went back 0x%08X -> 0x%08X"
++                                        " with no JUMP; not scanned" "\n",
++                                        last_put, put);
 +                        }
                          if (getenv("RECOMP_PB_WRAP_TRACE")) {
                              static unsigned wraps;
                              if (wraps++ < 8)
+@@ -3094,6 +3133,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+     g_contig_block_count++;
+ }
+ 
++/* Take a range the title pinned at a fixed physical address out of the arena.
++ *
++ * MmAllocateContiguousMemoryEx with lowest/highest spanning exactly one
++ * allocation is honoured at that address, but nothing told this allocator, so
++ * the bump pointer kept handing out memory inside the pinned block. Halo 2
++ * pins a 51 MB pool at physical 0x61000 after freeing its first D3D device,
++ * then creates the second one: its pushbuffer, framebuffers and fence page all
++ * landed inside the pool. Reading the 13 MB intro movie into the pool then
++ * overwrote the framebuffer (noise on screen), the fence word and DirectSound's
++ * heap (a free-list walk that never ended).
++ *
++ * The bump pointer is moved past the pinned block. Blocks handed out below it
++ * earlier are the caller's business: the title frees what it had there before
++ * it pins, as it would have to on the console. */
++void xbox_ContiguousReserve(uint32_t va, uint32_t size)
++{
++    uint32_t end = (va + size + 4095u) & ~4095u;
++
++    AcquireSRWLockExclusive(&g_contig_lock);
++    if (end > g_contig_next) {
++        if (xbox_HeapReclaimEnabled()) {
++            if (va > g_contig_next)
++                contig_insert(g_contig_block_count, g_contig_next,
++                              va - g_contig_next, 1);
++            contig_insert(g_contig_block_count, va, end - va, 0);
++        }
++        fprintf(stderr, "  [CONTIG] pinned 0x%08X..0x%08X reserved; arena continues at 0x%08X"
++                "\n", va, end, end);
++        fflush(stderr);
++        g_contig_next = end;
++    }
++    ReleaseSRWLockExclusive(&g_contig_lock);
++}
++
+ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+ {
+     uint32_t result = 0;

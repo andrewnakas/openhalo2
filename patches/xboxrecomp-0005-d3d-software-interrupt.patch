@@ -1,8 +1,64 @@
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..9b13466 100644
+index c65632c..94bdce9 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
-@@ -2855,8 +2855,117 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -679,12 +679,44 @@ static void clear_surface(uint32_t param)
+         s_gpu.color_base = base;
+     }
+ 
+-    for (y = 0; y < s_gpu.clip_h; y++) {
++    /* The clear rectangle is the title's, and nothing says it fits the
++     * surface. A row is never wider than its pitch, and the surface never
++     * runs past the contiguous window; a rectangle that claims otherwise is
++     * clamped rather than written. Halo 2 clears with one after its intro
++     * movie, and unclamped that walked off the end of the window. */
++    uint32_t cw = s_gpu.clip_w, ch = s_gpu.clip_h;
++    {
++        uint32_t max_w = s_gpu.pitch / bpp;
++        uint32_t ow = cw, oh = ch;
++
++        if (s_gpu.clip_x >= max_w)
++            return;
++        if (cw > max_w - s_gpu.clip_x)
++            cw = max_w - s_gpu.clip_x;
++        if (s_gpu.color_base >= XBOX_CONTIG_BASE) {
++            uint64_t limit = (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
++            uint64_t rows = (limit - s_gpu.color_base) / s_gpu.pitch;
++            if (rows <= s_gpu.clip_y)
++                return;
++            if (ch > rows - s_gpu.clip_y)
++                ch = (uint32_t)(rows - s_gpu.clip_y);
++        }
++        if (cw != ow || ch != oh) {
++            static unsigned said;
++            if (said++ < 4)
++                fprintf(stderr, "  [GPU] clear rectangle %ux%u+%u+%u clamped to %ux%u"
++                                " (surface 0x%08X pitch %u)" "\n",
++                        ow, oh, s_gpu.clip_x, s_gpu.clip_y, cw, ch,
++                        s_gpu.color_base, s_gpu.pitch);
++        }
++    }
++
++    for (y = 0; y < ch; y++) {
+         uint8_t *row = mem + s_gpu.color_base
+                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+         if (bpp == 4) {
+             uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
+-            for (x = 0; x < s_gpu.clip_w; x++)
++            for (x = 0; x < cw; x++)
+                 p[x] = s_gpu.clear_color;
+         } else if (bpp == 2) {
+             /* The clear value is always given as A8R8G8B8; a 16-bit surface
+@@ -693,7 +725,7 @@ static void clear_surface(uint32_t param)
+                                   | ((s_gpu.clear_color >> 5) & 0x07E0)
+                                   | ((s_gpu.clear_color >> 3) & 0x001F));
+             uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
+-            for (x = 0; x < s_gpu.clip_w; x++)
++            for (x = 0; x < cw; x++)
+                 p[x] = v;
+         }
+     }
+@@ -2855,8 +2887,117 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          record_tex_reg(method, param);
  }
  
