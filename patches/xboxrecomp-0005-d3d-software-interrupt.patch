@@ -1,8 +1,8 @@
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..5a171ed 100644
+index c65632c..9b13466 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
-@@ -2855,8 +2855,109 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2855,8 +2855,117 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          record_tex_reg(method, param);
  }
  
@@ -18,15 +18,23 @@ index c65632c..5a171ed 100644
 + * The parameters are queued here and handed to the title's handler from the
 + * timer thread (kernel_d3d_swi_tick), which has a guest stack. One producer
 + * (the executor) and one consumer, so plain indices are enough on x86. */
-+#define NV2A_SWI_QUEUE 64u
++#define NV2A_SWI_QUEUE 4096u
 +static volatile uint32_t s_swi_head, s_swi_tail;
 +static uint32_t s_swi_param[NV2A_SWI_QUEUE];
 +
 +static void nv2a_swi_post(uint32_t param)
 +{
 +    uint32_t t = s_swi_tail;
-+    if (t - s_swi_head >= NV2A_SWI_QUEUE)
-+        return;                               /* full: the fence is lost */
++    if (t - s_swi_head >= NV2A_SWI_QUEUE) {
++        /* Full: this fence is lost, and whatever waits on it waits forever.
++         * Never silently -- a stalled frame loop with no log line is an
++         * afternoon. */
++        static unsigned dropped;
++        if (dropped++ < 8)
++            fprintf(stderr, "  [NV2A] software interrupt 0x%08X DROPPED: queue full (%u pending)" "\n",
++                    param, t - s_swi_head);
++        return;
++    }
 +    s_swi_param[t % NV2A_SWI_QUEUE] = param;
 +    s_swi_tail = t + 1;
 +}

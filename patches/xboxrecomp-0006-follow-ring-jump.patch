@@ -1,0 +1,80 @@
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index 65bbedb..a158d14 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -163,6 +163,17 @@ void nv2a_pb_scan_report(void)
+  * The NV2A has one level of subroutine, so a CALL inside a call is not
+  * followed. Addresses are physical, like PUT's, and reach guest memory the
+  * same way: through the contiguous window. */
++static uint32_t s_ring_jump_target;
++
++/* Where the last top-level segment jumped to, or 0 if it did not. Cleared by
++ * the read, so a stale target is never reused. */
++uint32_t nv2a_pb_take_ring_jump(void)
++{
++    uint32_t t = s_ring_jump_target;
++    s_ring_jump_target = 0;
++    return t;
++}
++
+ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+                         uint32_t *jumps, uint32_t *unknown)
+ {
+@@ -178,8 +189,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                              : (w & 0x1FFFFFFCu);
+             (*jumps)++;
+-            if (!in_call)
+-                break;                        /* the ring: a jump ends it */
++            if (!in_call) {
++                /* The ring: a jump ends this segment, and its target is where
++                 * the ring starts again. Kept for the caller, which otherwise
++                 * has to guess the ring's base. */
++                s_ring_jump_target = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
++                break;
++            }
+             va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+             end_va = va + 0x400000u;
+             continue;
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 72d5131..c76057a 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -970,14 +970,31 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                     } else if (last_put && put < last_put) {
+-                        if (put_hi > last_put)
+-                            nv2a_pb_scan(
+-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
+-                        if (put > put_lo)
++                        /* Follow the title's own JUMP across the seam rather
++                         * than the learned bounds. put_lo is the lowest PUT
++                         * ever seen, and a title that destroys its device and
++                         * creates another has a second ring somewhere else:
++                         * Halo 2's first is at physical 0x2000, so every wrap
++                         * of the second replayed the dead first ring -- whose
++                         * last semaphore release put the GPU back at fence 13
++                         * and stalled the frame loop for good. */
++                        extern uint32_t nv2a_pb_take_ring_jump(void);
++                        uint32_t from = XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu);
++                        uint32_t to   = XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu);
++                        uint32_t tgt;
++
++                        (void)nv2a_pb_take_ring_jump();
++                        nv2a_pb_scan(from, from + 0x400000u);  /* runs to the JUMP */
++                        tgt = nv2a_pb_take_ring_jump();
++                        if (tgt) {
++                            if (tgt < to)
++                                nv2a_pb_scan(tgt, to);
++                        } else if (put > put_lo) {
++                            /* No JUMP found: the old guess is all there is. */
+                             nv2a_pb_scan(
+                                 XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
+-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
++                                to);
++                        }
+                         if (getenv("RECOMP_PB_WRAP_TRACE")) {
+                             static unsigned wraps;
+                             if (wraps++ < 8)

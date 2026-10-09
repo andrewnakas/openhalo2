@@ -1,8 +1,8 @@
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..95cf959 100644
+index c65ba43..5530c11 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
-@@ -2284,6 +2284,46 @@ static void kernel_vblank_tick(void)
+@@ -2284,6 +2284,53 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -32,15 +32,22 @@ index c65ba43..95cf959 100644
 +    if (!g_xbox_d3d_swi_routine)
 +        return;
 +    kint = xbox_GetConnectedInterrupt(NV2A_VECTOR);
-+    if (!kint)
-+        return;
 +    fn = recomp_lookup(g_xbox_d3d_swi_routine);
-+    if (!fn)
++    /* A title tears its device down and builds another (Halo 2 does on the
++     * way to its final display mode). The interrupt object is then cleared
++     * while fences from the dead device are still queued; they have no
++     * handler and no waiter, so they are dropped rather than delivered to a
++     * null miniport. */
++    if (!kint || !fn || !BRIDGE_MEM32(kint + 0) || !BRIDGE_MEM32(kint + 4)) {
++        while (nv2a_swi_take(&param))
++            ;
 +        return;
++    }
 +
 +    while (budget-- > 0 && nv2a_swi_take(&param)) {
 +        g_ecx = BRIDGE_MEM32(kint + 4);
 +        g_eax = param;
++        { static unsigned n; if (n++ < 12) { fprintf(stderr, "  [NV2A] software interrupt 0x%08X -> handler (this=0x%08X)\n", param, g_ecx); fflush(stderr); } }
 +        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
 +        { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
 +    }
@@ -49,7 +56,7 @@ index c65ba43..95cf959 100644
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2572,6 +2612,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2572,6 +2619,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
  
          Sleep(10);
          kernel_vblank_tick();  /* the GPU's frame clock */
@@ -57,7 +64,7 @@ index c65ba43..95cf959 100644
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -3880,6 +3921,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3880,6 +3928,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);

@@ -50,9 +50,29 @@ index 42135e0..c7b5d83 100644
                  info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                  info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
 diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
-index caf6390..3a5d9b8 100644
+index caf6390..6d79f72 100644
 --- a/src/kernel/kernel_path.c
 +++ b/src/kernel/kernel_path.c
+@@ -66,8 +66,8 @@ static const path_rule s_rules[] = {
+     { "C:\\",                                 0, NULL,         NULL          },
+     { "\\??\\C:\\",                           0, NULL,         NULL          },
+     { "\\Device\\Harddisk0\\Partition2",     1, "\\SystemData", "/SystemData" },
+-    { "\\Device\\Harddisk0\\Partition3",     1, "\\Cache",   "/Cache"      },
+-    { "\\Device\\Harddisk0\\Partition4",     1, "\\Cache",   "/Cache"      },
++    { "\\Device\\Harddisk0\\Partition3",     1, "\\CacheX",  "/CacheX"     },
++    { "\\Device\\Harddisk0\\Partition4",     1, "\\CacheY",  "/CacheY"     },
+     { "\\Device\\Harddisk0\\Partition5",     1, "\\Cache",   "/Cache"      },
+     { "D:\\",                                 0, NULL,         NULL          },
+     { "d:\\",                                 0, NULL,         NULL          },
+@@ -328,7 +328,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
+      * Cheap and idempotent: SHCreateDirectoryExW builds intermediates and is
+      * happy if they already exist. */
+     {
+-        static const WCHAR *subs[] = { L"TitleData", L"UserData", L"Cache",
++        static const WCHAR *subs[] = { L"TitleData", L"UserData", L"Cache", L"CacheX", L"CacheY",
+                                        L"SystemData" };
+         WCHAR image[MAX_PATH];
+         WCHAR dir[MAX_PATH];
 @@ -394,6 +394,17 @@ static void xbox_remember_host_path(const wchar_t *p)
  
  
