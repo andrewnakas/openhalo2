@@ -352,11 +352,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      *                                  (miniport + 0x1A4), set by software
      *                                  interrupt 5; without this the wait
      *                                  fails at once and is retried forever
-     *   RECOMP_USB                     the controller */
+     *   RECOMP_USB                     the controller
+     *   RECOMP_GPU                     the OpenGL pixel backend (nv2a_gl.c):
+     *                                  30 fps where the software rasteriser
+     *                                  managed 2. RECOMP_GPU=0 selects the
+     *                                  software rasteriser; it is also the
+     *                                  fallback if no GL 3.3 context exists */
     if (!getenv("RECOMP_H2_NO_DEFAULTS")) {
         static const char *const defaults[] = {
             "RECOMP_PB_EXEC", "RECOMP_VBLANK", "RECOMP_TITLE_KEVENTS",
-            "RECOMP_USB",
+            "RECOMP_USB", "RECOMP_GPU",
         };
         size_t di;
         for (di = 0; di < sizeof defaults / sizeof defaults[0]; di++)

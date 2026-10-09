@@ -1,8 +1,8 @@
 diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
-index a045752..880f260 100644
+index a045752..8987665 100644
 --- a/src/kernel/CMakeLists.txt
 +++ b/src/kernel/CMakeLists.txt
-@@ -24,6 +24,7 @@ set(KERNEL_SOURCES
+@@ -24,9 +24,11 @@ set(KERNEL_SOURCES
      icall_feedback.c
      recomp_trace.c
      nv2a_pb_scan.c
@@ -10,8 +10,23 @@ index a045752..880f260 100644
      nv2a_pb_exec.c
      nv2a_vsh_interp.c
      nv2a_combiner.c
++    nv2a_gl.c
+ )
+ 
+ add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+@@ -43,7 +45,9 @@ target_include_directories(xbox_kernel PUBLIC
+ if(WIN32)
+     # platform is an INTERFACE target on Windows: it contributes the src/
+     # include path that "platform/xbox_winnt.h" resolves against.
+-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
++    # opengl32/gdi32/user32: the hardware pixel backend (nv2a_gl.c).
++    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt
++                          opengl32 gdi32 user32 winmm)
+ else()
+     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
+     find_package(OpenSSL REQUIRED)
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..45a1243 100644
+index c65ba43..589f11f 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
@@ -36,7 +51,29 @@ index c65ba43..45a1243 100644
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
-@@ -2270,8 +2278,10 @@ static void kernel_vblank_tick(void)
+@@ -2262,16 +2270,30 @@ static void kernel_vblank_tick(void)
+     if (!enabled)
+         return;
+ 
+-    now = (long long)GetTickCount64();
++    /* 60 Hz against the performance counter, stepping the deadline rather
++     * than re-basing it on "now". GetTickCount64 advances in 15.6 ms steps
++     * and the old "now + 16" test then passed on every second wake of a
++     * 15.6 ms sleep: the frame clock ran at 32 Hz, and a title that presents
++     * every second vblank at 16 frames a second. */
++    {
++        LARGE_INTEGER qpc, freq;
++        QueryPerformanceCounter(&qpc);
++        QueryPerformanceFrequency(&freq);
++        now = (long long)(qpc.QuadPart * 1000000 / freq.QuadPart);   /* us */
++    }
+     if (now < next_ms)
+         return;
+-    next_ms = now + 16;                       /* ~60 Hz */
++    next_ms += 16667;
++    if (next_ms < now - 100000 || next_ms > now + 16667)
++        next_ms = now + 16667;                /* first tick, or fell behind */
+ 
      if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
          return;
  
@@ -49,7 +86,7 @@ index c65ba43..45a1243 100644
  
      {
          static unsigned n;
-@@ -2284,6 +2294,56 @@ static void kernel_vblank_tick(void)
+@@ -2284,6 +2306,68 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -65,6 +102,18 @@ index c65ba43..45a1243 100644
 +static uint32_t g_xbox_d3d_swi_routine;
 +int nv2a_swi_take(uint32_t *param);
 +void nv2a_swi_done(void);
++
++/* Wakes the timer thread ahead of its tick. The executor stops at every
++ * software interrupt until the title's handler has run, and the handler runs
++ * on the timer thread: left to the tick, each fence cost the executor up to
++ * a whole tick of doing nothing. */
++static HANDLE g_timer_wake;
++
++void xbox_TimerThreadWake(void)
++{
++    if (g_timer_wake)
++        SetEvent(g_timer_wake);
++}
 +
 +void xbox_SetD3DSoftwareInterruptRoutine(uint32_t guest_va)
 +{
@@ -106,15 +155,39 @@ index c65ba43..45a1243 100644
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2572,6 +2632,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2566,12 +2650,22 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+         g_fs_base = tib;
+     }
  
-         Sleep(10);
++    /* Millisecond sleeps: at the default 15.6 ms granularity neither the
++     * 60 Hz frame clock nor a 10 ms tick is achievable. */
++    {
++        extern __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int);
++        timeBeginPeriod(1);
++    }
+     for (;;) {
+         long long now;
+         int i;
+ 
+-        Sleep(10);
++        if (g_timer_wake)
++            WaitForSingleObject(g_timer_wake, 4);
++        else
++            Sleep(4);
          kernel_vblank_tick();  /* the GPU's frame clock */
 +        kernel_d3d_swi_tick(); /* pushbuffer fences */
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -3880,6 +3941,16 @@ static void bridge_NtFsControlFile(void)
+@@ -2619,6 +2713,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+     if (!g_timer_started) {
+         InitializeCriticalSection(&g_timer_lock);
+         g_timer_started = 1;
++        g_timer_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+         CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+     }
+ 
+@@ -3880,6 +3975,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
@@ -131,7 +204,7 @@ index c65ba43..45a1243 100644
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
-@@ -9391,24 +9462,45 @@ void guest_cpu_part(void)
+@@ -9391,24 +9496,45 @@ void guest_cpu_part(void)
      t_guest_thread = 0;
  }
  
@@ -177,7 +250,7 @@ index c65ba43..45a1243 100644
      }
      (void)held;
  }
-@@ -9473,6 +9565,28 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9473,6 +9599,28 @@ static void kernel_thunk_dispatch_body(void)
                      fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
                              (unsigned long long)g_ordinal_calls[best]);
                  }
@@ -337,11 +410,1985 @@ index caf6390..6d79f72 100644
          fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
          fflush(stderr);
          return TRUE;
+diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
+new file mode 100644
+index 0000000..a3646ab
+--- /dev/null
++++ b/src/kernel/nv2a_gl.c
+@@ -0,0 +1,1800 @@
++/**
++ * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
++ *
++ * What is mirrored, and from where:
++ *   - the three software pixel loops in nv2a_pb_exec.c (raster_triangle,
++ *     xf_rows with and without combiners), one fragment program family each;
++ *   - nv2a_rc_eval (nv2a_combiner.c), translated register for register into
++ *     GLSL, one program per distinct combiner set-up, cached;
++ *   - put_pixel's blending, colour mask and clip rectangle as GL state;
++ *   - the host-side depth buffers (one per zeta offset, four of them).
++ * Texels are decoded on the CPU by the executor's own sample_tex and uploaded
++ * as RGBA8, so every format the software path reads looks the same here.
++ *
++ * ---- Guest memory and the GPU: who holds the truth ----------------------
++ *
++ * Every guest colour surface that is drawn into gets a GL texture + FBO,
++ * keyed by its resolved guest address. The simplest scheme that is correct
++ * for this title:
++ *
++ *   1. The GPU copy is authoritative from the moment the surface is first
++ *      used. It is created by UPLOADING what guest memory holds, so anything
++ *      the CPU put there beforehand is kept.
++ *   2. Guest memory is brought up to date ("download", glReadPixels straight
++ *      into the surface with its own pitch) only when something is about to
++ *      read it there: a frame dump, the framebuffer window at a flip, a
++ *      texture stage that reads those bytes in a way that cannot use the FBO
++ *      directly, or the surface being re-created with another shape. A
++ *      download first checks (full hash) that the CPU has not written those
++ *      bytes in the meantime; if it has, nothing is written and (4) applies.
++ *   3. A texture stage whose address, pitch and format are a surface's binds
++ *      that surface's texture directly (render to texture; the title's
++ *      blurred menu backdrop). Sampling the surface being drawn into goes
++ *      through a snapshot copy.
++ *   4. CPU writes into a surface after (1) are detected, not assumed away: a
++ *      sampled hash of the surface's guest bytes is kept from the last moment
++ *      the two copies agreed, and re-taken once per frame when the surface is
++ *      bound for drawing or sampling. If the bytes changed, the CPU wrote
++ *      them (nothing else writes there), so they are uploaded and win. This
++ *      also covers a freed render target whose memory became a texture.
++ *
++ * Not covered: the title reading a surface out of guest memory by itself
++ * (a screenshot, a thumbnail) sees the last download, not the current frame.
++ * RECOMP_GPU_SYNC=1 downloads the presented surface at every flip for that.
++ *
++ * Ordinary textures are cached by (address, format, size) and validated by a
++ * hash of their bytes: once per frame, and again whenever the title touches
++ * that stage's registers, so a texture rewritten in place (video frames, a
++ * glyph cache) is re-uploaded.
++ */
++#include "nv2a_gl.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdarg.h>
++#include <stddef.h>
++
++#if defined(_WIN32)
++
++#include "kernel.h"                     /* XBOX_CONTIG_BASE / _SIZE */
++#include "../d3d/d3d8_swizzle.h"
++#include <windows.h>
++#include <GL/gl.h>
++
++extern ptrdiff_t xbox_GetMemoryOffset(void);
++
++/* Laptops with two adapters: ask for the fast one. Harmless elsewhere. */
++__declspec(dllexport) DWORD NvOptimusEnablement = 1;
++__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
++
++/* ---- GL beyond 1.1 ------------------------------------------------------ */
++
++#define GL_BGRA                         0x80E1
++#define GL_RGBA8                        0x8058
++#define GL_CLAMP_TO_EDGE                0x812F
++#define GL_TEXTURE_BASE_LEVEL           0x813C
++#define GL_TEXTURE_MAX_LEVEL            0x813D
++#define GL_TEXTURE_WRAP_R               0x8072
++#define GL_TEXTURE0                     0x84C0
++#define GL_TEXTURE_CUBE_MAP             0x8513
++#define GL_TEXTURE_CUBE_MAP_POSITIVE_X  0x8515
++#define GL_DEPTH_CLAMP                  0x864F
++#define GL_QUERY_RESULT                 0x8866
++#define GL_ARRAY_BUFFER                 0x8892
++#define GL_STREAM_DRAW                  0x88E0
++#define GL_SAMPLES_PASSED               0x8914
++#define GL_FRAGMENT_SHADER              0x8B30
++#define GL_VERTEX_SHADER                0x8B31
++#define GL_COMPILE_STATUS               0x8B81
++#define GL_LINK_STATUS                  0x8B82
++#define GL_DEPTH_COMPONENT32F           0x8CAC
++#define GL_FRAMEBUFFER_COMPLETE         0x8CD5
++#define GL_COLOR_ATTACHMENT0            0x8CE0
++#define GL_DEPTH_ATTACHMENT             0x8D00
++#define GL_FRAMEBUFFER                  0x8D40
++#define GL_FUNC_ADD                     0x8006
++
++#define GLFUNCS(X) \
++    X(GLuint, CreateShader, (GLenum)) \
++    X(void,   ShaderSource, (GLuint, GLsizei, const char *const *, const GLint *)) \
++    X(void,   CompileShader, (GLuint)) \
++    X(void,   GetShaderiv, (GLuint, GLenum, GLint *)) \
++    X(void,   GetShaderInfoLog, (GLuint, GLsizei, GLsizei *, char *)) \
++    X(void,   DeleteShader, (GLuint)) \
++    X(GLuint, CreateProgram, (void)) \
++    X(void,   AttachShader, (GLuint, GLuint)) \
++    X(void,   BindAttribLocation, (GLuint, GLuint, const char *)) \
++    X(void,   LinkProgram, (GLuint)) \
++    X(void,   GetProgramiv, (GLuint, GLenum, GLint *)) \
++    X(void,   GetProgramInfoLog, (GLuint, GLsizei, GLsizei *, char *)) \
++    X(void,   UseProgram, (GLuint)) \
++    X(GLint,  GetUniformLocation, (GLuint, const char *)) \
++    X(void,   Uniform1i, (GLint, GLint)) \
++    X(void,   Uniform1f, (GLint, GLfloat)) \
++    X(void,   Uniform3f, (GLint, GLfloat, GLfloat, GLfloat)) \
++    X(void,   Uniform1fv, (GLint, GLsizei, const GLfloat *)) \
++    X(void,   Uniform3fv, (GLint, GLsizei, const GLfloat *)) \
++    X(void,   Uniform4fv, (GLint, GLsizei, const GLfloat *)) \
++    X(void,   Uniform4iv, (GLint, GLsizei, const GLint *)) \
++    X(void,   GenBuffers, (GLsizei, GLuint *)) \
++    X(void,   BindBuffer, (GLenum, GLuint)) \
++    X(void,   BufferData, (GLenum, ptrdiff_t, const void *, GLenum)) \
++    X(void,   GenVertexArrays, (GLsizei, GLuint *)) \
++    X(void,   BindVertexArray, (GLuint)) \
++    X(void,   EnableVertexAttribArray, (GLuint)) \
++    X(void,   VertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) \
++    X(void,   GenFramebuffers, (GLsizei, GLuint *)) \
++    X(void,   BindFramebuffer, (GLenum, GLuint)) \
++    X(void,   FramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint)) \
++    X(GLenum, CheckFramebufferStatus, (GLenum)) \
++    X(void,   DeleteFramebuffers, (GLsizei, const GLuint *)) \
++    X(void,   ActiveTexture, (GLenum)) \
++    X(void,   BlendColor, (GLfloat, GLfloat, GLfloat, GLfloat)) \
++    X(void,   BlendEquation, (GLenum)) \
++    X(void,   GenSamplers, (GLsizei, GLuint *)) \
++    X(void,   BindSampler, (GLuint, GLuint)) \
++    X(void,   SamplerParameteri, (GLuint, GLenum, GLint)) \
++    X(void,   GenQueries, (GLsizei, GLuint *)) \
++    X(void,   BeginQuery, (GLenum, GLuint)) \
++    X(void,   EndQuery, (GLenum)) \
++    X(void,   GetQueryObjectuiv, (GLuint, GLenum, GLuint *))
++
++#define X(ret, name, args) static ret (APIENTRY *gl##name) args;
++GLFUNCS(X)
++#undef X
++
++/* ---- State -------------------------------------------------------------- */
++
++#define GLQ_MAX_TRIS 16384
++
++typedef struct {
++    uint32_t base, pitch, bpp;          /* guest address of row 0, shape  */
++    int      w, h;
++    GLuint   tex, snap;
++    int      gpu_newer;                 /* the FBO holds what memory lacks */
++    uint64_t mem_hash;                  /* guest bytes when last in agreement */
++    uint64_t mem_full;                  /* the same, every byte (see surf_download) */
++    uint32_t checked_flip, last_use;
++    int      used;
++} GlSurface;
++
++typedef struct {
++    uint32_t offset, color, w, h, pitch, cube;      /* key */
++    uint64_t hash;
++    GLuint   tex;
++    uint32_t checked_flip, last_use;
++    int      supported, used;
++} GlTexEntry;
++
++typedef struct {
++    uint32_t mode, afunc, kind[4];
++    uint32_t control, stage_program, clip_plane_mode, final0, final1;
++    uint32_t cicw[8], aicw[8], cocw[8], aocw[8];
++} ProgKey;
++
++typedef struct {
++    ProgKey key;
++    int     used;
++    GLuint  prog;
++    GLint   u_scale, u_c0, u_c1, u_fc0, u_fc1, u_fogc, u_aref, u_zcut;
++    GLint   u_tsc, u_tsz, u_taf;
++} GlProg;
++
++typedef struct {
++    GLuint tex;
++    int    cube, w, h, supported;
++    float  sx, sy, mx, my, afloor;
++} TexBind;
++
++#define GL_MAX_SURFACES 16
++#define GL_TEX_SLOTS    4096
++#define GL_PROG_SLOTS   512
++#define GL_FBO_SLOTS    64
++#define KIND_CUBE  1u
++#define KIND_FETCH 2u
++
++static int        s_state;              /* 0 untried, 1 on, -1 off */
++static HDC        s_hdc;
++static HWND       s_hwnd;
++static Nv2aGlVertex *s_q;
++static int        s_nverts;
++static uint32_t   s_flip = 1;
++static GlSurface  s_surf[GL_MAX_SURFACES];
++static GlTexEntry *s_tex;
++static GlProg    *s_prog;
++static struct { GLuint color, depth, fbo; } s_fbo[GL_FBO_SLOTS];
++static int        s_nfbo;
++static struct { uint32_t offset; GLuint tex; int w, h, used; } s_depth[4];
++static int        s_depth_next;
++static GLuint     s_vao, s_vbo, s_white, s_query, s_vs;
++static GLuint     s_sampler[2][2][2];   /* [linear][wrap u][wrap v] */
++static uint32_t  *s_buf;                /* scratch pixels */
++static size_t     s_buf_px;
++static int        s_stage_touched[4] = {1, 1, 1, 1};
++static int        s_debug;
++static int        s_verify;             /* RECOMP_GPU_VERIFY, see nv2a_gl.h */
++static struct {
++    uint64_t draws, tris, tex_uploads, tex_hashed, downloads, uploads;
++    uint32_t programs;
++} s_stat;
++
++/* ---- Small helpers ------------------------------------------------------ */
++
++static uint8_t *guest(uint32_t va)
++{
++    return (uint8_t *)(uintptr_t)xbox_GetMemoryOffset() + va;
++}
++
++/* Guest bytes this process actually has mapped: low RAM or the contiguous
++ * window. Anything else is refused rather than read. */
++static int range_ok(uint32_t va, uint64_t n)
++{
++    if (!n)
++        return 0;
++    if (va >= 0x1000u && (uint64_t)va + n <= 0x04000000u)
++        return 1;
++    if (va >= XBOX_CONTIG_BASE
++        && (uint64_t)va + n <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
++        return 1;
++    return 0;
++}
++
++static uint64_t rotl64(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
++
++/* Four multiply-rotate lanes over 32 bytes a step; not cryptographic, only
++ * "did these bytes change". */
++static uint64_t hash_bytes(const uint8_t *p, size_t n)
++{
++    const uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full;
++    uint64_t a = P1 + P2, b = P2, c = 0, d = 0 - P1, h, w[4];
++    size_t left = n;
++
++    while (left >= 32) {
++        memcpy(w, p, 32);
++        a = rotl64(a + w[0] * P2, 31) * P1;
++        b = rotl64(b + w[1] * P2, 31) * P1;
++        c = rotl64(c + w[2] * P2, 31) * P1;
++        d = rotl64(d + w[3] * P2, 31) * P1;
++        p += 32;
++        left -= 32;
++    }
++    h = rotl64(a, 1) + rotl64(b, 7) + rotl64(c, 12) + rotl64(d, 18) + n;
++    while (left) {
++        h = rotl64(h ^ ((uint64_t)*p++ * P1), 11) * P2;
++        left--;
++    }
++    h ^= h >> 33; h *= P2; h ^= h >> 29;
++    return h;
++}
++
++/* A surface is megabytes and is checked every frame: sample it. */
++static uint64_t hash_sampled(const uint8_t *p, size_t n)
++{
++    const uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full;
++    uint64_t h = n, w;
++    size_t step, i;
++
++    if (n <= 65536)
++        return hash_bytes(p, n);
++    step = (n / 8192) & ~(size_t)7;
++    if (step < 8)
++        step = 8;
++    for (i = 0; i + 8 <= n; i += step) {
++        memcpy(&w, p + i, 8);
++        h = rotl64(h + w * P2, 31) * P1;
++    }
++    return h;
++}
++
++static uint32_t *scratch(size_t px)
++{
++    if (px > s_buf_px) {
++        free(s_buf);
++        s_buf = (uint32_t *)malloc(px * 4);
++        s_buf_px = s_buf ? px : 0;
++    }
++    return s_buf;
++}
++
++static void gl_check(const char *what)
++{
++    GLenum e;
++    if (!s_debug)
++        return;
++    while ((e = glGetError()) != 0) {
++        static unsigned said;
++        if (said++ < 40)
++            fprintf(stderr, "  [GL] error 0x%04X after %s\n", e, what);
++    }
++}
++
++/* ---- Framebuffer objects ------------------------------------------------ */
++
++static GLuint fbo_for(GLuint color, GLuint depth)
++{
++    int i;
++    GLuint f;
++
++    for (i = 0; i < s_nfbo; i++)
++        if (s_fbo[i].color == color && s_fbo[i].depth == depth)
++            return s_fbo[i].fbo;
++    if (s_nfbo == GL_FBO_SLOTS) {
++        for (i = 0; i < s_nfbo; i++)
++            glDeleteFramebuffers(1, &s_fbo[i].fbo);
++        s_nfbo = 0;
++    }
++    glGenFramebuffers(1, &f);
++    glBindFramebuffer(GL_FRAMEBUFFER, f);
++    if (color)
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                               GL_TEXTURE_2D, color, 0);
++    else {
++        glDrawBuffer(GL_NONE);
++        glReadBuffer(GL_NONE);
++    }
++    if (depth)
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
++                               GL_TEXTURE_2D, depth, 0);
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++        static unsigned said;
++        if (said++ < 4)
++            fprintf(stderr, "  [GL] framebuffer incomplete (colour %u depth %u)\n",
++                    color, depth);
++    }
++    s_fbo[s_nfbo].color = color;
++    s_fbo[s_nfbo].depth = depth;
++    s_fbo[s_nfbo].fbo = f;
++    s_nfbo++;
++    return f;
++}
++
++static void fbo_forget(GLuint tex)
++{
++    int i;
++    for (i = 0; i < s_nfbo; ) {
++        if (s_fbo[i].color == tex || s_fbo[i].depth == tex) {
++            glDeleteFramebuffers(1, &s_fbo[i].fbo);
++            s_fbo[i] = s_fbo[--s_nfbo];
++        } else {
++            i++;
++        }
++    }
++}
++
++/* Unit 5 is the scratch unit: uploads never disturb a stage binding. */
++static void bind_scratch(GLenum target, GLuint tex)
++{
++    glActiveTexture(GL_TEXTURE0 + 5);
++    glBindTexture(target, tex);
++}
++
++static void tex_params(GLenum target)
++{
++    glTexParameteri(target, GL_TEXTURE_BASE_LEVEL, 0);
++    glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, 0);
++    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++}
++
++/* ---- Surfaces ----------------------------------------------------------- */
++
++static GlSurface *surf_find(uint32_t base)
++{
++    int i;
++    for (i = 0; i < GL_MAX_SURFACES; i++)
++        if (s_surf[i].used && s_surf[i].base == base)
++            return &s_surf[i];
++    return NULL;
++}
++
++static size_t surf_bytes(const GlSurface *s)
++{
++    return (size_t)s->h * s->pitch;
++}
++
++/* Guest memory -> FBO. */
++static void surf_upload(GlSurface *s)
++{
++    const uint8_t *src = guest(s->base);
++
++    bind_scratch(GL_TEXTURE_2D, s->tex);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    if (s->bpp == 4) {
++        glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(s->pitch / 4));
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s->w, s->h, GL_BGRA,
++                        GL_UNSIGNED_BYTE, src);
++        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    } else {
++        uint32_t *buf = scratch((size_t)s->w * s->h);
++        int x, y;
++        if (!buf)
++            return;
++        for (y = 0; y < s->h; y++) {
++            const uint16_t *row = (const uint16_t *)(src + (size_t)y * s->pitch);
++            for (x = 0; x < s->w; x++) {
++                uint32_t t = row[x];
++                /* As put_pixel reads a 5:6:5 destination: alpha 1, low bits 0. */
++                buf[(size_t)y * s->w + x] = 0xFF000000u | ((t & 0xF800u) << 8)
++                                          | ((t & 0x07E0u) << 5) | ((t & 0x001Fu) << 3);
++            }
++        }
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s->w, s->h, GL_BGRA,
++                        GL_UNSIGNED_BYTE, buf);
++    }
++    s->gpu_newer = 0;
++    s->mem_hash = hash_sampled(src, surf_bytes(s));
++    s->mem_full = hash_bytes(src, surf_bytes(s));
++    s_stat.uploads++;
++    gl_check("surface upload");
++}
++
++/* FBO -> guest memory, if the FBO is ahead. */
++static void surf_download(GlSurface *s)
++{
++    uint8_t *dst = guest(s->base);
++
++    if (!s->gpu_newer || s_verify)
++        return;
++    /* Never write over bytes the CPU has changed since the two copies last
++     * agreed. A surface the title freed keeps its entry here, and its memory
++     * may by now be a texture or a vertex buffer; writing old pixels there
++     * would corrupt the guest. Changed bytes mean the CPU's copy is the
++     * current one, so it is taken instead. */
++    if (hash_bytes(dst, surf_bytes(s)) != s->mem_full) {
++        surf_upload(s);
++        return;
++    }
++    glBindFramebuffer(GL_FRAMEBUFFER, fbo_for(s->tex, 0));
++    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++    if (s->bpp == 4) {
++        glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(s->pitch / 4));
++        glReadPixels(0, 0, s->w, s->h, GL_BGRA, GL_UNSIGNED_BYTE, dst);
++        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++    } else {
++        uint32_t *buf = scratch((size_t)s->w * s->h);
++        int x, y;
++        if (!buf)
++            return;
++        glReadPixels(0, 0, s->w, s->h, GL_BGRA, GL_UNSIGNED_BYTE, buf);
++        for (y = 0; y < s->h; y++) {
++            uint16_t *row = (uint16_t *)(dst + (size_t)y * s->pitch);
++            for (x = 0; x < s->w; x++) {
++                uint32_t argb = buf[(size_t)y * s->w + x];
++                row[x] = (uint16_t)(((argb >> 8) & 0xF800) | ((argb >> 5) & 0x07E0)
++                                  | ((argb >> 3) & 0x001F));
++            }
++        }
++    }
++    s->gpu_newer = 0;
++    s->mem_hash = hash_sampled(dst, surf_bytes(s));
++    s->mem_full = hash_bytes(dst, surf_bytes(s));
++    s_stat.downloads++;
++    gl_check("surface download");
++}
++
++static void surf_destroy(GlSurface *s)
++{
++    fbo_forget(s->tex);
++    glDeleteTextures(1, &s->tex);
++    if (s->snap)
++        glDeleteTextures(1, &s->snap);
++    memset(s, 0, sizeof *s);
++}
++
++/* Did the CPU write these bytes since the two copies last agreed? Once a
++ * frame per surface. See (4) at the top of the file. */
++static void surf_cpu_check(GlSurface *s)
++{
++    if (s->checked_flip == s_flip || s_verify)
++        return;
++    s->checked_flip = s_flip;
++    if (hash_sampled(guest(s->base), surf_bytes(s)) != s->mem_hash)
++        surf_upload(s);
++}
++
++/* The surface a batch or clear draws into, created or reshaped as needed. */
++static GlSurface *surf_get(uint32_t base, uint32_t pitch, uint32_t bpp,
++                           uint32_t need_h)
++{
++    GlSurface *s = surf_find(base);
++    int w, h, i;
++
++    if ((bpp != 4 && bpp != 2) || pitch < bpp || !need_h)
++        return NULL;
++    w = (int)(pitch / bpp);
++    if (need_h > 4096)
++        need_h = 4096;
++    if (w > 4096)
++        return NULL;
++    /* Never past the end of what is mapped. */
++    while (need_h && !range_ok(base, (uint64_t)need_h * pitch))
++        need_h = need_h > 64 ? need_h - 64 : 0;
++    if (!need_h)
++        return NULL;
++    h = (int)need_h;
++
++    if (s && s->pitch == pitch && s->bpp == bpp && s->h >= h) {
++        s->last_use = s_flip;
++        surf_cpu_check(s);
++        return s;
++    }
++    if (s) {
++        /* Another shape at the same address: memory gets what was drawn,
++         * then the new surface starts from memory. */
++        if (s->pitch == pitch && s->bpp == bpp && s->h > h)
++            h = s->h;
++        surf_download(s);
++        surf_destroy(s);
++    } else {
++        GlSurface *old = NULL;
++        for (i = 0; i < GL_MAX_SURFACES; i++) {
++            if (!s_surf[i].used) { s = &s_surf[i]; break; }
++            if (!old || s_surf[i].last_use < old->last_use)
++                old = &s_surf[i];
++        }
++        if (!s) {
++            surf_download(old);
++            surf_destroy(old);
++            s = old;
++        }
++    }
++    s->used = 1;
++    s->base = base; s->pitch = pitch; s->bpp = bpp;
++    s->w = w; s->h = h;
++    s->last_use = s->checked_flip = s_flip;
++    glGenTextures(1, &s->tex);
++    bind_scratch(GL_TEXTURE_2D, s->tex);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_BGRA,
++                 GL_UNSIGNED_BYTE, NULL);
++    tex_params(GL_TEXTURE_2D);
++    surf_upload(s);
++    if (s_debug)
++        fprintf(stderr, "  [GL] surface 0x%08X %dx%d pitch %u bpp %u\n",
++                base, w, h, pitch, bpp);
++    return s;
++}
++
++/* A copy of `s` as it is now, for sampling it while drawing into it. */
++static GLuint surf_snapshot(GlSurface *s)
++{
++    if (!s->snap) {
++        glGenTextures(1, &s->snap);
++        bind_scratch(GL_TEXTURE_2D, s->snap);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s->w, s->h, 0, GL_BGRA,
++                     GL_UNSIGNED_BYTE, NULL);
++        tex_params(GL_TEXTURE_2D);
++    }
++    glBindFramebuffer(GL_FRAMEBUFFER, fbo_for(s->tex, 0));
++    bind_scratch(GL_TEXTURE_2D, s->snap);
++    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, s->w, s->h);
++    return s->snap;
++}
++
++/* ---- Depth -------------------------------------------------------------- */
++
++static void depth_clear_tex(GLuint tex, float v)
++{
++    glBindFramebuffer(GL_FRAMEBUFFER, fbo_for(0, tex));
++    glDisable(GL_SCISSOR_TEST);
++    glDepthMask(GL_TRUE);
++    glClearDepth(v);
++    glClear(GL_DEPTH_BUFFER_BIT);
++}
++
++/* One depth texture per zeta offset, four of them, replaced in turn -- the
++ * same book-keeping as the software path's zbuf_current. A fresh one reads
++ * as "far". */
++static GLuint depth_for(uint32_t zeta, int need_w, int need_h)
++{
++    int i, w = need_w > 1024 ? need_w : 1024, h = need_h > 1024 ? need_h : 1024;
++
++    for (i = 0; i < 4; i++)
++        if (s_depth[i].used && s_depth[i].offset == zeta)
++            break;
++    if (i < 4 && s_depth[i].w >= need_w && s_depth[i].h >= need_h)
++        return s_depth[i].tex;
++    if (i == 4)
++        i = s_depth_next++ & 3;
++    if (!s_depth[i].tex)
++        glGenTextures(1, &s_depth[i].tex);
++    else
++        fbo_forget(s_depth[i].tex);
++    bind_scratch(GL_TEXTURE_2D, s_depth[i].tex);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, w, h, 0,
++                 GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
++    tex_params(GL_TEXTURE_2D);
++    s_depth[i].used = 1;
++    s_depth[i].offset = zeta;
++    s_depth[i].w = w;
++    s_depth[i].h = h;
++    depth_clear_tex(s_depth[i].tex, 1.0f);
++    return s_depth[i].tex;
++}
++
++/* ---- Textures ----------------------------------------------------------- */
++
++static int tex_normalised(uint32_t fmt)
++{
++    return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
++}
++
++static uint64_t tex_face_bytes(const Nv2aTexture *t)
++{
++    uint32_t block = d3d8_format_dxt_block_bytes(t->color);
++    if (block)
++        return (uint64_t)((t->width + 3) / 4) * ((t->height + 3) / 4) * block;
++    if (d3d8_format_is_swizzled(t->color))
++        return (uint64_t)t->width * t->height
++             * nv2a_exec_tex_texel_bytes(t->color);
++    return (uint64_t)t->pitch * t->height;
++}
++
++static uint64_t tex_bytes(const Nv2aTexture *t)
++{
++    uint64_t face = tex_face_bytes(t);
++    return t->cube ? (uint64_t)nv2a_exec_tex_face_stride(t) * 5 + face : face;
++}
++
++static void bind_white(TexBind *b)
++{
++    b->tex = s_white;
++    b->cube = 0;
++    b->w = b->h = 1;
++    b->sx = b->sy = b->mx = b->my = 0.0f;
++    b->afloor = 0.0f;
++    b->supported = 0;
++}
++
++static void tex_decode_upload(GlTexEntry *e, const Nv2aTexture *t)
++{
++    uint32_t w = t->width, h = t->height, x, y, f, faces = t->cube ? 6 : 1;
++    uint32_t stride = t->cube ? nv2a_exec_tex_face_stride(t) : 0;
++    uint32_t *buf = scratch((size_t)w * h), probe;
++    GLenum target = t->cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
++
++    e->supported = buf && nv2a_exec_sample_tex(t, 0, 0, 0, &probe);
++    if (!e->supported)
++        return;
++    if (!e->tex) {
++        glGenTextures(1, &e->tex);
++        bind_scratch(target, e->tex);
++        tex_params(target);
++        if (t->cube)
++            glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
++    } else {
++        bind_scratch(target, e->tex);
++    }
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    for (f = 0; f < faces; f++) {
++        for (y = 0; y < h; y++)
++            for (x = 0; x < w; x++)
++                if (!nv2a_exec_sample_tex(t, f * stride, x, y,
++                                          &buf[(size_t)y * w + x]))
++                    buf[(size_t)y * w + x] = 0xFFFFFFFFu;
++        glTexImage2D(t->cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f : GL_TEXTURE_2D,
++                     0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_BGRA,
++                     GL_UNSIGNED_BYTE, buf);
++    }
++    s_stat.tex_uploads++;
++    gl_check("texture upload");
++}
++
++static GlTexEntry *tex_lookup(const Nv2aTexture *t)
++{
++    uint32_t slot = ((t->offset >> 6) ^ (t->offset >> 17) ^ t->color * 131u)
++                  & (GL_TEX_SLOTS - 1), i;
++    GlTexEntry *oldest = NULL;
++
++    for (i = 0; i < 8; i++) {
++        GlTexEntry *e = &s_tex[(slot + i) & (GL_TEX_SLOTS - 1)];
++        if (e->used && e->offset == t->offset && e->color == t->color
++            && e->w == t->width && e->h == t->height && e->pitch == t->pitch
++            && e->cube == (uint32_t)t->cube)
++            return e;
++        if (!oldest || !e->used
++            || (oldest->used && e->last_use < oldest->last_use))
++            oldest = e;
++        if (!e->used)
++            break;
++    }
++    if (oldest->used && oldest->tex)
++        glDeleteTextures(1, &oldest->tex);
++    memset(oldest, 0, sizeof *oldest);
++    oldest->used = 1;
++    oldest->offset = t->offset; oldest->color = t->color;
++    oldest->w = t->width; oldest->h = t->height; oldest->pitch = t->pitch;
++    oldest->cube = (uint32_t)t->cube;
++    oldest->checked_flip = 0;
++    return oldest;
++}
++
++/* What stage `stage` samples: a surface's own texture, a cached decoded
++ * texture, or white when the stage cannot be read (as the software path). */
++static void tex_resolve(const Nv2aGlState *st, int stage, GlSurface *target,
++                        TexBind *b)
++{
++    const Nv2aTexture *t = &st->tex[stage];
++    GlSurface *s;
++    GlTexEntry *e;
++    uint64_t bytes;
++    int i, touched = s_stage_touched[stage];
++
++    bind_white(b);
++    if (!t->valid || !t->width || !t->height || t->width > 4096
++        || t->height > 4096 || (t->cube && t->width != t->height))
++        return;
++    bytes = tex_bytes(t);
++    if (!range_ok(t->offset, bytes))
++        return;
++
++    s = surf_find(t->offset);
++    if (s) {
++        int same = !t->cube && !tex_normalised(t->color) && t->pitch == s->pitch
++                && (int)t->width <= s->w && (int)t->height <= s->h
++                && ((s->bpp == 4 && (t->color == 0x12 || t->color == 0x1E))
++                 || (s->bpp == 2 && t->color == 0x11));
++        surf_cpu_check(s);
++        if (same) {
++            s->last_use = s_flip;
++            b->tex = s == target ? surf_snapshot(s) : s->tex;
++            b->w = (int)t->width; b->h = (int)t->height;
++            b->sx = 1.0f / (float)s->w; b->sy = 1.0f / (float)s->h;
++            b->mx = b->my = 1.0f;
++            b->afloor = t->color == 0x12 ? 0.0f : 1.0f;
++            b->supported = 1;
++            return;
++        }
++    }
++    /* Read from guest memory: anything drawn into those bytes goes there
++     * first. */
++    for (i = 0; i < GL_MAX_SURFACES && !s_verify; i++) {
++        GlSurface *o = &s_surf[i];
++        if (o->used && o->gpu_newer && o->base < t->offset + bytes
++            && t->offset < o->base + surf_bytes(o))
++            surf_download(o);
++    }
++
++    e = tex_lookup(t);
++    e->last_use = s_flip;
++    if (e->checked_flip != s_flip || touched) {
++        uint64_t h = hash_bytes(guest(t->offset), (size_t)bytes);
++        if (t->color == 0x0B && t->palette && range_ok(t->palette, 1024))
++            h ^= hash_bytes(guest(t->palette), 1024) * 3u;
++        s_stat.tex_hashed += bytes;
++        if (!e->checked_flip || h != e->hash) {
++            e->hash = h;
++            tex_decode_upload(e, t);
++        }
++        e->checked_flip = s_flip;
++    }
++    s_stage_touched[stage] = 0;
++    if (!e->supported)
++        return;
++    b->tex = e->tex;
++    b->cube = t->cube;
++    b->w = (int)t->width; b->h = (int)t->height;
++    if (tex_normalised(t->color)) {
++        b->sx = b->sy = 1.0f;
++        b->mx = (float)t->width; b->my = (float)t->height;
++    } else {
++        b->sx = 1.0f / (float)t->width; b->sy = 1.0f / (float)t->height;
++        b->mx = b->my = 1.0f;
++    }
++    b->supported = 1;
++}
++
++/* ---- Shaders ------------------------------------------------------------ */
++
++typedef struct { char *p; size_t n, cap; } SB;
++
++static void sb_f(SB *sb, const char *fmt, ...)
++{
++    va_list ap;
++    int k;
++    if (sb->n >= sb->cap)
++        return;
++    va_start(ap, fmt);
++    k = vsnprintf(sb->p + sb->n, sb->cap - sb->n, fmt, ap);
++    va_end(ap);
++    if (k > 0)
++        sb->n += (size_t)k;
++    if (sb->n > sb->cap)
++        sb->n = sb->cap;
++}
++
++static const char *const VS_SRC =
++    "#version 330 core\n"
++    "layout(location=0) in vec4 a_pos;\n"
++    "layout(location=1) in vec4 a_d0;\n"
++    "layout(location=2) in vec4 a_d1;\n"
++    "layout(location=3) in vec4 a_t0;\n"
++    "layout(location=4) in vec4 a_t1;\n"
++    "layout(location=5) in vec4 a_t2;\n"
++    "layout(location=6) in vec4 a_t3;\n"
++    "layout(location=7) in float a_fog;\n"
++    "uniform vec3 u_scale;\n"
++    /* Colours and fog interpolate in screen space, texture coordinates
++     * with perspective: exactly what xf_rows does. */
++    "noperspective out vec4 v_d0;\n"
++    "noperspective out vec4 v_d1;\n"
++    "noperspective out float v_fog;\n"
++    "noperspective out float v_z;\n"
++    "out vec4 v_t0;\n"
++    "out vec4 v_t1;\n"
++    "out vec4 v_t2;\n"
++    "out vec4 v_t3;\n"
++    "void main() {\n"
++    "  v_d0 = a_d0; v_d1 = a_d1; v_fog = a_fog;\n"
++    "  v_t0 = a_t0; v_t1 = a_t1; v_t2 = a_t2; v_t3 = a_t3;\n"
++    /* Already screen space: back to clip space with the w it came with, so
++     * the hardware's interpolation is the perspective-correct one. Guest row
++     * 0 is framebuffer row 0 (no flip), so read-back needs no reordering. */
++    "  float w = a_pos.w;\n"
++    "  v_z = a_pos.z * u_scale.z;\n"
++    "  vec3 n = vec3(a_pos.xy * u_scale.xy - 1.0, a_pos.z * u_scale.z * 2.0 - 1.0);\n"
++    "  gl_Position = vec4(n * w, w);\n"
++    "}\n";
++
++static const char *const FS_HEAD =
++    "#version 330 core\n"
++    "noperspective in vec4 v_d0;\n"
++    "noperspective in vec4 v_d1;\n"
++    "noperspective in float v_fog;\n"
++    "noperspective in float v_z;\n"
++    "in vec4 v_t0;\n"
++    "in vec4 v_t1;\n"
++    "in vec4 v_t2;\n"
++    "in vec4 v_t3;\n"
++    "uniform vec4 u_tsc[4];\n"      /* xy: to [0,1] for texture(); zw: to texels */
++    "uniform ivec4 u_tsz[4];\n"     /* width, height, wrap u, wrap v */
++    "uniform float u_taf[4];\n"     /* alpha floor (1 for X8 formats) */
++    "uniform vec4 u_c0[8];\n"
++    "uniform vec4 u_c1[8];\n"
++    "uniform vec4 u_fc0;\n"
++    "uniform vec4 u_fc1;\n"
++    "uniform vec3 u_fogc;\n"
++    "uniform int u_aref;\n"
++    "uniform float u_zcut;\n"
++    "out vec4 o_col;\n"
++    /* wrap_coord() of the software path. */
++    "int wrapi(int p, int n, int m) {\n"
++    "  if (m == 1) return p - n * int(floor(float(p) / float(n)));\n"
++    "  return clamp(p, 0, n - 1);\n"
++    "}\n"
++    /* One texel, nearest, at texel coordinates. */
++    "vec4 fetch2(sampler2D s, vec2 uv, ivec4 sz) {\n"
++    "  ivec2 p = ivec2(floor(uv));\n"
++    "  return texelFetch(s, ivec2(wrapi(p.x, sz.x, sz.z), wrapi(p.y, sz.y, sz.w)), 0);\n"
++    "}\n";
++
++/* map_in() of nv2a_combiner.c, as an expression. */
++static void rc_in(SB *sb, uint32_t byte, int alpha_portion)
++{
++    char src[32];
++    uint32_t r;
++
++    byte &= 0xFF;
++    r = byte & 0xF;
++    if (alpha_portion)
++        snprintf(src, sizeof src, "R[%u].%c", r, (byte & 0x10) ? 'a' : 'b');
++    else
++        snprintf(src, sizeof src, "R[%u].%s", r, (byte & 0x10) ? "aaa" : "rgb");
++    switch ((byte >> 5) & 7) {
++    case 0:  sb_f(sb, "max(%s, 0.0)", src); break;
++    case 1:  sb_f(sb, "(1.0 - clamp(%s, 0.0, 1.0))", src); break;
++    case 2:  sb_f(sb, "(2.0 * max(%s, 0.0) - 1.0)", src); break;
++    case 3:  sb_f(sb, "(-2.0 * max(%s, 0.0) + 1.0)", src); break;
++    case 4:  sb_f(sb, "(max(%s, 0.0) - 0.5)", src); break;
++    case 5:  sb_f(sb, "(0.5 - max(%s, 0.0))", src); break;
++    case 6:  sb_f(sb, "(%s)", src); break;
++    default: sb_f(sb, "(-%s)", src); break;
++    }
++}
++
++/* map_out(). */
++static const char *rc_out_fmt(uint32_t mapping)
++{
++    switch (mapping) {
++    case 0x08: return "clamp(%s - 0.5, -1.0, 1.0)";
++    case 0x10: return "clamp(%s * 2.0, -1.0, 1.0)";
++    case 0x18: return "clamp((%s - 0.5) * 2.0, -1.0, 1.0)";
++    case 0x20: return "clamp(%s * 4.0, -1.0, 1.0)";
++    case 0x30: return "clamp(%s * 0.5, -1.0, 1.0)";
++    default:   return "clamp(%s, -1.0, 1.0)";
++    }
++}
++
++static void emit_alpha_test(SB *sb, uint32_t afunc)
++{
++    static const char *const op[] = { NULL, "<", "==", "<=", ">", "!=", ">=" };
++    if (afunc == 0x200)
++        sb_f(sb, "  discard;\n");
++    else if (afunc >= 0x201 && afunc <= 0x206)
++        sb_f(sb, "  if (!(int(o_col.a * 255.0 + 0.5) %s u_aref)) discard;\n",
++             op[afunc - 0x200]);
++}
++
++static void emit_sample(SB *sb, int st, uint32_t kind, const char *uv)
++{
++    if (kind & KIND_FETCH)
++        sb_f(sb, "    T = fetch2(u_tex%d, (%s) * u_tsc[%d].zw, u_tsz[%d]);\n",
++             st, uv, st, st);
++    else
++        sb_f(sb, "    T = texture(u_tex%d, (%s) * u_tsc[%d].xy);\n", st, uv, st);
++}
++
++/* nv2a_rc_eval(), and rc_stage_fetch() in front of it. */
++static void emit_rc(SB *sb, const ProgKey *k)
++{
++    uint32_t n = k->control & 0xFF, flags = k->control >> 8, s;
++    int st, j;
++
++    for (st = 0; st < 4; st++) {
++        uint32_t mode = (k->stage_program >> (st * 5)) & 0x1F;
++        if (mode >= 1 && mode <= 3)
++            sb_f(sb, "uniform %s u_tex%d;\n",
++                 (k->kind[st] & KIND_CUBE) ? "samplerCube" : "sampler2D", st);
++    }
++    sb_f(sb, "void main() {\n  if (v_z > u_zcut) discard;\n  vec4 R[16];\n  vec4 T;\n"
++             "  for (int i = 0; i < 16; i++) R[i] = vec4(0.0);\n");
++    for (st = 0; st < 4; st++) {
++        uint32_t mode = (k->stage_program >> (st * 5)) & 0x1F;
++        sb_f(sb, "  {\n");
++        switch (mode) {
++        case 0:
++            sb_f(sb, "    T = vec4(0.0, 0.0, 0.0, 1.0);\n");
++            break;
++        case 1: case 2: {
++            char uv[64];
++            sb_f(sb, "    float q = v_t%d.w != 0.0 ? v_t%d.w : 1.0;\n", st, st);
++            snprintf(uv, sizeof uv, "v_t%d.xy / q", st);
++            emit_sample(sb, st, k->kind[st], uv);
++            sb_f(sb, "    T.a = max(T.a, u_taf[%d]);\n", st);
++            break;
++        }
++        case 3:
++            if (k->kind[st] & KIND_CUBE) {
++                sb_f(sb, "    T = texture(u_tex%d, v_t%d.xyz);\n", st, st);
++            } else {
++                char uv[64];
++                snprintf(uv, sizeof uv, "v_t%d.xy", st);
++                emit_sample(sb, st, k->kind[st], uv);
++            }
++            sb_f(sb, "    T.a = max(T.a, u_taf[%d]);\n", st);
++            break;
++        case 4:
++            sb_f(sb, "    T = clamp(v_t%d, 0.0, 1.0);\n", st);
++            break;
++        case 5:
++            /* The software path's own test, sense included. */
++            for (j = 0; j < 4; j++) {
++                int ge = (k->clip_plane_mode >> (st * 4 + j)) & 1;
++                sb_f(sb, "    if (v_t%d[%d] %s 0.0) discard;\n", st, j,
++                     ge ? ">=" : "<");
++            }
++            sb_f(sb, "    T = vec4(0.0);\n");
++            break;
++        default:
++            sb_f(sb, "    T = vec4(0.0);\n");
++            break;
++        }
++        sb_f(sb, "    R[%d] = T;\n  }\n", 8 + st);
++    }
++    sb_f(sb, "  R[3] = vec4(u_fogc, v_fog);\n  R[4] = v_d0;\n  R[5] = v_d1;\n");
++    sb_f(sb, "  R[12].a = %s;\n", (k->stage_program & 0x1F) ? "R[8].a" : "1.0");
++
++    if (n > 8)
++        n = 8;
++    for (s = 0; s < n; s++) {
++        uint32_t icw = k->cicw[s], ocw = k->cocw[s];
++        uint32_t aicw = k->aicw[s], aocw = k->aocw[s];
++        uint32_t fl = ocw >> 12, afl = aocw >> 12;
++        const char *mo = rc_out_fmt(fl & 0x38), *amo = rc_out_fmt(afl & 0x38);
++        static const char *const nm[4] = { "A", "B", "C", "D" };
++
++        sb_f(sb, "  {\n    R[1] = u_c0[%u]; R[2] = u_c1[%u];\n", s, s);
++        if (flags & 1)
++            sb_f(sb, "    bool mux = R[12].a >= 0.5;\n");
++        else
++            sb_f(sb, "    bool mux = (int(R[12].a * 255.0) & 1) != 0;\n");
++        for (j = 0; j < 4; j++) {
++            sb_f(sb, "    vec3 %s = ", nm[j]);
++            rc_in(sb, icw >> (24 - 8 * j), 0);
++            sb_f(sb, ";\n    float a%s = ", nm[j]);
++            rc_in(sb, aicw >> (24 - 8 * j), 1);
++            sb_f(sb, ";\n");
++        }
++        sb_f(sb, "    vec3 pab = %s;\n", (fl & 2) ? "vec3(dot(A, B))" : "A * B");
++        sb_f(sb, "    vec3 pcd = %s;\n", (fl & 1) ? "vec3(dot(C, D))" : "C * D");
++        sb_f(sb, "    vec3 sum = %s;\n",
++             (fl & 4) ? "mux ? pcd : pab" : "pab + pcd");
++        sb_f(sb, "    vec3 ab = "); sb_f(sb, mo, "pab");
++        sb_f(sb, ";\n    vec3 cd = "); sb_f(sb, mo, "pcd");
++        sb_f(sb, ";\n    vec3 ms = "); sb_f(sb, mo, "sum");
++        sb_f(sb, ";\n    float apab = aA * aB;\n    float apcd = aC * aD;\n");
++        sb_f(sb, "    float asum = %s;\n",
++             (afl & 4) ? "mux ? apcd : apab" : "apab + apcd");
++        sb_f(sb, "    float aab = "); sb_f(sb, amo, "apab");
++        sb_f(sb, ";\n    float acd = "); sb_f(sb, amo, "apcd");
++        sb_f(sb, ";\n    float ams = "); sb_f(sb, amo, "asum");
++        sb_f(sb, ";\n");
++        if ((ocw >> 4) & 0xF) {
++            sb_f(sb, "    R[%u].rgb = ab;\n", (ocw >> 4) & 0xF);
++            if (fl & 0x80)
++                sb_f(sb, "    R[%u].a = ab.b;\n", (ocw >> 4) & 0xF);
++        }
++        if (ocw & 0xF) {
++            sb_f(sb, "    R[%u].rgb = cd;\n", ocw & 0xF);
++            if (fl & 0x40)
++                sb_f(sb, "    R[%u].a = cd.b;\n", ocw & 0xF);
++        }
++        if ((ocw >> 8) & 0xF)
++            sb_f(sb, "    R[%u].rgb = ms;\n", (ocw >> 8) & 0xF);
++        if ((aocw >> 4) & 0xF)
++            sb_f(sb, "    R[%u].a = aab;\n", (aocw >> 4) & 0xF);
++        if (aocw & 0xF)
++            sb_f(sb, "    R[%u].a = acd;\n", aocw & 0xF);
++        if ((aocw >> 8) & 0xF)
++            sb_f(sb, "    R[%u].a = ams;\n", (aocw >> 8) & 0xF);
++        sb_f(sb, "    R[0] = vec4(0.0);\n  }\n");
++    }
++
++    if (k->final0 || k->final1) {
++        uint32_t f0 = k->final0, f1 = k->final1, ff = f1 & 0xFF;
++        static const char *const nm[4] = { "A", "B", "C", "D" };
++        sb_f(sb, "  R[1] = u_fc0; R[2] = u_fc1;\n");
++        sb_f(sb, "  vec3 sa = %s;\n", (ff & 0x40) ? "1.0 - R[5].rgb" : "R[5].rgb");
++        sb_f(sb, "  vec3 sb = %s;\n", (ff & 0x20) ? "1.0 - R[12].rgb" : "R[12].rgb");
++        sb_f(sb, "  R[14] = vec4(%s, 0.0);\n",
++             (ff & 0x80) ? "clamp(sa + sb, 0.0, 1.0)" : "sa + sb");
++        sb_f(sb, "  vec3 E = "); rc_in(sb, f1 >> 24, 0);
++        sb_f(sb, ";\n  vec3 F = "); rc_in(sb, f1 >> 16, 0);
++        sb_f(sb, ";\n  R[15] = vec4(E * F, 0.0);\n");
++        for (j = 0; j < 4; j++) {
++            sb_f(sb, "  vec3 %s = ", nm[j]);
++            rc_in(sb, f0 >> (24 - 8 * j), 0);
++            sb_f(sb, ";\n");
++        }
++        sb_f(sb, "  o_col.rgb = D + C * (1.0 - A) + B * A;\n  o_col.a = ");
++        rc_in(sb, f1 >> 8, 1);
++        sb_f(sb, ";\n");
++    } else {
++        sb_f(sb, "  o_col = R[12];\n");
++    }
++    sb_f(sb, "  o_col = clamp(o_col, 0.0, 1.0);\n");
++    emit_alpha_test(sb, k->afunc);
++    sb_f(sb, "}\n");
++}
++
++static GLuint compile(GLenum type, const char *src)
++{
++    GLuint sh = glCreateShader(type);
++    GLint ok = 0;
++
++    glShaderSource(sh, 1, &src, NULL);
++    glCompileShader(sh);
++    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[2048];
++        log[0] = 0;
++        glGetShaderInfoLog(sh, sizeof log, NULL, log);
++        fprintf(stderr, "  [GL] shader compile failed: %s\n%s\n", log, src);
++        glDeleteShader(sh);
++        return 0;
++    }
++    return sh;
++}
++
++static GlProg *prog_for(const ProgKey *k)
++{
++    uint32_t slot = (uint32_t)hash_bytes((const uint8_t *)k, sizeof *k)
++                  & (GL_PROG_SLOTS - 1), i;
++    GlProg *p = NULL;
++    static char src[32768];
++    SB sb;
++    GLuint fs;
++    GLint ok = 0;
++    int st;
++
++    for (i = 0; i < GL_PROG_SLOTS; i++) {
++        p = &s_prog[(slot + i) & (GL_PROG_SLOTS - 1)];
++        if (!p->used)
++            break;
++        if (!memcmp(&p->key, k, sizeof *k))
++            return p->prog ? p : NULL;
++    }
++    if (i == GL_PROG_SLOTS)
++        return NULL;                    /* table full: 512 distinct set-ups */
++
++    sb.p = src; sb.n = 0; sb.cap = sizeof src - 1;
++    sb_f(&sb, "%s", FS_HEAD);
++    switch (k->mode) {
++    case NV2A_GL_MODE_2D:
++        /* raster_triangle: the texel as it is, or the flat vertex colour. */
++        sb_f(&sb, "uniform sampler2D u_tex0;\nvoid main() {\n"
++                  "  if (v_fog > 0.5)\n"
++                  "    o_col = fetch2(u_tex0, max(v_t0.xy, 0.0) * u_tsc[0].zw, u_tsz[0]);\n"
++                  "  else\n    o_col = v_d0;\n}\n");
++        break;
++    case NV2A_GL_MODE_XF:
++        /* xf_rows without combiners: nearest texel times diffuse. */
++        sb_f(&sb, "uniform sampler2D u_tex0;\nvoid main() {\n"
++                  "  if (v_z > u_zcut) discard;\n"
++                  "  o_col = clamp(v_d0, 0.0, 1.0);\n");
++        if (k->kind[0])
++            sb_f(&sb, "  o_col = clamp(o_col * fetch2(u_tex0, v_t0.xy * u_tsc[0].zw,"
++                      " u_tsz[0]), 0.0, 1.0);\n");
++        emit_alpha_test(&sb, k->afunc);
++        sb_f(&sb, "}\n");
++        break;
++    case NV2A_GL_MODE_RC:
++        emit_rc(&sb, k);
++        break;
++    default:
++        sb_f(&sb, "void main() { if (v_z > u_zcut) discard; o_col = vec4(0.0); }\n");
++        break;
++    }
++    src[sb.n] = 0;
++
++    p->used = 1;
++    p->key = *k;
++    p->prog = 0;
++    s_stat.programs++;
++    fs = compile(GL_FRAGMENT_SHADER, src);
++    if (!fs)
++        return NULL;
++    p->prog = glCreateProgram();
++    glAttachShader(p->prog, s_vs);
++    glAttachShader(p->prog, fs);
++    glLinkProgram(p->prog);
++    glDeleteShader(fs);
++    glGetProgramiv(p->prog, GL_LINK_STATUS, &ok);
++    if (!ok) {
++        char log[2048];
++        log[0] = 0;
++        glGetProgramInfoLog(p->prog, sizeof log, NULL, log);
++        fprintf(stderr, "  [GL] program link failed: %s\n", log);
++        p->prog = 0;
++        return NULL;
++    }
++    glUseProgram(p->prog);
++    p->u_scale = glGetUniformLocation(p->prog, "u_scale");
++    p->u_c0 = glGetUniformLocation(p->prog, "u_c0");
++    p->u_c1 = glGetUniformLocation(p->prog, "u_c1");
++    p->u_fc0 = glGetUniformLocation(p->prog, "u_fc0");
++    p->u_fc1 = glGetUniformLocation(p->prog, "u_fc1");
++    p->u_fogc = glGetUniformLocation(p->prog, "u_fogc");
++    p->u_aref = glGetUniformLocation(p->prog, "u_aref");
++    p->u_zcut = glGetUniformLocation(p->prog, "u_zcut");
++    p->u_tsc = glGetUniformLocation(p->prog, "u_tsc");
++    p->u_tsz = glGetUniformLocation(p->prog, "u_tsz");
++    p->u_taf = glGetUniformLocation(p->prog, "u_taf");
++    for (st = 0; st < 4; st++) {
++        char name[16];
++        GLint loc;
++        snprintf(name, sizeof name, "u_tex%d", st);
++        loc = glGetUniformLocation(p->prog, name);
++        if (loc >= 0)
++            glUniform1i(loc, st);
++    }
++    if (s_debug)
++        fprintf(stderr, "  [GL] program %u (mode %u)\n%s\n", s_stat.programs,
++                k->mode, s_debug > 1 ? src : "");
++    gl_check("program build");
++    return p;
++}
++
++/* ---- Context ------------------------------------------------------------ */
++
++static int gl_init(void)
++{
++    typedef HGLRC (WINAPI *CreateAttribs)(HDC, HGLRC, const int *);
++    static const int attribs[] = {
++        0x2091, 3,                      /* WGL_CONTEXT_MAJOR_VERSION_ARB */
++        0x2092, 3,                      /* WGL_CONTEXT_MINOR_VERSION_ARB */
++        0x9126, 0x0001,                 /* PROFILE_MASK: core */
++        0
++    };
++    WNDCLASSA wc;
++    PIXELFORMATDESCRIPTOR pfd;
++    HGLRC rc, rc2;
++    CreateAttribs create;
++    int pf, missing = 0, i, j, k;
++    static const uint32_t white = 0xFFFFFFFFu;
++
++    memset(&wc, 0, sizeof wc);
++    wc.style = CS_OWNDC;
++    wc.lpfnWndProc = DefWindowProcA;
++    wc.hInstance = GetModuleHandleA(NULL);
++    wc.lpszClassName = "xboxrecomp_nv2a_gl";
++    RegisterClassA(&wc);
++    /* Never shown: the context only ever draws into framebuffer objects. */
++    s_hwnd = CreateWindowExA(WS_EX_TOOLWINDOW, wc.lpszClassName, "nv2a-gl",
++                             WS_POPUP, 0, 0, 16, 16, NULL, NULL, wc.hInstance,
++                             NULL);
++    if (!s_hwnd)
++        return 0;
++    s_hdc = GetDC(s_hwnd);
++    memset(&pfd, 0, sizeof pfd);
++    pfd.nSize = sizeof pfd;
++    pfd.nVersion = 1;
++    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
++    pfd.iPixelType = PFD_TYPE_RGBA;
++    pfd.cColorBits = 32;
++    pf = ChoosePixelFormat(s_hdc, &pfd);
++    if (!pf || !SetPixelFormat(s_hdc, pf, &pfd))
++        return 0;
++    rc = wglCreateContext(s_hdc);
++    if (!rc || !wglMakeCurrent(s_hdc, rc))
++        return 0;
++    create = (CreateAttribs)(void *)wglGetProcAddress("wglCreateContextAttribsARB");
++    if (create && (rc2 = create(s_hdc, NULL, attribs)) != NULL) {
++        wglMakeCurrent(NULL, NULL);
++        wglDeleteContext(rc);
++        if (!wglMakeCurrent(s_hdc, rc2))
++            return 0;
++    }
++
++#define X(ret, name, args) \
++    gl##name = (ret (APIENTRY *) args)(void *)wglGetProcAddress("gl" #name); \
++    if (!gl##name) missing++;
++    GLFUNCS(X)
++#undef X
++    if (missing) {
++        fprintf(stderr, "  [GL] %d OpenGL 3.3 functions missing (%s)\n", missing,
++                (const char *)glGetString(GL_VERSION));
++        return 0;
++    }
++
++    s_q = (Nv2aGlVertex *)malloc(sizeof(Nv2aGlVertex) * 3 * GLQ_MAX_TRIS);
++    s_tex = (GlTexEntry *)calloc(GL_TEX_SLOTS, sizeof(GlTexEntry));
++    s_prog = (GlProg *)calloc(GL_PROG_SLOTS, sizeof(GlProg));
++    if (!s_q || !s_tex || !s_prog)
++        return 0;
++    s_vs = compile(GL_VERTEX_SHADER, VS_SRC);
++    if (!s_vs)
++        return 0;
++
++    glGenVertexArrays(1, &s_vao);
++    glBindVertexArray(s_vao);
++    glGenBuffers(1, &s_vbo);
++    glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
++    {
++        const GLsizei sz = (GLsizei)sizeof(Nv2aGlVertex);
++#define VOFF(f) ((const void *)offsetof(Nv2aGlVertex, f))
++        glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sz, VOFF(pos));
++        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sz, VOFF(d0));
++        glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sz, VOFF(d1));
++        for (i = 0; i < 4; i++)
++            glVertexAttribPointer(3 + i, 4, GL_FLOAT, GL_FALSE, sz,
++                                  (const char *)VOFF(tex) + 16 * i);
++        glVertexAttribPointer(7, 1, GL_FLOAT, GL_FALSE, sz, VOFF(fog));
++#undef VOFF
++        for (i = 0; i < 8; i++)
++            glEnableVertexAttribArray(i);
++    }
++    glGenQueries(1, &s_query);
++    glGenTextures(1, &s_white);
++    bind_scratch(GL_TEXTURE_2D, s_white);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_BGRA, GL_UNSIGNED_BYTE,
++                 &white);
++    tex_params(GL_TEXTURE_2D);
++    for (i = 0; i < 2; i++)
++        for (j = 0; j < 2; j++)
++            for (k = 0; k < 2; k++) {
++                GLuint smp;
++                glGenSamplers(1, &smp);
++                glSamplerParameteri(smp, GL_TEXTURE_MIN_FILTER, i ? GL_LINEAR : GL_NEAREST);
++                glSamplerParameteri(smp, GL_TEXTURE_MAG_FILTER, i ? GL_LINEAR : GL_NEAREST);
++                glSamplerParameteri(smp, GL_TEXTURE_WRAP_S, j ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++                glSamplerParameteri(smp, GL_TEXTURE_WRAP_T, k ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++                glSamplerParameteri(smp, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
++                s_sampler[i][j][k] = smp;
++            }
++    glDisable(GL_DITHER);
++    glDisable(GL_CULL_FACE);
++    /* The software path has no near or far plane: depth outside the buffer's
++     * range is drawn, not clipped. */
++    glEnable(GL_DEPTH_CLAMP);
++    {
++        const char *d = getenv("RECOMP_GPU_DEBUG"), *v = getenv("RECOMP_GPU_VERIFY");
++        s_debug = d ? atoi(d) : 0;
++        s_verify = v && *v && *v != '0';
++        if (s_verify)
++            fprintf(stderr, "  [GL] VERIFY mode: every batch is drawn by both"
++                            " paths and compared at each flip\n");
++    }
++    fprintf(stderr, "  [GL] hardware pixel backend: %s, OpenGL %s\n",
++            (const char *)glGetString(GL_RENDERER),
++            (const char *)glGetString(GL_VERSION));
++    while ((i = (int)glGetError()) != 0)
++        fprintf(stderr, "  [GL] error 0x%04X during set-up%c", i, 10);
++    return 1;
++}
++
++int nv2a_gl_active(void)
++{
++    if (!s_state) {
++        const char *e = getenv("RECOMP_GPU");
++        s_state = -1;
++        if (e && *e && strcmp(e, "0") != 0) {
++            if (gl_init())
++                s_state = 1;
++            else
++                fprintf(stderr, "  [GL] no usable OpenGL 3.3 context; staying on"
++                                " the software rasteriser\n");
++        }
++    }
++    return s_state > 0;
++}
++
++/* ---- Queue and draw ----------------------------------------------------- */
++
++Nv2aGlVertex *nv2a_gl_tri(void)
++{
++    Nv2aGlVertex *v;
++    if (s_nverts + 3 > 3 * GLQ_MAX_TRIS)
++        return NULL;
++    v = &s_q[s_nverts];
++    s_nverts += 3;
++    return v;
++}
++
++int nv2a_gl_pending(void)
++{
++    return s_nverts != 0;
++}
++
++void nv2a_gl_tex_touched(int stage)
++{
++    if (stage >= 0 && stage < 4)
++        s_stage_touched[stage] = 1;
++}
++
++static GLenum blend_factor_gl(uint32_t f)
++{
++    if (f == 0 || f == 1 || (f >= 0x0300 && f <= 0x0308)
++        || (f >= 0x8001 && f <= 0x8004))
++        return (GLenum)f;
++    return GL_ONE;                      /* as blend_factor()'s default */
++}
++
++static int tex_linear(const Nv2aTexture *t)
++{
++    uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
++    return mag == 2 || min == 2 || min == 4 || min == 6;
++}
++
++static void unpack_argb(uint32_t c, float o[4])
++{
++    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
++    o[1] = (float)((c >>  8) & 0xFF) / 255.0f;
++    o[2] = (float)( c        & 0xFF) / 255.0f;
++    o[3] = (float)( c >> 24        ) / 255.0f;
++}
++
++void nv2a_gl_draw(const Nv2aGlState *st, uint32_t *zpass)
++{
++    int n = s_nverts, i, stage, used[4] = {0, 0, 0, 0}, linear[4] = {0, 0, 0, 0};
++    GlSurface *S;
++    GLuint depth = 0;
++    TexBind tb[4];
++    ProgKey key;
++    GlProg *p;
++    float tsc[16], taf[4];
++    GLint tsz[16];
++
++    s_nverts = 0;
++    if (zpass)
++        *zpass = 0;
++    if (!n || s_state <= 0)
++        return;
++    S = surf_get(st->color_base, st->pitch, st->bpp, st->clip_y + st->clip_h);
++    if (!S)
++        return;
++
++    /* Program key and textures. */
++    memset(&key, 0, sizeof key);
++    key.mode = (uint32_t)st->mode;
++    key.afunc = 0x207;
++    if (st->mode != NV2A_GL_MODE_2D && st->mode != NV2A_GL_MODE_DEPTH
++        && st->alpha_test && st->alpha_func >= 0x200 && st->alpha_func <= 0x206)
++        key.afunc = st->alpha_func;
++    for (i = 0; i < 4; i++)
++        bind_white(&tb[i]);
++    if (st->mode == NV2A_GL_MODE_RC) {
++        uint32_t ns = st->rc.control & 0xFF;
++        if (ns > 8)
++            ns = 8;
++        key.control = (st->rc.control & 0x00011100u) | ns;
++        key.stage_program = st->rc.stage_program & 0xFFFFFu;
++        key.final0 = st->rc.final0;
++        key.final1 = st->rc.final1;
++        for (i = 0; i < (int)ns; i++) {
++            key.cicw[i] = st->rc.color_icw[i]; key.aicw[i] = st->rc.alpha_icw[i];
++            key.cocw[i] = st->rc.color_ocw[i]; key.aocw[i] = st->rc.alpha_ocw[i];
++        }
++        for (stage = 0; stage < 4; stage++) {
++            uint32_t mode = (key.stage_program >> (stage * 5)) & 0x1F;
++            if (mode == 5)
++                key.clip_plane_mode |= st->clip_plane_mode & (0xFu << (stage * 4));
++            if (mode < 1 || mode > 3)
++                continue;
++            used[stage] = 1;
++            tex_resolve(st, stage, S, &tb[stage]);
++            linear[stage] = tex_linear(&st->tex[stage]);
++            if (mode == 3 && tb[stage].cube)
++                key.kind[stage] = KIND_CUBE;
++            else if (tb[stage].cube)
++                bind_white(&tb[stage]);    /* a cube map read as 2D: no such thing */
++            if (!(key.kind[stage] & KIND_CUBE) && !linear[stage])
++                key.kind[stage] = KIND_FETCH;
++        }
++    } else if (st->mode == NV2A_GL_MODE_XF || st->mode == NV2A_GL_MODE_2D) {
++        if (st->tex[0].valid) {
++            tex_resolve(st, 0, S, &tb[0]);
++            if (tb[0].cube)
++                bind_white(&tb[0]);
++            used[0] = 1;
++            /* XF: an unreadable stage leaves the colour alone, which is what
++             * white does. 2D: it falls back to the flat colour instead. */
++            key.kind[0] = KIND_FETCH;
++            if (st->mode == NV2A_GL_MODE_2D) {
++                if (tb[0].supported)
++                    tb[0].mx = tb[0].my = 1.0f;    /* texels already */
++                else
++                    for (i = 0; i < n; i++)
++                        s_q[i].fog = 0.0f;
++            }
++        } else if (st->mode == NV2A_GL_MODE_2D) {
++            key.kind[0] = KIND_FETCH;
++            used[0] = 1;
++            for (i = 0; i < n; i++)
++                s_q[i].fog = 0.0f;
++        }
++    }
++    p = prog_for(&key);
++    if (!p)
++        return;
++    if (st->use_depth)
++        depth = depth_for(st->zeta_offset, S->w, S->h);
++
++    /* Target and per-fragment state. */
++    glBindFramebuffer(GL_FRAMEBUFFER, fbo_for(S->tex, depth));
++    glViewport(0, 0, S->w, S->h);
++    glEnable(GL_SCISSOR_TEST);
++    glScissor((GLint)st->clip_x, (GLint)st->clip_y, (GLsizei)st->clip_w,
++              (GLsizei)st->clip_h);
++    if (st->blend_enable && !(st->blend_sfactor == 1 && st->blend_dfactor == 0)) {
++        float c[4];
++        GLenum eq = st->blend_equation;
++        if (eq != 0x800A && eq != 0x800B && eq != 0x8007 && eq != 0x8008)
++            eq = GL_FUNC_ADD;
++        unpack_argb(st->blend_color, c);
++        glEnable(GL_BLEND);
++        glBlendFunc(blend_factor_gl(st->blend_sfactor),
++                    blend_factor_gl(st->blend_dfactor));
++        glBlendEquation(eq);
++        glBlendColor(c[0], c[1], c[2], c[3]);
++    } else {
++        glDisable(GL_BLEND);
++    }
++    glColorMask((st->color_mask & 0x00010000u) != 0,
++                (st->color_mask & 0x00000100u) != 0,
++                (st->color_mask & 0x00000001u) != 0,
++                /* A 5:6:5 surface has no alpha: it stays 1, as the software
++                 * path reads it. */
++                S->bpp == 4 && (st->color_mask & 0x01000000u) != 0);
++    if (depth && (st->depth_test || st->depth_mask)) {
++        glEnable(GL_DEPTH_TEST);
++        if (st->depth_test) {
++            glDepthFunc(st->depth_func >= 0x200 && st->depth_func <= 0x207
++                        ? (GLenum)st->depth_func : GL_ALWAYS);
++            glDepthMask(st->depth_mask != 0);
++        } else {
++            /* The software path writes depth with the test off. */
++            glDepthFunc(GL_ALWAYS);
++            glDepthMask(GL_TRUE);
++        }
++    } else {
++        glDisable(GL_DEPTH_TEST);
++    }
++
++    /* Program, uniforms, textures. */
++    glUseProgram(p->prog);
++    glUniform3f(p->u_scale, 2.0f / (float)S->w, 2.0f / (float)S->h,
++                st->zmax > 0.0f ? 1.0f / st->zmax : 1.0f);
++    if (st->mode == NV2A_GL_MODE_RC) {
++        uint32_t flags = st->rc.control >> 8;
++        float c0[32], c1[32], fc[4];
++        for (i = 0; i < 8; i++) {
++            unpack_argb(st->rc.factor0[(flags & 0x010) ? i : 0], &c0[i * 4]);
++            unpack_argb(st->rc.factor1[(flags & 0x100) ? i : 0], &c1[i * 4]);
++        }
++        glUniform4fv(p->u_c0, 8, c0);
++        glUniform4fv(p->u_c1, 8, c1);
++        unpack_argb(st->rc.final_c0, fc);
++        glUniform4fv(p->u_fc0, 1, fc);
++        unpack_argb(st->rc.final_c1, fc);
++        glUniform4fv(p->u_fc1, 1, fc);
++        glUniform3fv(p->u_fogc, 1, st->fog_color);
++    }
++    glUniform1i(p->u_aref, (GLint)(st->alpha_ref & 0xFF));
++    /* Depth beyond the buffer's range. GL always clamps here (there is no
++     * near or far plane in the software path either). With the title's depth
++     * clamp on that is the whole story; with it off the software path's
++     * unclamped depth simply fails a LESS/LEQUAL test against anything in
++     * the buffer, so those fragments are dropped. */
++    glUniform1f(p->u_zcut, depth && st->depth_test && !st->depth_clamp
++                           && (st->depth_func == 0x201 || st->depth_func == 0x203)
++                           ? 1.0f : 3.0e38f);
++    for (i = 0; i < 4; i++) {
++        tsc[i * 4 + 0] = tb[i].sx; tsc[i * 4 + 1] = tb[i].sy;
++        tsc[i * 4 + 2] = tb[i].mx; tsc[i * 4 + 3] = tb[i].my;
++        tsz[i * 4 + 0] = tb[i].w;  tsz[i * 4 + 1] = tb[i].h;
++        tsz[i * 4 + 2] = (GLint)st->tex[i].addr_u;
++        tsz[i * 4 + 3] = (GLint)st->tex[i].addr_v;
++        taf[i] = tb[i].afloor;
++        if (!used[i])
++            continue;
++        glActiveTexture(GL_TEXTURE0 + i);
++        glBindTexture(tb[i].cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, tb[i].tex);
++        glBindSampler((GLuint)i, s_sampler[linear[i] != 0]
++                                          [st->tex[i].addr_u == 1]
++                                          [st->tex[i].addr_v == 1]);
++    }
++    glUniform4fv(p->u_tsc, 4, tsc);
++    glUniform4iv(p->u_tsz, 4, tsz);
++    glUniform1fv(p->u_taf, 4, taf);
++
++    glBufferData(GL_ARRAY_BUFFER, (ptrdiff_t)sizeof(Nv2aGlVertex) * n, s_q,
++                 GL_STREAM_DRAW);
++    if (st->zpass_enable && zpass) {
++        GLuint r = 0;
++        glBeginQuery(GL_SAMPLES_PASSED, s_query);
++        glDrawArrays(GL_TRIANGLES, 0, n);
++        glEndQuery(GL_SAMPLES_PASSED);
++        glGetQueryObjectuiv(s_query, GL_QUERY_RESULT, &r);
++        *zpass = r;
++    } else {
++        glDrawArrays(GL_TRIANGLES, 0, n);
++    }
++    S->gpu_newer = 1;
++    s_stat.draws++;
++    s_stat.tris += (uint64_t)n / 3;
++    gl_check("draw");
++}
++
++void nv2a_gl_clear_color(const Nv2aGlState *st, uint32_t x, uint32_t y,
++                         uint32_t w, uint32_t h, uint32_t argb)
++{
++    GlSurface *S;
++    float c[4];
++
++    if (s_state <= 0)
++        return;
++    S = surf_get(st->color_base, st->pitch, st->bpp, y + h);
++    if (!S)
++        return;
++    unpack_argb(argb, c);
++    glBindFramebuffer(GL_FRAMEBUFFER, fbo_for(S->tex, 0));
++    glEnable(GL_SCISSOR_TEST);
++    glScissor((GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    glClearColor(c[0], c[1], c[2], S->bpp == 4 ? c[3] : 1.0f);
++    glClear(GL_COLOR_BUFFER_BIT);
++    S->gpu_newer = 1;
++    gl_check("clear");
++}
++
++void nv2a_gl_clear_depth(uint32_t zeta_offset, float value01)
++{
++    if (s_state <= 0)
++        return;
++    if (value01 < 0.0f) value01 = 0.0f;
++    if (value01 > 1.0f) value01 = 1.0f;
++    depth_clear_tex(depth_for(zeta_offset, 0, 0), value01);
++    gl_check("depth clear");
++}
++
++void nv2a_gl_download(uint32_t color_base)
++{
++    GlSurface *s;
++    if (s_state <= 0)
++        return;
++    s = surf_find(color_base);
++    if (s)
++        surf_download(s);
++}
++
++void nv2a_gl_flip(void)
++{
++    MSG msg;
++    int i;
++
++    if (s_state <= 0)
++        return;
++    s_flip++;
++    glFlush();
++    /* The hidden window still has a queue; keep it empty. */
++    while (PeekMessageA(&msg, s_hwnd, 0, 0, PM_REMOVE))
++        DispatchMessageA(&msg);
++    /* Textures nothing has drawn with for a long time. */
++    if ((s_flip & 255) == 0) {
++        for (i = 0; i < GL_TEX_SLOTS; i++) {
++            GlTexEntry *e = &s_tex[i];
++            if (e->used && e->tex && s_flip - e->last_use > 1800) {
++                glDeleteTextures(1, &e->tex);
++                e->tex = 0;
++                e->checked_flip = 0;
++            }
++        }
++    }
++}
++
++int nv2a_gl_verify(void)
++{
++    return s_state > 0 && s_verify;
++}
++
++/* The surface as the GPU has it, BGRA rows of s->w, into the scratch buffer. */
++static const uint32_t *verify_read(GlSurface *s)
++{
++    uint32_t *buf = scratch((size_t)s->w * s->h);
++    if (!buf)
++        return NULL;
++    glBindFramebuffer(GL_FRAMEBUFFER, fbo_for(s->tex, 0));
++    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++    glReadPixels(0, 0, s->w, s->h, GL_BGRA, GL_UNSIGNED_BYTE, buf);
++    return buf;
++}
++
++static uint32_t guest_pixel(const GlSurface *s, uint32_t x, uint32_t y)
++{
++    const uint8_t *row = guest(s->base) + (size_t)y * s->pitch;
++    uint32_t t;
++    if (s->bpp == 4)
++        return ((const uint32_t *)row)[x];
++    t = ((const uint16_t *)row)[x];
++    return 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
++         | ((t & 0x001Fu) << 3);
++}
++
++void nv2a_gl_verify_compare(uint32_t color_base, uint32_t x, uint32_t y,
++                            uint32_t w, uint32_t h, uint32_t flip)
++{
++    GlSurface *s;
++    const uint32_t *buf;
++    uint64_t sum[4] = {0, 0, 0, 0}, differ = 0, big = 0, n = 0;
++    uint32_t max[4] = {0, 0, 0, 0}, px, py, k;
++    uint32_t bx0 = 0xFFFFFFFFu, by0 = 0xFFFFFFFFu, bx1 = 0, by1 = 0;
++
++    if (s_state <= 0 || !s_verify)
++        return;
++    s = surf_find(color_base);
++    if (!s) {
++        fprintf(stderr, "[GLV] flip %u: no GL surface at 0x%08X\n", flip, color_base);
++        return;
++    }
++    buf = verify_read(s);
++    if (!buf)
++        return;
++    for (py = y; py < y + h && py < (uint32_t)s->h; py++) {
++        for (px = x; px < x + w && px < (uint32_t)s->w; px++) {
++            uint32_t g = buf[(size_t)py * s->w + px], c = guest_pixel(s, px, py);
++            uint32_t worst = 0;
++            if (s->bpp == 2)
++                g = (g & 0x00F8FCF8u) | 0xFF000000u;
++            n++;
++            if (g == c)
++                continue;
++            for (k = 0; k < 4; k++) {
++                int d = (int)((g >> (k * 8)) & 0xFF) - (int)((c >> (k * 8)) & 0xFF);
++                uint32_t ad = (uint32_t)(d < 0 ? -d : d);
++                sum[k] += ad;
++                if (ad > max[k]) max[k] = ad;
++                if (k < 3 && ad > worst) worst = ad;
++            }
++            if (worst)
++                differ++;
++            if (worst > 8) {
++                big++;
++                if (px < bx0) bx0 = px;
++                if (py < by0) by0 = py;
++                if (px > bx1) bx1 = px;
++                if (py > by1) by1 = py;
++            }
++        }
++    }
++    if (!n)
++        return;
++    fprintf(stderr, "[GLV] flip %u surf 0x%08X %ux%u: mean |d| b %.3f g %.3f r %.3f"
++                    " a %.3f | max %u %u %u a %u | rgb differs %llu (%.2f%%),"
++                    " >8: %llu (%.3f%%)",
++            flip, color_base, w, h, (double)sum[0] / n, (double)sum[1] / n,
++            (double)sum[2] / n, (double)sum[3] / n, max[0], max[1], max[2],
++            max[3], (unsigned long long)differ, 100.0 * differ / n,
++            (unsigned long long)big, 100.0 * big / n);
++    if (big)
++        fprintf(stderr, " bbox %u,%u..%u,%u", bx0, by0, bx1, by1);
++    fprintf(stderr, "\n");
++}
++
++void nv2a_gl_verify_dump(uint32_t color_base, uint32_t x, uint32_t y,
++                         uint32_t w, uint32_t h, const char *path)
++{
++    GlSurface *s;
++    const uint32_t *buf;
++    uint32_t row_bytes = w * 3, pad = (4 - (row_bytes & 3)) & 3, px, py;
++    uint32_t filesz = 54 + (row_bytes + pad) * h;
++    uint8_t hdr[54];
++    FILE *f;
++
++    if (s_state <= 0 || !s_verify || !w || !h)
++        return;
++    s = surf_find(color_base);
++    if (!s || x + w > (uint32_t)s->w || y + h > (uint32_t)s->h)
++        return;
++    buf = verify_read(s);
++    f = buf ? fopen(path, "wb") : NULL;
++    if (!f)
++        return;
++    memset(hdr, 0, sizeof hdr);
++    hdr[0] = 'B'; hdr[1] = 'M';
++    memcpy(hdr + 2, &filesz, 4);
++    hdr[10] = 54; hdr[14] = 40;
++    memcpy(hdr + 18, &w, 4);
++    memcpy(hdr + 22, &h, 4);
++    hdr[26] = 1; hdr[28] = 24;
++    fwrite(hdr, 1, sizeof hdr, f);
++    for (py = h; py-- > 0; ) {
++        static const uint8_t zero[3] = {0, 0, 0};
++        for (px = 0; px < w; px++)
++            fwrite(&buf[(size_t)(y + py) * s->w + x + px], 1, 3, f);
++        if (pad)
++            fwrite(zero, 1, pad, f);
++    }
++    fclose(f);
++}
++
++void nv2a_gl_report(void)
++{
++    if (s_state <= 0)
++        return;
++    fprintf(stderr, "[GL] draws %llu tris %llu | programs %u | texture uploads"
++                    " %llu, %llu MB hashed | surface downloads %llu uploads %llu\n",
++            (unsigned long long)s_stat.draws, (unsigned long long)s_stat.tris,
++            s_stat.programs, (unsigned long long)s_stat.tex_uploads,
++            (unsigned long long)(s_stat.tex_hashed >> 20),
++            (unsigned long long)s_stat.downloads,
++            (unsigned long long)s_stat.uploads);
++}
++
++#else  /* not Windows: software only */
++
++int  nv2a_gl_active(void) { return 0; }
++int  nv2a_gl_verify(void) { return 0; }
++void nv2a_gl_verify_compare(uint32_t color_base, uint32_t x, uint32_t y,
++                            uint32_t w, uint32_t h, uint32_t flip)
++{ (void)color_base; (void)x; (void)y; (void)w; (void)h; (void)flip; }
++void nv2a_gl_verify_dump(uint32_t color_base, uint32_t x, uint32_t y,
++                         uint32_t w, uint32_t h, const char *path)
++{ (void)color_base; (void)x; (void)y; (void)w; (void)h; (void)path; }
++Nv2aGlVertex *nv2a_gl_tri(void) { return NULL; }
++int  nv2a_gl_pending(void) { return 0; }
++void nv2a_gl_draw(const Nv2aGlState *st, uint32_t *zpass) { (void)st; (void)zpass; }
++void nv2a_gl_clear_color(const Nv2aGlState *st, uint32_t x, uint32_t y,
++                         uint32_t w, uint32_t h, uint32_t argb)
++{ (void)st; (void)x; (void)y; (void)w; (void)h; (void)argb; }
++void nv2a_gl_clear_depth(uint32_t zeta_offset, float value01)
++{ (void)zeta_offset; (void)value01; }
++void nv2a_gl_download(uint32_t color_base) { (void)color_base; }
++void nv2a_gl_tex_touched(int stage) { (void)stage; }
++void nv2a_gl_flip(void) {}
++void nv2a_gl_report(void) {}
++
++#endif
+diff --git a/src/kernel/nv2a_gl.h b/src/kernel/nv2a_gl.h
+new file mode 100644
+index 0000000..15c0bc6
+--- /dev/null
++++ b/src/kernel/nv2a_gl.h
+@@ -0,0 +1,124 @@
++/**
++ * Hardware pixel backend for the pushbuffer executor (nv2a_pb_exec.c).
++ *
++ * The executor keeps doing everything up to and including vertex processing
++ * on the CPU: it decodes the pushbuffer, runs vertex programs, near-clips and
++ * arrives at screen-space triangles. Only the per-pixel work -- texturing,
++ * register combiners, fog, alpha test, depth, blending -- moves to OpenGL,
++ * because that is where a software rasteriser spends its time (Halo 2's menu
++ * ran at 2 frames a second).
++ *
++ * Enabled with RECOMP_GPU=1 (RECOMP_GPU=0 or unset: software). If no context
++ * can be created one line is logged and the software path carries on.
++ *
++ * Everything here runs on the executor thread, which owns the GL context.
++ */
++#ifndef XBOXRECOMP_NV2A_GL_H
++#define XBOXRECOMP_NV2A_GL_H
++
++#include <stdint.h>
++#include "nv2a_combiner.h"
++
++/* One texture stage as the title programmed it (the executor's own type). */
++typedef struct {
++    uint32_t offset;                    /* guest address of texel (0,0)  */
++    uint32_t width, height;             /* from IMAGE_RECT or FORMAT     */
++    uint32_t pitch;                     /* bytes per row, from CONTROL1  */
++    uint32_t color;                     /* NV097 colour-format code      */
++    uint32_t addr_u, addr_v;            /* wrap mode per axis            */
++    uint32_t palette;                   /* guest address of the CLUT, P8 */
++    uint32_t levels;                    /* mip levels, from FORMAT       */
++    uint32_t filter;                    /* SET_TEXTURE_FILTER            */
++    int      cube;                      /* FORMAT: six faces, not one    */
++    int      valid;
++} Nv2aTexture;
++
++/* How a batch is shaded; each mirrors one software pixel loop. */
++enum {
++    NV2A_GL_MODE_2D = 0,    /* raster_triangle: texel replaces, else flat  */
++    NV2A_GL_MODE_XF,        /* xf_rows without combiners: texel * diffuse  */
++    NV2A_GL_MODE_RC,        /* xf_rows through the register combiners      */
++    NV2A_GL_MODE_DEPTH      /* colour writes off, no alpha test: no shading */
++};
++
++typedef struct {
++    float pos[4];           /* screen x, y (pixels), z (depth units), w    */
++    float d0[4], d1[4];     /* r g b a                                     */
++    float tex[4][4];
++    float fog;              /* fog factor; in 2D mode 1 = textured vertex  */
++} Nv2aGlVertex;
++
++typedef struct {
++    /* Where it draws. */
++    uint32_t color_base;    /* resolved guest address of the surface       */
++    uint32_t pitch, bpp;
++    uint32_t clip_x, clip_y, clip_w, clip_h;
++    uint32_t zeta_offset;
++    float    zmax;          /* largest depth value of the zeta format      */
++    int      use_depth;
++    int      depth_clamp;   /* ZMIN_MAX_CONTROL bit 4                      */
++    /* Per-fragment state. */
++    uint32_t blend_enable, blend_sfactor, blend_dfactor;
++    uint32_t blend_equation, blend_color;
++    uint32_t color_mask;
++    uint32_t depth_test, depth_func, depth_mask;
++    uint32_t alpha_test, alpha_func, alpha_ref;
++    uint32_t zpass_enable;
++    /* Shading. */
++    int      mode;
++    Nv2aCombiner rc;
++    uint32_t clip_plane_mode;
++    float    fog_color[3];
++    Nv2aTexture tex[4];
++} Nv2aGlState;
++
++/* Is the backend on? The first call creates the context. */
++int  nv2a_gl_active(void);
++
++/* Three vertices of the next queued triangle, or NULL when the queue is full
++ * (draw it and ask again). */
++Nv2aGlVertex *nv2a_gl_tri(void);
++int  nv2a_gl_pending(void);
++
++/* Draw the queue under `st`. *zpass gets the pixels that passed the depth
++ * test, when st->zpass_enable. */
++void nv2a_gl_draw(const Nv2aGlState *st, uint32_t *zpass);
++
++/* Clears: target fields of `st` only. */
++void nv2a_gl_clear_color(const Nv2aGlState *st, uint32_t x, uint32_t y,
++                         uint32_t w, uint32_t h, uint32_t argb);
++void nv2a_gl_clear_depth(uint32_t zeta_offset, float value01);
++
++/* Make guest memory hold what was drawn into the surface at `color_base`. */
++void nv2a_gl_download(uint32_t color_base);
++
++/* A texture-stage register was written: revalidate that stage's texture. */
++void nv2a_gl_tex_touched(int stage);
++
++/* The title flipped. */
++void nv2a_gl_flip(void);
++
++/* RECOMP_GPU_VERIFY: the executor draws everything twice, on the GPU and
++ * with the software rasteriser into guest memory, and the two results of
++ * the same frame are compared here. Guest memory then belongs to the
++ * software path: nothing is downloaded into it or uploaded from it after a
++ * surface is created. Software speed; a test mode. */
++int  nv2a_gl_verify(void);
++/* Compare the GL surface with guest memory over a rectangle; one log line. */
++void nv2a_gl_verify_compare(uint32_t color_base, uint32_t x, uint32_t y,
++                            uint32_t w, uint32_t h, uint32_t flip);
++/* Write the GL surface's rectangle as a 24-bit BMP. */
++void nv2a_gl_verify_dump(uint32_t color_base, uint32_t x, uint32_t y,
++                         uint32_t w, uint32_t h, const char *path);
++
++/* One line of counters for the periodic report. */
++void nv2a_gl_report(void);
++
++/* Supplied by the executor: its own texel decoder and layout helpers, so
++ * there is one implementation of every texture format. */
++int      nv2a_exec_sample_tex(const Nv2aTexture *t, uint32_t face_offset,
++                              uint32_t u, uint32_t v, uint32_t *argb);
++uint32_t nv2a_exec_tex_face_stride(const Nv2aTexture *t);
++uint32_t nv2a_exec_tex_texel_bytes(uint32_t fmt);
++
++#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..04d100b 100644
+index c65632c..f934b90 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
-@@ -583,8 +583,10 @@ static uint32_t surface_bpp(void)
+@@ -37,6 +37,7 @@
+ #include "../d3d/d3d8_swizzle.h"
+ #include "nv2a_vsh_interp.h"
+ #include "nv2a_combiner.h"
++#include "nv2a_gl.h"
+ #if defined(_WIN32)
+ #include <windows.h>
+ #define NV_TLS __declspec(thread)
+@@ -234,18 +235,9 @@ typedef struct {
+  * nothing writes to is a stage nothing can be sampled from. The rest arrive
+  * as unhandled methods and are counted as such, which is how the next title
+  * that needs them will say so. */
+-typedef struct {
+-    uint32_t offset;                    /* guest address of texel (0,0)  */
+-    uint32_t width, height;             /* from IMAGE_RECT               */
+-    uint32_t pitch;                     /* bytes per row, from CONTROL1  */
+-    uint32_t color;                     /* NV097 colour-format code      */
+-    uint32_t addr_u, addr_v;            /* wrap mode per axis            */
+-    uint32_t palette;                   /* guest address of the CLUT, P8 */
+-    uint32_t levels;                    /* mip levels, from FORMAT       */
+-    uint32_t filter;                    /* SET_TEXTURE_FILTER            */
+-    int      cube;                      /* FORMAT: six faces, not one    */
+-    int      valid;
+-} Texture;
++/* The fields live in nv2a_gl.h: the hardware backend reads the same
++ * description. */
++typedef Nv2aTexture Texture;
+ 
+ static struct {
+     VertexAttr attr[NV_VERTEX_ATTRS];
+@@ -322,6 +314,7 @@ static struct {
+     int xf_nfmt, xf_seeded;
+     uint32_t depth_test, depth_func, depth_mask;
+     uint32_t zeta_offset, zstencil_clear;
++    uint32_t zminmax_control;           /* SET_ZMIN_MAX_CONTROL */
+ } s_gpu;
+ 
+ /* Unhandled methods, ranked. The interesting output is not that something was
+@@ -583,12 +576,18 @@ static uint32_t surface_bpp(void)
   * the sequence. */
  static int s_flip_dumping;
  
@@ -352,7 +2399,35 @@ index c65632c..04d100b 100644
      const char *prefix = getenv("RECOMP_FB_DUMP");
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      int drawn = s_gpu.drawn_offset != 0;
-@@ -679,12 +681,44 @@ static void clear_surface(uint32_t param)
+     uint32_t offset = drawn ? s_gpu.drawn_offset : s_gpu.color_offset;
++    /* The hardware backend keeps the surface on the GPU until someone reads
++     * it from guest memory; this is someone. */
++    if (prefix && offset && nv2a_gl_active() && !nv2a_gl_verify())
++        nv2a_gl_download(dma_resolve(offset));
+     uint32_t pitch = drawn ? s_gpu.drawn_pitch : s_gpu.pitch;
+     uint32_t cx = drawn ? s_gpu.drawn_x : s_gpu.clip_x;
+     uint32_t cy = drawn ? s_gpu.drawn_y : s_gpu.clip_y;
+@@ -649,6 +648,11 @@ static void dump_surface_bmp(void)
+         }
+     }
+     fclose(f);
++    if (nv2a_gl_verify()) {
++        /* The same frame as the GPU drew it, beside the software one. */
++        snprintf(path, sizeof path, "%s%05d_gl.bmp", prefix, seq - 1);
++        nv2a_gl_verify_dump(dma_resolve(offset), cx, cy, w, h, path);
++    }
+     if (seq == 1)
+         fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
+                 path, w, h, s_gpu.color_offset, bpp);
+@@ -659,6 +663,7 @@ static void dump_surface_bmp(void)
+ static void raster_triangle(const float a[2], const float b[2],
+                             const float c[2], uint32_t argb,
+                             const float uv[3][2]);
++static void gl_fill_state(Nv2aGlState *st, int mode);
+ 
+ static void clear_surface(uint32_t param)
+ {
+@@ -679,12 +684,52 @@ static void clear_surface(uint32_t param)
          s_gpu.color_base = base;
      }
  
@@ -389,6 +2464,14 @@ index c65632c..04d100b 100644
 +        }
 +    }
 +
++    if (nv2a_gl_active()) {
++        Nv2aGlState st;
++        gl_fill_state(&st, NV2A_GL_MODE_DEPTH);
++        nv2a_gl_clear_color(&st, s_gpu.clip_x, s_gpu.clip_y, cw, ch,
++                            s_gpu.clear_color);
++        if (!nv2a_gl_verify())
++            ch = 0;                        /* nothing for the loop below */
++    }
 +    for (y = 0; y < ch; y++) {
          uint8_t *row = mem + s_gpu.color_base
                       + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
@@ -399,7 +2482,7 @@ index c65632c..04d100b 100644
                  p[x] = s_gpu.clear_color;
          } else if (bpp == 2) {
              /* The clear value is always given as A8R8G8B8; a 16-bit surface
-@@ -693,7 +727,7 @@ static void clear_surface(uint32_t param)
+@@ -693,7 +738,7 @@ static void clear_surface(uint32_t param)
                                    | ((s_gpu.clear_color >> 5) & 0x07E0)
                                    | ((s_gpu.clear_color >> 3) & 0x001F));
              uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
@@ -408,7 +2491,162 @@ index c65632c..04d100b 100644
                  p[x] = v;
          }
      }
-@@ -1904,12 +1938,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -1245,6 +1290,55 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
+     }
+ }
+ 
++/* ---- Hardware backend hand-off (nv2a_gl.c) -------------------------------
++ *
++ * With RECOMP_GPU the triangles the two rasterisers below would fill are
++ * queued as GL vertices instead, and drawn by nv2a_pb_exec_flush under the
++ * state as it stands -- the same "nothing between BEGIN and END changes
++ * state" rule the software batch queue relies on. */
++static int s_glq_mode;
++
++static Nv2aGlVertex *gl_next_tri(int mode)
++{
++    Nv2aGlVertex *v;
++
++    if (nv2a_gl_pending() && mode != s_glq_mode)
++        nv2a_pb_exec_flush();
++    s_glq_mode = mode;
++    v = nv2a_gl_tri();
++    if (!v) {
++        nv2a_pb_exec_flush();
++        v = nv2a_gl_tri();
++    }
++    return v;
++}
++
++/* raster_triangle's triangle: screen-space corners, one flat colour, texel
++ * coordinates if it is textured. */
++static void gl_emit_2d(const float a[2], const float b[2], const float c[2],
++                       uint32_t argb, const float uv[3][2])
++{
++    Nv2aGlVertex *v = gl_next_tri(NV2A_GL_MODE_2D);
++    const float *p[3];
++    int k;
++
++    if (!v)
++        return;
++    p[0] = a; p[1] = b; p[2] = c;
++    memset(v, 0, sizeof *v * 3);
++    for (k = 0; k < 3; k++) {
++        v[k].pos[0] = p[k][0];
++        v[k].pos[1] = p[k][1];
++        v[k].pos[3] = 1.0f;
++        nv2a_rc_unpack(argb, v[k].d0);
++        if (uv) {
++            v[k].tex[0][0] = uv[k][0];
++            v[k].tex[0][1] = uv[k][1];
++            v[k].fog = 1.0f;
++        }
++    }
++}
++
+ /* Half-space fill. Barycentric edge functions rather than scanline slopes:
+  * the same test decides both windings, so a title that emits clockwise
+  * triangles does not silently render nothing. */
+@@ -1285,6 +1379,15 @@ static void raster_triangle(const float a[2], const float b[2],
+         return;
+     }
+ 
++    if (nv2a_gl_active()) {
++        gl_emit_2d(a, b, c, argb, textured ? uv : NULL);
++        if (!nv2a_gl_verify()) {
++            s_gpu.tris_drawn++;
++            note_drawn();
++            return;
++        }
++    }
++
+     for (y = miny; y < maxy; y++) {
+         for (x = minx; x < maxx; x++) {
+             float px = (float)x + 0.5f, py = (float)y + 0.5f;
+@@ -1785,6 +1888,65 @@ static int alpha_test_pass(float a)
+     }
+ }
+ 
++/* The state a queued hardware batch is drawn under: everything put_pixel
++ * and xf_rows consult, copied out for nv2a_gl.c. */
++static void gl_fill_state(Nv2aGlState *st, int mode)
++{
++    uint32_t zf = (s_gpu.format >> 4) & 0xF;
++    float f[4];
++    int k;
++
++    memset(st, 0, sizeof *st);
++    st->color_base = dma_resolve(s_gpu.color_offset);
++    st->pitch = s_gpu.pitch;
++    st->bpp = surface_bpp();
++    st->clip_x = s_gpu.clip_x; st->clip_y = s_gpu.clip_y;
++    st->clip_w = s_gpu.clip_w; st->clip_h = s_gpu.clip_h;
++    st->zeta_offset = s_gpu.zeta_offset;
++    st->zmax = zf == 1 ? 65535.0f : 16777215.0f;
++    st->use_depth = mode != NV2A_GL_MODE_2D
++                 && (s_gpu.depth_test || s_gpu.depth_mask);
++    st->depth_clamp = (s_gpu.zminmax_control & 0x10) != 0;
++    st->blend_enable = s_gpu.blend_enable;
++    st->blend_sfactor = s_gpu.blend_sfactor;
++    st->blend_dfactor = s_gpu.blend_dfactor;
++    st->blend_equation = s_gpu.blend_equation;
++    st->blend_color = s_gpu.blend_color;
++    st->color_mask = s_gpu.color_mask;
++    st->depth_test = s_gpu.depth_test;
++    st->depth_func = s_gpu.depth_func;
++    st->depth_mask = s_gpu.depth_mask;
++    st->alpha_test = s_gpu.alpha_test;
++    st->alpha_func = s_gpu.alpha_func;
++    st->alpha_ref = s_gpu.alpha_ref;
++    st->zpass_enable = mode != NV2A_GL_MODE_2D && s_gpu.zpass_enable;
++    st->mode = mode;
++    st->rc = s_gpu.rc;
++    st->clip_plane_mode = s_gpu.clip_plane_mode;
++    /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
++    nv2a_rc_unpack(s_gpu.fog_color, f);
++    st->fog_color[0] = f[2]; st->fog_color[1] = f[1]; st->fog_color[2] = f[0];
++    for (k = 0; k < 4; k++)
++        st->tex[k] = s_gpu.texs[k];
++}
++
++/* The texel decoder and layout helpers, for the hardware backend's uploads. */
++int nv2a_exec_sample_tex(const Nv2aTexture *t, uint32_t face_offset,
++                         uint32_t u, uint32_t v, uint32_t *argb)
++{
++    return sample_tex(t, face_offset, u, v, argb);
++}
++
++uint32_t nv2a_exec_tex_face_stride(const Nv2aTexture *t)
++{
++    return tex_face_stride(t);
++}
++
++uint32_t nv2a_exec_tex_texel_bytes(uint32_t fmt)
++{
++    return tex_texel_bytes(fmt);
++}
++
+ /* Everything a triangle's pixels need, computed once per triangle, so the
+  * pixel loop can run over any subset of rows on any thread. */
+ typedef struct {
+@@ -1794,6 +1956,7 @@ typedef struct {
+     const float *a, *b, *c;
+     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
+     float *zb;
++    float zclamp;                       /* depth clamp on: the largest depth */
+     int minx, maxx, miny, maxy, use_rc, textured;
+ } XfTri;
+ 
+@@ -1820,6 +1983,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+             /* w1 is opposite a, w2 opposite b, w0 opposite c. */
+             l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
+             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
++            if (T->zclamp > 0.0f)
++                z = z < 0.0f ? 0.0f : (z > T->zclamp ? T->zclamp : z);
+             {
+                 float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
+                 int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
+@@ -1904,12 +2069,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -452,7 +2690,7 @@ index c65632c..04d100b 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -1919,7 +1984,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -1919,7 +2115,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -467,7 +2705,7 @@ index c65632c..04d100b 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -1985,6 +2056,75 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -1985,6 +2187,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
  }
  #endif
  
@@ -477,6 +2715,14 @@ index c65632c..04d100b 100644
 +    XfCount total = {0, 0, 0};
 +    int i, n;
 +
++    if (nv2a_gl_pending()) {
++        Nv2aGlState st;
++        uint32_t zpass = 0;
++        gl_fill_state(&st, s_glq_mode);
++        nv2a_gl_draw(&st, &zpass);
++        if (!nv2a_gl_verify())             /* else the software path counts */
++            s_gpu.zpass_count += zpass;
++    }
 +    if (!s_xfq_n)
 +        return;
 +#if defined(_WIN32)
@@ -543,16 +2789,96 @@ index c65632c..04d100b 100644
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                 const Nv2aVshOutput *vc)
  {
-@@ -2070,7 +2210,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2004,6 +2283,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     T.textured = s_gpu.texs[0].valid;
+     T.use_rc = s_gpu.rc_seen && !no_rc;
+     T.va = va; T.vb = vb; T.vc = vc;
++    if (s_gpu.zminmax_control & 0x10)
++        T.zclamp = ((s_gpu.format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
+ 
+     v[0] = va; v[1] = vb; v[2] = vc;
+     a = va->pos; b = vb->pos; c = vc->pos;
+@@ -2028,7 +2309,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     s_gpu.xf_seeded = 1;
+     if (!surface_begin_batch(T.mem))
+         return;
+-    if (s_gpu.depth_test || s_gpu.depth_mask)
++    if ((s_gpu.depth_test || s_gpu.depth_mask)
++        && (!nv2a_gl_active() || nv2a_gl_verify()))
+         T.zb = zbuf_current(1);
+     if (tex_size_from_format(s_gpu.texs[0].color)) {
+         su = (float)s_gpu.texs[0].width;
+@@ -2070,7 +2352,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
 -    xf_rows_parallel(&T, &cnt);
++    if (nv2a_gl_active()) {
++        /* xf_rows shades only if colour is written or the alpha test can
++         * reject; otherwise the pixel is depth alone. */
++        int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
++        Nv2aGlVertex *g = gl_next_tri(!shade ? NV2A_GL_MODE_DEPTH
++                                      : T.use_rc ? NV2A_GL_MODE_RC
++                                                 : NV2A_GL_MODE_XF);
++        if (g) {
++            for (k = 0; k < 3; k++) {
++                memcpy(g[k].pos, v[k]->pos, sizeof g[k].pos);
++                memcpy(g[k].d0, v[k]->d0, sizeof g[k].d0);
++                memcpy(g[k].d1, v[k]->d1, sizeof g[k].d1);
++                memcpy(g[k].tex, v[k]->tex, sizeof g[k].tex);
++                g[k].fog = T.use_rc ? T.vfog[k] : 0.0f;
++            }
++        }
++        if (!nv2a_gl_verify()) {
++            s_gpu.tris_drawn++;
++            note_drawn();
++            return;
++        }
++    }
 +    xf_submit(&T, &cnt);
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
      s_gpu.zpass_count += cnt.zpass;
-@@ -2855,8 +2995,272 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2180,9 +2484,30 @@ static void raster_batch_program(void)
+ {
+     uint32_t i, n = s_gpu.idx_count;
+ 
+-    for (i = 0; i < n; i++)
+-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+-            return;                                    /* no program loaded */
++    {
++        /* An indexed mesh names each vertex several times; the program is a
++         * pure function of the vertex (unless it writes constants), so run
++         * it once per distinct index of the batch and copy. */
++        static uint32_t stamp[65536], gen;
++        static uint16_t first[65536];
++        int reuse = !nv2a_vsh_writes_constants();
++
++        if (++gen == 0) {
++            memset(stamp, 0, sizeof stamp);
++            gen = 1;
++        }
++        for (i = 0; i < n; i++) {
++            uint16_t ix = s_gpu.idx[i];
++            if (reuse && stamp[ix] == gen) {
++                s_xf[i] = s_xf[first[ix]];
++                continue;
++            }
++            if (!transform_vertex(ix, &s_xf[i]))
++                return;                                /* no program loaded */
++            stamp[ix] = gen;
++            first[ix] = (uint16_t)i;
++        }
++    }
+     s_gpu.batches_program++;
+     s_gpu.verts_program += n;
+     if (s_gpu.blend_enable) {
+@@ -2851,12 +3176,286 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+         break;
+     }
+     tex_update_valid(t);
++    nv2a_gl_tex_touched((int)stage);
+     if (stage == 0)
          record_tex_reg(method, param);
  }
  
@@ -589,6 +2915,8 @@ index c65632c..04d100b 100644
 +    *(volatile uint32_t *)(m + 0xFD40186Cu) = cclear;
 +}
 +
++static HANDLE s_swi_done_event;        /* set by nv2a_swi_done */
++
 +static void nv2a_swi_post(uint32_t param)
 +{
 +    uint32_t t = s_swi_tail;
@@ -623,9 +2951,13 @@ index c65632c..04d100b 100644
 +     * Bounded, because a handler that itself waits on the GPU would otherwise
 +     * wait on this thread forever. */
 +    {
-+        int waited = 0;
-+        while (s_swi_head != s_swi_tail && waited++ < 200)
-+            Sleep(1);
++        extern void xbox_TimerThreadWake(void);
++        DWORD t0 = GetTickCount();
++        if (!s_swi_done_event)
++            s_swi_done_event = CreateEventA(NULL, FALSE, FALSE, NULL);
++        xbox_TimerThreadWake();
++        while (s_swi_head != s_swi_tail && GetTickCount() - t0 < 200)
++            WaitForSingleObject(s_swi_done_event, 2);
 +        if (s_swi_head != s_swi_tail) {
 +            static unsigned said;
 +            if (said++ < 4)
@@ -715,6 +3047,8 @@ index c65632c..04d100b 100644
 +{
 +    nv2a_latch_write(s_latch_zclear, s_latch_cclear);
 +    s_swi_head = s_swi_next;
++    if (s_swi_done_event)
++        SetEvent(s_swi_done_event);
 +}
 +
  void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
@@ -723,7 +3057,8 @@ index c65632c..04d100b 100644
 +     * that is not vertex data (immediate attributes 0x15xx, array elements,
 +     * draws and inline data 0x1800-0x1AFF) may change it, or read what they
 +     * were going to draw. */
-+    if (s_xfq_n && !(subch == 0 && ((method >= 0x1500u && method < 0x1600u)
++    if ((s_xfq_n || nv2a_gl_pending())
++        && !(subch == 0 && ((method >= 0x1500u && method < 0x1600u)
 +                                 || (method >= 0x1800u && method < 0x1B00u))))
 +        nv2a_pb_exec_flush();
 +    /* NV097_NO_OPERATION with a non-zero parameter: see nv2a_swi_post. */
@@ -825,11 +3160,92 @@ index c65632c..04d100b 100644
      static int inited;
      if (!inited) {
          inited = 1;
+@@ -3004,8 +3603,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
+                     s_gpu.clear_color, 10);
+         clear_surface(param);
+-        if (param & 0x01)                         /* Z */
+-            zbuf_clear();
++        if (param & 0x01) {                       /* Z */
++            if (nv2a_gl_active())
++                nv2a_gl_clear_depth(s_gpu.zeta_offset, zclear_value()
++                    / (((s_gpu.format >> 4) & 0xF) == 1 ? 65535.0f
++                                                        : 16777215.0f));
++            if (!nv2a_gl_active() || nv2a_gl_verify())
++                zbuf_clear();
++        }
+         break;
+ 
+     case NV097_SET_BEGIN_END:
+@@ -3119,6 +3724,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+                                                : s_gpu.color_offset;
+             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
+                                                 : s_gpu.pitch;
++            if (done && nv2a_gl_active()) {
++                /* Only if someone is going to look at guest memory. */
++                static int want = -1;
++                if (want < 0) {
++                    const char *sync = getenv("RECOMP_GPU_SYNC");
++                    want = getenv("RECOMP_FB_WINDOW") != NULL
++                        || (sync && *sync && *sync != '0');
++                }
++                if (want)
++                    nv2a_gl_download(dma_resolve(done));
++                if (nv2a_gl_verify())
++                    nv2a_gl_verify_compare(dma_resolve(done), s_gpu.drawn_x,
++                                           s_gpu.drawn_y, s_gpu.drawn_w,
++                                           s_gpu.drawn_h, s_gpu.flips);
++            }
+             if (done) {
+                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
+                 xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+@@ -3146,6 +3766,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+             }
+         }
+         s_gpu.drawn_stale = 1;
++        if (nv2a_gl_active())
++            nv2a_gl_flip();
+ 
+         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+             static unsigned n;
+@@ -3181,6 +3803,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
+     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
+     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
++    case 0x1D78: {                                /* SET_ZMIN_MAX_CONTROL */
++        /* Bit 4 is depth clamp: geometry beyond the far (or near) plane is
++         * drawn with its depth clamped into range instead of being lost.
++         * A sky dome is drawn exactly that way -- beyond the far plane --
++         * and unclamped its depth failed against the cleared buffer on
++         * every pixel: Halo 2's black sky. */
++        static uint32_t seen[8];
++        static int nseen;
++        int i;
++        s_gpu.zminmax_control = param;
++        for (i = 0; i < nseen && seen[i] != param; i++)
++            ;
++        if (i == nseen && nseen < 8) {
++            seen[nseen++] = param;
++            fprintf(stderr, "  [GPU] ZMIN_MAX_CONTROL 0x%08X\n", param);
++        }
++        break;
++    }
+ 
+     default:
+         if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
+@@ -3449,6 +4089,7 @@ void nv2a_pb_exec_report(void)
+     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
+      * a vertex program we do not run" look identical on screen, and only one
+      * of them means the rasteriser is broken. */
++    nv2a_gl_report();
+     fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
+     fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
+                     " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index 65bbedb..3b603ff 100644
+index 65bbedb..72a4f5f 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
-@@ -163,14 +163,53 @@ void nv2a_pb_scan_report(void)
+@@ -163,14 +163,54 @@ void nv2a_pb_scan_report(void)
   * The NV2A has one level of subroutine, so a CALL inside a call is not
   * followed. Addresses are physical, like PUT's, and reach guest memory the
   * same way: through the contiguous window. */
@@ -845,6 +3261,7 @@ index 65bbedb..3b603ff 100644
 +}
 +
 +uint32_t g_nv2a_pb_cur_va, g_nv2a_pb_seg_va;
++static int s_scan_enabled = -1;
 +
  static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                          uint32_t *jumps, uint32_t *unknown)
@@ -884,7 +3301,7 @@ index 65bbedb..3b603ff 100644
          va += 4;
          words++;
  
-@@ -178,8 +217,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+@@ -178,8 +218,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
              uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                               : (w & 0x1FFFFFFCu);
              (*jumps)++;
@@ -900,16 +3317,33 @@ index 65bbedb..3b603ff 100644
              va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
              end_va = va + 0x400000u;
              continue;
-@@ -205,6 +249,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+@@ -205,7 +250,12 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
  
              for (uint32_t i = 0; i < count && va < end_va; i++) {
                  uint32_t m = noninc ? method : method + i * 4;
+-                note(subch, m);
 +                g_nv2a_pb_cur_va = va;       /* for diagnostics in the executor */
 +                g_nv2a_pb_seg_va = seg_start;
-                 note(subch, m);
++                /* The inventory is only printed under RECOMP_PB_SCAN, and its
++                 * linear search was a sixth of the executor thread. */
++                if (s_scan_enabled)
++                    note(subch, m);
                  /* Same walk, two consumers: the survey counts, the executor
                   * acts. Keeping them on one decode means they can never
-@@ -237,6 +283,12 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+                  * disagree about what the stream said. */
+@@ -228,15 +278,20 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+ 
+     if (s_exec_enabled < 0)
+         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+-    static int scan = -1;
+-    if (scan < 0)
+-        scan = getenv("RECOMP_PB_SCAN") != NULL;
+-    if (!(scan || s_exec_enabled) || end_va <= start_va)
++    if (s_scan_enabled < 0)
++        s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
++    if (!(s_scan_enabled || s_exec_enabled) || end_va <= start_va)
+         return;
+     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
          end_va = start_va + 0x400000u;
  
      words = pb_walk(start_va, end_va, 0, &jumps, &unknown);
@@ -1215,6 +3649,519 @@ index 0000000..59f8da2
 +void xbox_Nv2aRegTrapReport(void);
 +
 +#endif /* NV2A_REG_TRAP_H */
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index 7fae74c..b99b54b 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -39,6 +39,9 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
+ static uint32_t s_load_slot, s_load_word, s_start_slot;
+ static uint32_t s_const_load, s_const_word;
+ static uint32_t s_cxt_write;
++/* The program from the start slot, decoded once instead of per vertex (see
++ * decode_program). Any upload or a new start slot invalidates it. */
++static int s_dec_valid;
+ 
+ static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
+ {
+@@ -57,13 +60,20 @@ void nv2a_vsh_program_word(uint32_t word)
+ {
+     if (s_load_slot < NV2A_VSH_SLOTS)
+         s_program[s_load_slot][s_load_word] = word;
++    s_dec_valid = 0;
+     if (++s_load_word == 4) {
+         s_load_word = 0;
+         s_load_slot++;
+     }
+ }
+ 
+-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
++void nv2a_vsh_set_start_slot(uint32_t slot)
++{
++    s_start_slot = slot;
++    s_dec_valid = 0;
++}
++
++int nv2a_vsh_writes_constants(void) { return s_cxt_write != 0; }
+ void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
+ 
+ void nv2a_vsh_set_constant_load(uint32_t index)
+@@ -92,6 +102,7 @@ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
+ {
+     if (slot < NV2A_VSH_SLOTS)
+         memcpy(s_program[slot], words, sizeof s_program[slot]);
++    s_dec_valid = 0;
+ }
+ 
+ /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
+@@ -305,12 +316,300 @@ static vec4 run_ilu(uint32_t op, vec4 c)
+     return r;
+ }
+ 
++/* The program as the loop wants it: every field pulled out of the four
++ * dwords once. Decoding per vertex (three sources, eight fields each) was
++ * half the executor thread once the pixels moved to the GPU. Semantics are
++ * read_src's and the old loop's, field for field. */
++typedef struct { uint8_t mux, reg, neg, sw[4]; } VshSrc;
++typedef struct {
++    uint8_t mac, ilu, mac_mask, ilu_mask, tdst, omask, oaddr;
++    uint8_t out_ilu, out_o, final, rel, in_idx, cidx;
++    uint8_t need;                   /* sources read: 1 A, 2 B, 4 C */
++    VshSrc src[3];
++} VshDec;
++static VshDec s_dec[NV2A_VSH_SLOTS];
++static uint32_t s_dec_n;
++
++/* ---- the same loop, four components at a time ----------------------------
++ *
++ * Halo 2's title scene runs the program on over 100,000 vertices a frame
++ * (most of what it submits is off screen), which at half a microsecond each
++ * was most of a 30 Hz frame. Registers are __m128; a source read is a load,
++ * one byte shuffle for the swizzle and one XOR for the negate; a masked write
++ * is a blend. Every arithmetic step is the scalar loop's own, in the same
++ * order (dot products are summed left to right, no fused multiply-add), so
++ * the results are bit-identical. ILU ops and ARL stay scalar. */
++#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
++#define VSH_SSE 1
++#include <tmmintrin.h>
++
++typedef struct {
++    __m128i shuf[3];
++    __m128  sign[3];
++    __m128  mac_wr, ilu_wr, out_wr;         /* component masks */
++} VshVec;
++static VshVec s_vec[NV2A_VSH_SLOTS];
++
++static __m128 vsh_mask(uint32_t m)             /* x=8 y=4 z=2 w=1 */
++{
++    return _mm_castsi128_ps(_mm_set_epi32((m & 1) ? -1 : 0, (m & 2) ? -1 : 0,
++                                          (m & 4) ? -1 : 0, (m & 8) ? -1 : 0));
++}
++
++static void vsh_sse_prepare(void)
++{
++    uint32_t s, k, i, j;
++    for (s = 0; s < s_dec_n; s++) {
++        const VshDec *d = &s_dec[s];
++        VshVec *v = &s_vec[s];
++        for (k = 0; k < 3; k++) {
++            uint8_t b[16];
++            for (i = 0; i < 4; i++)
++                for (j = 0; j < 4; j++)
++                    b[i * 4 + j] = (uint8_t)(d->src[k].sw[i] * 4 + j);
++            v->shuf[k] = _mm_loadu_si128((const __m128i *)b);
++            v->sign[k] = d->src[k].neg ? _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u))
++                                       : _mm_setzero_ps();
++        }
++        v->mac_wr = vsh_mask(d->mac_mask);
++        v->ilu_wr = vsh_mask(d->ilu_mask);
++        v->out_wr = vsh_mask(d->omask);
++    }
++}
++
++static __forceinline __m128 vsh_read(const VshDec *d, const VshVec *v, int k,
++                                     const float in[NV2A_VSH_INPUTS][4],
++                                     const __m128 *temp, int a0)
++{
++    const VshSrc *sr = &d->src[k];
++    const float *s;
++    if (sr->mux == 1)
++        s = (const float *)&temp[sr->reg];
++    else if (sr->mux == 2)
++        s = in[d->in_idx];
++    else {
++        int ci = (int)d->cidx;
++        if (d->rel)
++            ci += a0;
++        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
++            ci = 0;
++        s = s_const[ci];
++    }
++    return _mm_xor_ps(_mm_castsi128_ps(_mm_shuffle_epi8(
++                          _mm_castps_si128(_mm_loadu_ps(s)), v->shuf[k])),
++                      v->sign[k]);
++}
++
++static __forceinline __m128 vsh_blend(__m128 dst, __m128 src, __m128 mask)
++{
++    return _mm_or_ps(_mm_and_ps(mask, src), _mm_andnot_ps(mask, dst));
++}
++
++static vec4 run_ilu(uint32_t op, vec4 c);
++
++static int vsh_run_sse(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
++{
++    __m128 temp[13], outregs[13];
++    const __m128 zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f);
++    const __m128 w1 = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
++    int a0 = 0;
++    uint32_t s, i;
++
++    for (i = 0; i < 13; i++)
++        temp[i] = outregs[i] = zero;
++    outregs[3] = outregs[4] = w1;
++    outregs[9] = outregs[10] = outregs[11] = outregs[12] = w1;
++
++    for (s = 0; s < s_dec_n; s++) {
++        const VshDec *d = &s_dec[s];
++        const VshVec *v = &s_vec[s];
++        uint32_t mac = d->mac, ilu = d->ilu;
++        __m128 a = zero, b = zero, c = zero, mres = zero, ires = zero;
++        float f[4], g[4];
++
++        if (d->need & 1) a = vsh_read(d, v, 0, in, temp, a0);
++        if (d->need & 2) b = vsh_read(d, v, 1, in, temp, a0);
++        if (d->need & 4) c = vsh_read(d, v, 2, in, temp, a0);
++
++        switch (mac) {
++        case 0: break;
++        case 2: mres = _mm_mul_ps(a, b); break;
++        case 3: mres = _mm_add_ps(a, c); break;
++        case 4: mres = _mm_add_ps(_mm_mul_ps(a, b), c); break;
++        case 5: _mm_storeu_ps(f, _mm_mul_ps(a, b));
++                mres = _mm_set1_ps(f[0] + f[1] + f[2]); break;
++        case 6: _mm_storeu_ps(f, _mm_mul_ps(a, b)); _mm_storeu_ps(g, b);
++                mres = _mm_set1_ps(f[0] + f[1] + f[2] + g[3]); break;
++        case 7: _mm_storeu_ps(f, _mm_mul_ps(a, b));
++                mres = _mm_set1_ps(f[0] + f[1] + f[2] + f[3]); break;
++        case 8: _mm_storeu_ps(f, a); _mm_storeu_ps(g, b);
++                mres = _mm_set_ps(g[3], f[2], f[1] * g[1], 1.0f); break;
++        case 9:  mres = vsh_blend(b, a, _mm_cmplt_ps(a, b)); break;
++        case 10: mres = vsh_blend(b, a, _mm_cmpge_ps(a, b)); break;
++        case 11: mres = _mm_and_ps(_mm_cmplt_ps(a, b), one); break;
++        case 12: mres = _mm_and_ps(_mm_cmpge_ps(a, b), one); break;
++        case 13: _mm_storeu_ps(f, a);
++                 a0 = (int)floorf(f[0] + 0.001f);
++                 /* fall through: the result is A, as for mov */
++        default: mres = a; break;
++        }
++        if (ilu) {
++            vec4 cv, rv;
++            _mm_storeu_ps(cv.v, c);
++            rv = run_ilu(ilu, cv);
++            ires = _mm_loadu_ps(rv.v);
++        }
++
++        if (mac && mac != 13 && d->mac_mask && d->tdst <= 12)
++            temp[d->tdst] = vsh_blend(temp[d->tdst], mres, v->mac_wr);
++        if (ilu && d->ilu_mask) {
++            uint32_t it = mac ? 1u : d->tdst;     /* see the scalar loop */
++            if (it <= 12)
++                temp[it] = vsh_blend(temp[it], ires, v->ilu_wr);
++        }
++        if (d->omask) {
++            __m128 src = d->out_ilu ? ires : mres;
++            if (!d->out_o) {                              /* to c[] */
++                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
++                    _mm_storeu_ps(s_const[d->oaddr],
++                                  vsh_blend(_mm_loadu_ps(s_const[d->oaddr]),
++                                            src, v->out_wr));
++            } else if (d->oaddr == 0) {
++                temp[12] = vsh_blend(temp[12], src, v->out_wr);
++            } else if (d->oaddr < 13) {
++                outregs[d->oaddr] = vsh_blend(outregs[d->oaddr], src, v->out_wr);
++            }
++        }
++        if (d->final) {
++            _mm_storeu_ps(out->pos, temp[12]);
++            _mm_storeu_ps(out->d0, outregs[3]);
++            _mm_storeu_ps(out->d1, outregs[4]);
++            _mm_storeu_ps(out->fog, outregs[5]);
++            _mm_storeu_ps(out->tex[0], outregs[9]);
++            _mm_storeu_ps(out->tex[1], outregs[10]);
++            _mm_storeu_ps(out->tex[2], outregs[11]);
++            _mm_storeu_ps(out->tex[3], outregs[12]);
++            return 1;
++        }
++    }
++    return 0;
++}
++static int s_vsh_mode = -1, s_vsh_chk_ok;
++static Nv2aVshOutput s_vsh_chk;
++#else
++#define VSH_SSE 0
++#endif
++
++static void decode_program(void)
++{
++    uint32_t s, k;
++
++    s_dec_n = 0;
++    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
++        const uint32_t *ins = s_program[s];
++        VshDec *d = &s_dec[s_dec_n++];
++        d->mac = (uint8_t)field(ins, 1, 21, 4);
++        d->ilu = (uint8_t)field(ins, 1, 25, 3);
++        d->mac_mask = (uint8_t)field(ins, 3, 24, 4);
++        d->ilu_mask = (uint8_t)field(ins, 3, 16, 4);
++        d->tdst = (uint8_t)field(ins, 3, 20, 4);
++        d->omask = (uint8_t)field(ins, 3, 12, 4);
++        d->oaddr = (uint8_t)field(ins, 3, 3, 8);
++        d->out_ilu = (uint8_t)field(ins, 3, 2, 1);
++        d->out_o = (uint8_t)field(ins, 3, 11, 1);
++        d->final = (uint8_t)field(ins, 3, 0, 1);
++        d->rel = (uint8_t)field(ins, 3, 1, 1);
++        d->in_idx = (uint8_t)field(ins, 1, 9, 4);
++        d->cidx = (uint8_t)field(ins, 1, 13, 8);
++        for (k = 0; k < 3; k++) {
++            uint32_t neg, swz, mux, reg;
++            if (k == 0) {
++                neg = field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
++                mux = field(ins, 2, 26, 2); reg = field(ins, 2, 28, 4);
++            } else if (k == 1) {
++                neg = field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
++                mux = field(ins, 2, 11, 2); reg = field(ins, 2, 13, 4);
++            } else {
++                neg = field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
++                mux = field(ins, 3, 28, 2);
++                reg = (field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2);
++            }
++            d->src[k].mux = (uint8_t)mux;
++            d->src[k].reg = (uint8_t)(reg <= 12 ? reg : 0);   /* 12 is oPos */
++            d->src[k].neg = (uint8_t)neg;
++            d->src[k].sw[0] = (uint8_t)((swz >> 6) & 3);
++            d->src[k].sw[1] = (uint8_t)((swz >> 4) & 3);
++            d->src[k].sw[2] = (uint8_t)((swz >> 2) & 3);
++            d->src[k].sw[3] = (uint8_t)(swz & 3);
++        }
++        /* Which operands the two units actually read (run_mac / run_ilu):
++         * reading has no side effect, so the others are simply skipped. */
++        {
++            static const uint8_t mac_need[16] = {
++                0, 1, 3, 5, 7, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1
++            };
++            d->need = (uint8_t)(mac_need[d->mac] | (d->ilu ? 4 : 0));
++        }
++        if (d->final)
++            break;
++    }
++    /* No FINAL within program memory: nothing to run (the caller's 0). */
++    if (!s_dec_n || !s_dec[s_dec_n - 1].final)
++        s_dec_n = 0;
++#if VSH_SSE
++    vsh_sse_prepare();
++#endif
++    s_dec_valid = 1;
++}
++
++#if defined(_MSC_VER)
++#define VSH_INLINE static __forceinline
++#else
++#define VSH_INLINE static inline __attribute__((always_inline))
++#endif
++
++VSH_INLINE void read_dec(const VshDec *d, const VshSrc *sr,
++                         const float in[NV2A_VSH_INPUTS][4],
++                         float temp[13][4], int a0, float r[4])
++{
++    const float *s;
++
++    if (sr->mux == 1)
++        s = temp[sr->reg];
++    else if (sr->mux == 2)
++        s = in[d->in_idx];
++    else {
++        int ci = (int)d->cidx;
++        if (d->rel)
++            ci += a0;
++        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
++            ci = 0;
++        s = s_const[ci];
++    }
++    r[0] = s[sr->sw[0]];
++    r[1] = s[sr->sw[1]];
++    r[2] = s[sr->sw[2]];
++    r[3] = s[sr->sw[3]];
++    if (sr->neg) {
++        r[0] = -r[0]; r[1] = -r[1];
++        r[2] = -r[2]; r[3] = -r[3];
++    }
++}
++
++VSH_INLINE void write_mask4(float *dst, const float *src, uint32_t mask)
++{
++    if (mask & 8) dst[0] = src[0];
++    if (mask & 4) dst[1] = src[1];
++    if (mask & 2) dst[2] = src[2];
++    if (mask & 1) dst[3] = src[3];
++}
++
+ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+ {
+     static int dump = -1;
+     static uint32_t dumped[16];
+     static int ndumped;
+-    vec4 temp[12], opos;
++    float temp[13][4];                         /* R0..R11, and oPos as R12 */
+     float outregs[13][4];
+     int a0 = 0;
+     uint32_t s;
+@@ -335,8 +634,23 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+         }
+     }
+ 
++    if (!s_dec_valid)
++        decode_program();
++#if VSH_SSE
++    {
++        /* RECOMP_VSH_SCALAR keeps the scalar loop below; RECOMP_VSH_CHECK
++         * runs both on every vertex and reports any output that is not
++         * bit-identical. */
++        if (s_vsh_mode < 0)
++            s_vsh_mode = getenv("RECOMP_VSH_CHECK") ? 2
++                       : getenv("RECOMP_VSH_SCALAR") ? 1 : 0;
++        if (s_vsh_mode == 0)
++            return vsh_run_sse(in, out);
++        if (s_vsh_mode == 2)
++            s_vsh_chk_ok = vsh_run_sse(in, &s_vsh_chk);
++    }
++#endif
+     memset(temp, 0, sizeof temp);
+-    memset(&opos, 0, sizeof opos);
+     memset(outregs, 0, sizeof outregs);
+     outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
+     /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
+@@ -344,49 +658,72 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+      * unwritten stage at infinity. */
+     outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
+ 
+-    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+-        const uint32_t *ins = s_program[s];
+-        uint32_t mac = field(ins, 1, 21, 4), ilu = field(ins, 1, 25, 3);
+-        uint32_t mac_mask = field(ins, 3, 24, 4), ilu_mask = field(ins, 3, 16, 4);
+-        uint32_t tdst = field(ins, 3, 20, 4);
+-        uint32_t omask = field(ins, 3, 12, 4), oaddr = field(ins, 3, 3, 8);
+-        vec4 a = read_src(ins, 0, in, temp, &opos, a0);
+-        vec4 b = read_src(ins, 1, in, temp, &opos, a0);
+-        vec4 c = read_src(ins, 2, in, temp, &opos, a0);
+-        vec4 mres = {{0, 0, 0, 0}}, ires = {{0, 0, 0, 0}};
+-
+-        if (mac)
+-            mres = run_mac(mac, a, b, c, &a0);
+-        if (ilu)
+-            ires = run_ilu(ilu, c);
+-
+-        if (mac && mac != 13 && mac_mask) {
+-            float *d = tdst == 12 ? opos.v : (tdst < 12 ? temp[tdst].v : NULL);
+-            if (d) write_masked(d, &mres, mac_mask);
++    for (s = 0; s < s_dec_n; s++) {
++        const VshDec *d = &s_dec[s];
++        uint32_t mac = d->mac, ilu = d->ilu;
++        float a[4], b[4], c[4];
++        float mres[4] = {0, 0, 0, 0}, ires[4] = {0, 0, 0, 0};
++        int i;
++
++        if (d->need & 1) read_dec(d, &d->src[0], in, temp, a0, a);
++        if (d->need & 2) read_dec(d, &d->src[1], in, temp, a0, b);
++        if (d->need & 4) read_dec(d, &d->src[2], in, temp, a0, c);
++
++        /* run_mac, on arrays. */
++        switch (mac) {
++        case 0: break;
++        case 2: for (i = 0; i < 4; i++) mres[i] = a[i] * b[i]; break;
++        case 3: for (i = 0; i < 4; i++) mres[i] = a[i] + c[i]; break;
++        case 4: for (i = 0; i < 4; i++) mres[i] = a[i] * b[i] + c[i]; break;
++        case 5: mres[0] = mres[1] = mres[2] = mres[3] =
++                    a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; break;
++        case 6: mres[0] = mres[1] = mres[2] = mres[3] =
++                    a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + b[3]; break;   /* dph */
++        case 7: mres[0] = mres[1] = mres[2] = mres[3] =
++                    a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]; break;
++        case 8: mres[0] = 1.0f; mres[1] = a[1] * b[1];                 /* dst */
++                mres[2] = a[2]; mres[3] = b[3]; break;
++        case 9: for (i = 0; i < 4; i++) mres[i] = a[i] < b[i] ? a[i] : b[i]; break;
++        case 10: for (i = 0; i < 4; i++) mres[i] = a[i] >= b[i] ? a[i] : b[i]; break;
++        case 11: for (i = 0; i < 4; i++) mres[i] = a[i] < b[i] ? 1.0f : 0.0f; break;
++        case 12: for (i = 0; i < 4; i++) mres[i] = a[i] >= b[i] ? 1.0f : 0.0f; break;
++        case 13: a0 = (int)floorf(a[0] + 0.001f);                      /* arl */
++                 /* fall through: the result is A, as for mov */
++        default: mres[0] = a[0]; mres[1] = a[1]; mres[2] = a[2]; mres[3] = a[3];
++                 break;
++        }
++        if (ilu) {
++            vec4 cv, rv;
++            memcpy(cv.v, c, sizeof cv.v);
++            rv = run_ilu(ilu, cv);
++            memcpy(ires, rv.v, sizeof ires);
+         }
+-        if (ilu && ilu_mask) {
++
++        if (mac && mac != 13 && d->mac_mask && d->tdst <= 12)
++            write_mask4(temp[d->tdst], mres, d->mac_mask);
++        if (ilu && d->ilu_mask) {
+             /* Paired with any MAC op, the ILU can only write R1 -- even when
+              * the MAC half writes no temp at all. The D3D epilogue is exactly
+              * that: `mul o[0].xyz` beside `rcc R1.x`, then `mad` with R1.x.
+              * Sending the rcc to the temp field (R7 there) left R1.x at 0 and
+              * put every vertex of every 3D batch at c[59]. */
+-            uint32_t it = mac ? 1u : tdst;
+-            float *d = it == 12 ? opos.v : (it < 12 ? temp[it].v : NULL);
+-            if (d) write_masked(d, &ires, ilu_mask);
++            uint32_t it = mac ? 1u : d->tdst;
++            if (it <= 12)
++                write_mask4(temp[it], ires, d->ilu_mask);
+         }
+-        if (omask) {
+-            const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
+-            if (!field(ins, 3, 11, 1)) {                  /* to c[] */
+-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+-                    write_masked(s_const[oaddr], src, omask);
+-            } else if (oaddr == 0) {
+-                write_masked(opos.v, src, omask);
+-            } else if (oaddr < 13) {
+-                write_masked(outregs[oaddr], src, omask);
++        if (d->omask) {
++            const float *src = d->out_ilu ? ires : mres;
++            if (!d->out_o) {                              /* to c[] */
++                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
++                    write_mask4(s_const[d->oaddr], src, d->omask);
++            } else if (d->oaddr == 0) {
++                write_mask4(temp[12], src, d->omask);
++            } else if (d->oaddr < 13) {
++                write_mask4(outregs[d->oaddr], src, d->omask);
+             }
+         }
+-        if (field(ins, 3, 0, 1)) {
+-            memcpy(out->pos, opos.v, sizeof out->pos);
++        if (d->final) {
++            memcpy(out->pos, temp[12], sizeof out->pos);
+             memcpy(out->d0, outregs[3], sizeof out->d0);
+             memcpy(out->d1, outregs[4], sizeof out->d1);
+             memcpy(out->fog, outregs[5], sizeof out->fog);
+@@ -394,6 +731,20 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
+             memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
+             memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
++#if VSH_SSE
++            if (s_vsh_mode == 2) {
++                static unsigned long long n, bad;
++                n++;
++                if (!s_vsh_chk_ok || memcmp(out, &s_vsh_chk, sizeof *out)) {
++                    if (bad++ < 10)
++                        fprintf(stderr, "  [VSH] CHECK: vector and scalar outputs"
++                                        " differ (vertex %llu)\n", n);
++                }
++                if ((n & (n - 1)) == 0 && n >= 4096)
++                    fprintf(stderr, "  [VSH] CHECK: %llu vertices, %llu"
++                                    " mismatches\n", n, bad);
++            }
++#endif
+             return 1;
+         }
+     }
+diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
+index 8acb0af..5b533f5 100644
+--- a/src/kernel/nv2a_vsh_interp.h
++++ b/src/kernel/nv2a_vsh_interp.h
+@@ -43,6 +43,9 @@ void nv2a_vsh_set_start_slot(uint32_t slot);          /* _PROGRAM_START     */
+ void nv2a_vsh_set_constant_load(uint32_t index);      /* _CONSTANT_LOAD     */
+ void nv2a_vsh_constant_word(uint32_t word);           /* _CONSTANT(i)       */
+ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
++/* Can the program change the constants it runs with (so that running it
++ * twice on one vertex is not the same as running it once)? */
++int  nv2a_vsh_writes_constants(void);
+ 
+ /* Run the program from the start slot on one vertex. Inputs are the ten
+  * attribute values as floats. Returns 0 if there is no program to run (no
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
 index 72d5131..b6bb8ca 100644
 --- a/src/kernel/xbox_memory_layout.c
