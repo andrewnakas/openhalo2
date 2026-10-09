@@ -1,0 +1,971 @@
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index c65ba43..9e9596f 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
+     if (low && high >= low && (high - low + 1) <= size + 0x1000) {
+         xbox_va = XBOX_PHYSICAL_MIRROR_BASE + low;
+ 
++        /* Keep the ordinary arena out of it; see xbox_ContiguousReserve. */
++        {
++            extern void xbox_ContiguousReserve(uint32_t va, uint32_t size);
++            xbox_ContiguousReserve(xbox_va, size);
++        }
++
+         /* The console hands out zeroed pages here, and titles rely on it:
+          * pool headers and free-list roots are assumed clear, so whatever the
+          * backing view happened to contain shows up later as structures that
+@@ -2284,6 +2290,53 @@ static void kernel_vblank_tick(void)
+     }
+ }
+ 
++/* Deliver the pushbuffer's software interrupts (see nv2a_swi_post).
++ *
++ * The title's own handler is called directly, with the miniport object the
++ * title registered as its interrupt context in ecx and the trapped parameter
++ * in eax, rather than by raising a PGRAPH interrupt: the interrupt status
++ * registers are plain memory that the acknowledge thread zeroes, so the
++ * service routine's deferred half would find nothing pending. The handler's
++ * address is title-specific; a project sets it with
++ * xbox_SetD3DSoftwareInterruptRoutine, and until it does nothing is delivered. */
++static uint32_t g_xbox_d3d_swi_routine;
++int nv2a_swi_take(uint32_t *param);
++
++void xbox_SetD3DSoftwareInterruptRoutine(uint32_t guest_va)
++{
++    g_xbox_d3d_swi_routine = guest_va;
++}
++
++static void kernel_d3d_swi_tick(void)
++{
++    uint32_t param, kint;
++    recomp_func_t fn;
++    int budget = 32;
++
++    if (!g_xbox_d3d_swi_routine)
++        return;
++    kint = xbox_GetConnectedInterrupt(NV2A_VECTOR);
++    fn = recomp_lookup(g_xbox_d3d_swi_routine);
++    /* A title tears its device down and builds another (Halo 2 does on the
++     * way to its final display mode). The interrupt object is then cleared
++     * while fences from the dead device are still queued; they have no
++     * handler and no waiter, so they are dropped rather than delivered to a
++     * null miniport. */
++    if (!kint || !fn || !BRIDGE_MEM32(kint + 0) || !BRIDGE_MEM32(kint + 4)) {
++        while (nv2a_swi_take(&param))
++            ;
++        return;
++    }
++
++    while (budget-- > 0 && nv2a_swi_take(&param)) {
++        g_ecx = BRIDGE_MEM32(kint + 4);
++        g_eax = param;
++        { static unsigned n; if (n++ < 12) { fprintf(stderr, "  [NV2A] software interrupt 0x%08X -> handler (this=0x%08X)\n", param, g_ecx); fflush(stderr); } }
++        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
++        { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
++    }
++}
++
+ /* Run whatever is queued. Called from the timer thread, which has the guest
+  * stack and TIB that a deferred routine needs. */
+ static void kernel_drain_dpcs(void)
+@@ -2572,6 +2625,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+ 
+         Sleep(10);
+         kernel_vblank_tick();  /* the GPU's frame clock */
++        kernel_d3d_swi_tick(); /* pushbuffer fences */
+         kernel_drain_dpcs();   /* deferred work, before due timers */
+         now = (long long)GetTickCount64();
+ 
+@@ -3880,6 +3934,16 @@ static void bridge_NtFsControlFile(void)
+ {
+     uint32_t fsctl = STACK_ARG(5);
+     uint32_t ios_va = STACK_ARG(4);
++    /* FSCTL_DISMOUNT_VOLUME: XAPI dismounts the utility (cache) partition
++     * after formatting it and treats a failure as a bad hard disk, booting
++     * to the dashboard with XLD_ERROR_INVALID_HARD_DISK. The partitions here
++     * are host directories with nothing mounted, so there is nothing to do. */
++    if (fsctl == 0x00090020u) {
++        fprintf(stderr, "  [FILE] NtFsControlFile(FSCTL_DISMOUNT_VOLUME) - ok\n");
++        bridge_write_iostatus(ios_va, 0, 0);
++        g_eax = 0;
++        return;
++    }
+     fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
+     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
+     g_eax = 0xC00000BBu;
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index 42135e0..9b87ad8 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -503,6 +503,37 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
+     }
+ }
+ 
++extern const wchar_t *xbox_last_partition_image(void);
++
++/* Sectors per cluster of the volume just opened. A partition the title has
++ * formatted carries a FATX header (magic, volume id, sectors per cluster);
++ * XAPI's mount check multiplies this by the sector size and fails the hard
++ * disk when it differs from the size it formatted with. */
++static ULONG xbox_volume_sectors_per_cluster(void)
++{
++    const wchar_t *img = xbox_last_partition_image();
++    ULONG spc = XBOX_SECTORS_PER_CLUSTER;
++
++    if (img && img[0]) {
++        HANDLE h = CreateFileW(img, GENERIC_READ,
++                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                               NULL, OPEN_EXISTING, 0, NULL);
++        if (h != INVALID_HANDLE_VALUE) {
++            unsigned char hdr[12];
++            DWORD got = 0;
++            if (ReadFile(h, hdr, sizeof(hdr), &got, NULL) && got == sizeof(hdr)
++                    && memcmp(hdr, "FATX", 4) == 0) {
++                ULONG v = (ULONG)hdr[8] | ((ULONG)hdr[9] << 8)
++                        | ((ULONG)hdr[10] << 16) | ((ULONG)hdr[11] << 24);
++                if (v && v <= 2048 && (v & (v - 1)) == 0)
++                    spc = v;
++            }
++            CloseHandle(h);
++        }
++    }
++    return spc;
++}
++
+ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
+     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
+@@ -517,7 +548,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
+             ULARGE_INTEGER free_bytes, total_bytes, total_free;
+             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+-                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
++                info->SectorsPerAllocationUnit = xbox_volume_sectors_per_cluster();
+                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
+                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
+                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
+@@ -675,7 +706,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+         WCHAR* clean_path = dir_path;
+         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
+             clean_path += 4;
+-        if (FileName && FileName->Buffer) {
++        /* An empty pattern means every file, as a null one does: XAPI's
++         * FindFirstFile on "z:\fonts\\" passes a zero-length string. Appending
++         * it gave a search for "<dir>\\", which matches nothing, so a title
++         * clearing out a directory saw it as already empty. */
++        if (FileName && FileName->Buffer && FileName->Length) {
+             WCHAR pattern_wide[MAX_PATH];
+             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
+                                 pattern_wide, MAX_PATH);
+@@ -686,6 +721,14 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+         }
+         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
+         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
++            {
++                static unsigned shown;
++                if (shown++ < 12) {
++                    fprintf(stderr, "  [FILE] NtQueryDirectoryFile: no match for '%ls' (win32 err=%lu)" "\n",
++                            search_path, GetLastError());
++                    fflush(stderr);
++                }
++            }
+             ctx->find_handle = NULL;
+             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+             return STATUS_NO_MORE_FILES;
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index caf6390..6d79f72 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -66,8 +66,8 @@ static const path_rule s_rules[] = {
+     { "C:\\",                                 0, NULL,         NULL          },
+     { "\\??\\C:\\",                           0, NULL,         NULL          },
+     { "\\Device\\Harddisk0\\Partition2",     1, "\\SystemData", "/SystemData" },
+-    { "\\Device\\Harddisk0\\Partition3",     1, "\\Cache",   "/Cache"      },
+-    { "\\Device\\Harddisk0\\Partition4",     1, "\\Cache",   "/Cache"      },
++    { "\\Device\\Harddisk0\\Partition3",     1, "\\CacheX",  "/CacheX"     },
++    { "\\Device\\Harddisk0\\Partition4",     1, "\\CacheY",  "/CacheY"     },
+     { "\\Device\\Harddisk0\\Partition5",     1, "\\Cache",   "/Cache"      },
+     { "D:\\",                                 0, NULL,         NULL          },
+     { "d:\\",                                 0, NULL,         NULL          },
+@@ -328,7 +328,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
+      * Cheap and idempotent: SHCreateDirectoryExW builds intermediates and is
+      * happy if they already exist. */
+     {
+-        static const WCHAR *subs[] = { L"TitleData", L"UserData", L"Cache",
++        static const WCHAR *subs[] = { L"TitleData", L"UserData", L"Cache", L"CacheX", L"CacheY",
+                                        L"SystemData" };
+         WCHAR image[MAX_PATH];
+         WCHAR dir[MAX_PATH];
+@@ -394,6 +394,17 @@ static void xbox_remember_host_path(const wchar_t *p)
+ 
+ 
+ 
++/* The partition image the last translation resolved to, or empty when the
++ * last translation was not a partition device path. NtQueryVolumeInformationFile
++ * reads the FATX header from it: XAPI formats the utility partition with its
++ * own cluster size and then checks the volume reports that size back. */
++static XBOX_THREAD_LOCAL wchar_t s_last_partition_image[MAX_PATH];
++
++const wchar_t *xbox_last_partition_image(void)
++{
++    return s_last_partition_image;
++}
++
+ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
+ {
+     const char*  remainder = NULL;
+@@ -413,7 +424,9 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
+             return xbox_translate_path(linked, host_path_buf, buf_size);
+     }
+ 
++    s_last_partition_image[0] = 0;
+     if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
++        wcsncpy_s(s_last_partition_image, MAX_PATH, host_path_buf, _TRUNCATE);
+         fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
+         fflush(stderr);
+         return TRUE;
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index c65632c..a1c5393 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -679,12 +679,44 @@ static void clear_surface(uint32_t param)
+         s_gpu.color_base = base;
+     }
+ 
+-    for (y = 0; y < s_gpu.clip_h; y++) {
++    /* The clear rectangle is the title's, and nothing says it fits the
++     * surface. A row is never wider than its pitch, and the surface never
++     * runs past the contiguous window; a rectangle that claims otherwise is
++     * clamped rather than written. Halo 2 clears with one after its intro
++     * movie, and unclamped that walked off the end of the window. */
++    uint32_t cw = s_gpu.clip_w, ch = s_gpu.clip_h;
++    {
++        uint32_t max_w = s_gpu.pitch / bpp;
++        uint32_t ow = cw, oh = ch;
++
++        if (s_gpu.clip_x >= max_w)
++            return;
++        if (cw > max_w - s_gpu.clip_x)
++            cw = max_w - s_gpu.clip_x;
++        if (s_gpu.color_base >= XBOX_CONTIG_BASE) {
++            uint64_t limit = (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
++            uint64_t rows = (limit - s_gpu.color_base) / s_gpu.pitch;
++            if (rows <= s_gpu.clip_y)
++                return;
++            if (ch > rows - s_gpu.clip_y)
++                ch = (uint32_t)(rows - s_gpu.clip_y);
++        }
++        if (cw != ow || ch != oh) {
++            static unsigned said;
++            if (said++ < 4)
++                fprintf(stderr, "  [GPU] clear rectangle %ux%u+%u+%u clamped to %ux%u"
++                                " (surface 0x%08X pitch %u)" "\n",
++                        ow, oh, s_gpu.clip_x, s_gpu.clip_y, cw, ch,
++                        s_gpu.color_base, s_gpu.pitch);
++        }
++    }
++
++    for (y = 0; y < ch; y++) {
+         uint8_t *row = mem + s_gpu.color_base
+                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+         if (bpp == 4) {
+             uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
+-            for (x = 0; x < s_gpu.clip_w; x++)
++            for (x = 0; x < cw; x++)
+                 p[x] = s_gpu.clear_color;
+         } else if (bpp == 2) {
+             /* The clear value is always given as A8R8G8B8; a 16-bit surface
+@@ -693,7 +725,7 @@ static void clear_surface(uint32_t param)
+                                   | ((s_gpu.clear_color >> 5) & 0x07E0)
+                                   | ((s_gpu.clear_color >> 3) & 0x001F));
+             uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
+-            for (x = 0; x < s_gpu.clip_w; x++)
++            for (x = 0; x < cw; x++)
+                 p[x] = v;
+         }
+     }
+@@ -2855,8 +2887,174 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+         record_tex_reg(method, param);
+ }
+ 
++/* D3D's software interrupt.
++ *
++ * NV097_NO_OPERATION with a non-zero parameter makes the hardware raise a
++ * PGRAPH interrupt with the method and parameter trapped. The D3D8 library
++ * uses it as a fence: it writes the method into the pushbuffer and blocks
++ * until its interrupt service has run the handler for that parameter. Nothing
++ * delivered it, so a title that waits on a fence during device creation stops
++ * there -- Halo 2 does, inside its first BlockOnTime.
++ *
++ * The parameters are queued here and handed to the title's handler from the
++ * timer thread (kernel_d3d_swi_tick), which has a guest stack. One producer
++ * (the executor) and one consumer, so plain indices are enough on x86. */
++#define NV2A_SWI_QUEUE 4096u
++static volatile uint32_t s_swi_head, s_swi_tail;
++static uint32_t s_swi_param[NV2A_SWI_QUEUE];
++
++static void nv2a_swi_post(uint32_t param)
++{
++    uint32_t t = s_swi_tail;
++    if (t - s_swi_head >= NV2A_SWI_QUEUE) {
++        /* Full: this fence is lost, and whatever waits on it waits forever.
++         * Never silently -- a stalled frame loop with no log line is an
++         * afternoon. */
++        static unsigned dropped;
++        if (dropped++ < 8)
++            fprintf(stderr, "  [NV2A] software interrupt 0x%08X DROPPED: queue full (%u pending)" "\n",
++                    param, t - s_swi_head);
++        return;
++    }
++    s_swi_param[t % NV2A_SWI_QUEUE] = param;
++    s_swi_tail = t + 1;
++
++    /* The hardware raises this interrupt when it reaches the method, and the
++     * FIFO does not move on until the title's service routine has run. Here
++     * the handler runs on the timer thread, so the executor has to wait for
++     * it: carrying on let the rest of the segment execute, GET advance and the
++     * fences be written while the interrupt was still queued. D3D then saw an
++     * idle GPU, tore its device down, and the late handler ran against freed
++     * state -- a wild write that killed Halo 2 at its device re-creation.
++     *
++     * Bounded, because a handler that itself waits on the GPU would otherwise
++     * wait on this thread forever. */
++    {
++        int waited = 0;
++        while (s_swi_head != s_swi_tail && waited++ < 200)
++            Sleep(1);
++        if (s_swi_head != s_swi_tail) {
++            static unsigned said;
++            if (said++ < 4)
++                fprintf(stderr, "  [NV2A] software interrupt 0x%08X not serviced within 200 ms;"
++                                " continuing" "\n", param);
++        }
++    }
++}
++
++/* The fence itself.
++ *
++ * D3D numbers its fences and asks the GPU to store the number of each one it
++ * reaches: NV097_SET_CONTEXT_DMA_SEMAPHORE names a DMA object,
++ * NV097_SET_SEMAPHORE_OFFSET an offset inside it, and
++ * NV097_BACK_END_WRITE_SEMAPHORE_RELEASE writes its parameter there. The
++ * library then compares that word with the fence it wants and blocks while the
++ * GPU is behind. Unhandled, the word never moved, so the first wait never
++ * ended.
++ *
++ * The object's base comes from where the hardware gets it: the handle is
++ * looked up in RAMHT (NV_PFIFO_RAMHT gives its place in instance memory) and
++ * the instance holds the frame and adjust. The title wrote both. */
++static uint32_t s_sem_handle, s_sem_offset;
++
++static int dma_object_base(uint32_t handle, uint32_t *base_out)
++{
++    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++    const uint32_t regs = 0xFD000000u, ramin = regs + 0x00700000u;
++    uint32_t ramht = *(const uint32_t *)(mem + regs + 0x2210u);
++    uint32_t ht_base = ((ramht >> 4) & 0x1Fu) << 12;
++    uint32_t ht_size = 0x1000u << ((ramht >> 16) & 3u);
++    uint32_t i;
++
++    for (i = 0; i + 8 <= ht_size; i += 8) {
++        uint32_t h   = *(const uint32_t *)(mem + ramin + ht_base + i);
++        uint32_t ctx = *(const uint32_t *)(mem + ramin + ht_base + i + 4);
++        if (h == handle && (ctx & 0x80000000u)) {
++            uint32_t inst = (ctx & 0xFFFFu) << 4;
++            uint32_t w0 = *(const uint32_t *)(mem + ramin + inst);
++            uint32_t w2 = *(const uint32_t *)(mem + ramin + inst + 8);
++            *base_out = (w2 & 0xFFFFF000u) + (w0 >> 20);
++            return 1;
++        }
++    }
++    return 0;
++}
++
++static void semaphore_release(uint32_t value)
++{
++    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
++    uint32_t base, va;
++    static unsigned shown, missed;
++
++    if (!dma_object_base(s_sem_handle, &base)) {
++        if (missed++ < 3)
++            fprintf(stderr, "  [NV2A] semaphore release %u: DMA object 0x%X not found in RAMHT"
++                            "; the fence word is not written" "\n",
++                    value, s_sem_handle);
++        return;
++    }
++    va = dma_resolve(base + s_sem_offset);
++    *(uint32_t *)(mem + va) = value;
++    if (shown++ < 6)
++        fprintf(stderr, "  [NV2A] semaphore release %u -> 0x%08X (object 0x%X base 0x%08X + 0x%X)" "\n",
++                value, va, s_sem_handle, base, s_sem_offset);
++}
++
++int nv2a_swi_take(uint32_t *param)
++{
++    uint32_t h = s_swi_head;
++    if (h == s_swi_tail)
++        return 0;
++    *param = s_swi_param[h % NV2A_SWI_QUEUE];
++    s_swi_head = h + 1;
++    return 1;
++}
++
+ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ {
++    /* NV097_NO_OPERATION with a non-zero parameter: see nv2a_swi_post. */
++    /* The last methods seen, for the moment one of them is nonsense. A clip
++     * 44925 pixels wide says the stream was mis-read some way back; the
++     * methods before it say where. */
++    {
++        static struct { uint8_t subch; uint16_t method; uint32_t param; } ring[48];
++        static unsigned ring_n, dumped;
++        ring[ring_n % 48].subch = (uint8_t)subch;
++        ring[ring_n % 48].method = (uint16_t)method;
++        ring[ring_n % 48].param = param;
++        ring_n++;
++        if (subch == 0 && (method == 0x0200u || method == 0x0204u)
++                && ((param >> 16) & 0xFFFFu) > 4096u && dumped < 2) {
++            unsigned i, n = ring_n < 48 ? ring_n : 48;
++            dumped++;
++            fprintf(stderr, "  [GPU] implausible clip %04X=%08X; the %u methods before it:" "\n",
++                    method, param, n - 1);
++            for (i = ring_n - n; i < ring_n; i++)
++                fprintf(stderr, "  [GPU]    %u:%04X = %08X" "\n", ring[i % 48].subch,
++                        ring[i % 48].method, ring[i % 48].param);
++            {
++                extern uint32_t g_nv2a_pb_cur_va, g_nv2a_pb_seg_va;
++                const uint8_t *m8 = (const uint8_t *)xbox_GetMemoryOffset();
++                uint32_t a, lo = g_nv2a_pb_cur_va - 0xC0u;
++                if (lo < g_nv2a_pb_seg_va) lo = g_nv2a_pb_seg_va;
++                fprintf(stderr, "  [GPU]  raw words, segment start 0x%08X, reading at 0x%08X:" "\n",
++                        g_nv2a_pb_seg_va, g_nv2a_pb_cur_va);
++                for (a = lo; a < g_nv2a_pb_cur_va + 0x20u; a += 4)
++                    fprintf(stderr, "  [GPU]  raw %08X: %08X" "\n", a,
++                            *(const uint32_t *)(m8 + a));
++            }
++            fflush(stderr);
++        }
++    }
++    /* Fence methods belong to the 3D class, which is on subchannel 0. The
++     * same numbers on another subchannel are another object's methods. */
++    if (subch == 0 && method == 0x0100u && param != 0) {
++        nv2a_swi_post(param);
++        return;
++    }
++    if (subch == 0 && method == 0x01A4u) { s_sem_handle = param; return; }   /* SET_CONTEXT_DMA_SEMAPHORE */
++    if (subch == 0 && method == 0x1D6Cu) { s_sem_offset = param; return; }   /* SET_SEMAPHORE_OFFSET */
++    if (subch == 0 && method == 0x1D70u) { semaphore_release(param); return; }
+     static int inited;
+     if (!inited) {
+         inited = 1;
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index 65bbedb..79987e1 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -163,9 +163,23 @@ void nv2a_pb_scan_report(void)
+  * The NV2A has one level of subroutine, so a CALL inside a call is not
+  * followed. Addresses are physical, like PUT's, and reach guest memory the
+  * same way: through the contiguous window. */
++static uint32_t s_ring_jump_target;
++
++/* Where the last top-level segment jumped to, or 0 if it did not. Cleared by
++ * the read, so a stale target is never reused. */
++uint32_t nv2a_pb_take_ring_jump(void)
++{
++    uint32_t t = s_ring_jump_target;
++    s_ring_jump_target = 0;
++    return t;
++}
++
++uint32_t g_nv2a_pb_cur_va, g_nv2a_pb_seg_va;
++
+ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+                         uint32_t *jumps, uint32_t *unknown)
+ {
++    const uint32_t seg_start = va;
+     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+     uint32_t words = 0;
+ 
+@@ -178,8 +192,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                              : (w & 0x1FFFFFFCu);
+             (*jumps)++;
+-            if (!in_call)
+-                break;                        /* the ring: a jump ends it */
++            if (!in_call) {
++                /* The ring: a jump ends this segment, and its target is where
++                 * the ring starts again. Kept for the caller, which otherwise
++                 * has to guess the ring's base. */
++                s_ring_jump_target = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
++                break;
++            }
+             va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+             end_va = va + 0x400000u;
+             continue;
+@@ -205,6 +224,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+ 
+             for (uint32_t i = 0; i < count && va < end_va; i++) {
+                 uint32_t m = noninc ? method : method + i * 4;
++                g_nv2a_pb_cur_va = va;       /* for diagnostics in the executor */
++                g_nv2a_pb_seg_va = seg_start;
+                 note(subch, m);
+                 /* Same walk, two consumers: the survey counts, the executor
+                  * acts. Keeping them on one decode means they can never
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 72d5131..d8faa25 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -966,18 +966,57 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                     static uint32_t put_lo, put_hi;
+                     if (!put_lo || put < put_lo) put_lo = put;
+                     if (put > put_hi) put_hi = put;
+-                    if (last_put && put > last_put) {
++                    if (last_put && put > last_put
++                            && put - last_put > 0x00200000u) {
++                        /* Not one submission: PUT has moved to a different
++                         * ring (a title that destroys its device and creates
++                         * another gets a new pushbuffer somewhere else).
++                         * Everything between the two is somebody's memory --
++                         * for Halo 2 its 51 MB pool, movie and all -- and
++                         * walking it as commands produced clears 44925 pixels
++                         * wide and a fault on a pointer read out of the
++                         * movie. Start again from the new position. */
++                        static unsigned said;
++                        if (said++ < 4)
++                            fprintf(stderr, "  [NV2A] PUT moved 0x%08X -> 0x%08X:"
++                                    " a different pushbuffer, gap not scanned" "\n",
++                                    last_put, put);
++                    } else if (last_put && put > last_put) {
+                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                     } else if (last_put && put < last_put) {
+-                        if (put_hi > last_put)
+-                            nv2a_pb_scan(
+-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
+-                        if (put > put_lo)
+-                            nv2a_pb_scan(
+-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
+-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
++                        /* Follow the title's own JUMP across the seam rather
++                         * than the learned bounds. put_lo is the lowest PUT
++                         * ever seen, and a title that destroys its device and
++                         * creates another has a second ring somewhere else:
++                         * Halo 2's first is at physical 0x2000, so every wrap
++                         * of the second replayed the dead first ring -- whose
++                         * last semaphore release put the GPU back at fence 13
++                         * and stalled the frame loop for good. */
++                        extern uint32_t nv2a_pb_take_ring_jump(void);
++                        uint32_t from = XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu);
++                        uint32_t to   = XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu);
++                        uint32_t tgt;
++
++                        (void)nv2a_pb_take_ring_jump();
++                        /* Bounded: the JUMP is at most one submission past
++                         * the last PUT. Further than that there is no JUMP,
++                         * only whatever lies beyond the ring. */
++                        nv2a_pb_scan(from, from + 0x20000u);   /* runs to the JUMP */
++                        tgt = nv2a_pb_take_ring_jump();
++                        if (tgt) {
++                            if (tgt < to && to - tgt <= 0x00200000u)
++                                nv2a_pb_scan(tgt, to);
++                        } else {
++                            /* No JUMP: PUT was reset (device teardown), not
++                             * wrapped. Nothing below it is known to be this
++                             * ring, so nothing is scanned. */
++                            static unsigned said;
++                            if (said++ < 4)
++                                fprintf(stderr, "  [NV2A] PUT went back 0x%08X -> 0x%08X"
++                                        " with no JUMP; not scanned" "\n",
++                                        last_put, put);
++                        }
+                         if (getenv("RECOMP_PB_WRAP_TRACE")) {
+                             static unsigned wraps;
+                             if (wraps++ < 8)
+@@ -1176,6 +1215,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+ /* SEH frame pointer bridge (see recomp_types.h for explanation) */
+ RECOMP_TLS uint32_t g_seh_ebp = 0;
+ RECOMP_TLS double g_fp_stack[8];
++
++/* The flags word pushfd reads and popfd writes. Reserved bit 1 and IF set,
++ * as a title sees them on the console. */
++RECOMP_TLS uint32_t g_recomp_eflags = 0x00000202u;
++/* The guest SSE control word (stmxcsr/ldmxcsr). */
++RECOMP_TLS uint32_t g_recomp_mxcsr = 0x00001F80u;
+ RECOMP_TLS int g_fp_top = 0;
+ 
+ /* Set once at startup. The generated code reads it at the ret of every
+@@ -3094,6 +3139,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+     g_contig_block_count++;
+ }
+ 
++/* Take a range the title pinned at a fixed physical address out of the arena.
++ *
++ * MmAllocateContiguousMemoryEx with lowest/highest spanning exactly one
++ * allocation is honoured at that address, but nothing told this allocator, so
++ * the bump pointer kept handing out memory inside the pinned block. Halo 2
++ * pins a 51 MB pool at physical 0x61000 after freeing its first D3D device,
++ * then creates the second one: its pushbuffer, framebuffers and fence page all
++ * landed inside the pool. Reading the 13 MB intro movie into the pool then
++ * overwrote the framebuffer (noise on screen), the fence word and DirectSound's
++ * heap (a free-list walk that never ended).
++ *
++ * The bump pointer is moved past the pinned block. Blocks handed out below it
++ * earlier are the caller's business: the title frees what it had there before
++ * it pins, as it would have to on the console. */
++void xbox_ContiguousReserve(uint32_t va, uint32_t size)
++{
++    uint32_t end = (va + size + 4095u) & ~4095u;
++
++    AcquireSRWLockExclusive(&g_contig_lock);
++    if (end > g_contig_next) {
++        if (xbox_HeapReclaimEnabled()) {
++            if (va > g_contig_next)
++                contig_insert(g_contig_block_count, g_contig_next,
++                              va - g_contig_next, 1);
++            contig_insert(g_contig_block_count, va, end - va, 0);
++        }
++        fprintf(stderr, "  [CONTIG] pinned 0x%08X..0x%08X reserved; arena continues at 0x%08X"
++                "\n", va, end, end);
++        fflush(stderr);
++        g_contig_next = end;
++    }
++    ReleaseSRWLockExclusive(&g_contig_lock);
++}
++
+ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+ {
+     uint32_t result = 0;
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 8e9325e..6fc89a1 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -225,7 +225,9 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
+ #include <intrin.h>
+ #define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
+ #define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)_InterlockedCompareExchange((volatile long *)(p),                                            (long)(val), (long)(cmp)))
++#define RECOMP_ATOMIC_XCHG32(p, v)    ((uint32_t)_InterlockedExchange((volatile long *)(p), (long)(v)))
+ #else
++#define RECOMP_ATOMIC_XCHG32(p, v)    ((uint32_t)__atomic_exchange_n((volatile uint32_t *)(p), (uint32_t)(v), __ATOMIC_SEQ_CST))
+ #define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)__sync_fetch_and_add((volatile uint32_t *)(p), (uint32_t)(v)))
+ #define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
+ #endif
+@@ -1431,6 +1433,54 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
+  * state, and with RECOMP_UNIMPL_TRAP=1 it stops at the first one. The lifter
+  * keeps the comment beside the call so `grep TODO:` over a gen tree still
+  * enumerates every site whether or not it is ever reached. */
++/* pushfd/popfd state; see the lifter's note on cpuid. */
++extern RECOMP_TLS uint32_t g_recomp_eflags;
++
++/* cpuid as the console answers it: an Intel Pentium III (Coppermine core,
++ * family 6 model 8), which has MMX and SSE and nothing later. Titles and the
++ * libraries linked into them pick their code paths from this -- Bink installs
++ * no colour converters at all without the MMX bit. */
++static inline void recomp_cpuid(uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d)
++{
++    switch (*a) {
++    case 0:  *a = 2; *b = 0x756E6547u; *d = 0x49656E69u; *c = 0x6C65746Eu; break; /* "GenuineIntel" */
++    case 1:  *a = 0x0000068Au; *b = 0; *c = 0; *d = 0x0383F9FFu; break;
++    case 2:  *a = 0x03020101u; *b = 0; *c = 0; *d = 0x0C040841u; break;
++    default: *a = 0; *b = 0; *c = 0; *d = 0; break;
++    }
++}
++
++/* stmxcsr/ldmxcsr state: the guest's SSE control word, power-on value 0x1F80
++ * (all exceptions masked, round to nearest). Only the rounding field (bits
++ * 13-14) has an effect here, on cvtss2si/cvtsd2si. */
++extern RECOMP_TLS uint32_t g_recomp_mxcsr;
++
++/* cvttss2si/cvttsd2si: truncate. Out of range or NaN gives the CPU's
++ * "integer indefinite" 0x80000000, where a C cast is undefined. */
++static inline uint32_t recomp_cvtt_f2i(double x)
++{
++    if (!(x > -2147483649.0 && x < 2147483648.0)) return 0x80000000u;
++    return (uint32_t)(int32_t)x;
++}
++
++/* cvtss2si/cvtsd2si: round as MXCSR says (nearest-even unless the title
++ * changed it). These were lifted as a truncating cast. */
++static inline uint32_t recomp_cvt_f2i(double x)
++{
++    double r;
++    switch ((g_recomp_mxcsr >> 13) & 3u) {
++    case 1:  r = floor(x); break;
++    case 2:  r = ceil(x);  break;
++    case 3:  r = trunc(x); break;
++    default: r = floor(x);
++             { double d = x - r;
++               if (d > 0.5 || (d == 0.5 && fmod(r, 2.0) != 0.0)) r += 1.0; }
++             break;
++    }
++    if (!(r >= -2147483648.0 && r < 2147483648.0)) return 0x80000000u;
++    return (uint32_t)(int32_t)r;
++}
++
+ void recomp_unimpl(const char *text, uint32_t va);
+ #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
+ 
+diff --git a/tools/disasm/engine.py b/tools/disasm/engine.py
+index db71403..75ee96c 100644
+--- a/tools/disasm/engine.py
++++ b/tools/disasm/engine.py
+@@ -262,8 +262,25 @@ class DisasmEngine:
+ 
+         Returns the number of tables resynced.
+         """
++        # Realigning past one table decodes the code after it, and that code
++        # can hold the next switch: its `jmp [reg*4 + disp]` only becomes a
++        # candidate then. One pass over a snapshot missed those (Halo 2's
++        # 0x216B00 sits right after the table of 0x216AB0 and stayed
++        # unmeasured), so run to a fixed point.
+         resynced = 0
+-        for tbl in sorted(self._jt_candidates):
++        done = set()
++        while True:
++            pending = sorted(self._jt_candidates - done)
++            if not pending:
++                return resynced
++            done.update(pending)
++            resynced += self._resync_jump_tables_pass(
++                pending, min_entries, max_entries)
++
++    def _resync_jump_tables_pass(self, candidates, min_entries: int,
++                                 max_entries: int) -> int:
++        resynced = 0
++        for tbl in candidates:
+             # XBEs mark .rdata and .data executable, so "points at an
+             # executable section" alone would let an array of data pointers
+             # pass as a jump table -- and resyncing over real instructions is
+@@ -274,12 +291,25 @@ class DisasmEngine:
+                 continue
+             lo = home.virtual_addr
+             hi = lo + home.virtual_size
++            # A switch whose case values are sparse has null slots for the
++            # values the range check already excluded (Halo 2's 0x216B30:
++            # two arms, two nulls, two arms, two nulls, three arms). Stopping
++            # at the first null measured that as a two-entry table, too short
++            # to be one, so the function ended at its jmp and every arm became
++            # a fragment no dispatch could reach. A short run of nulls is part
++            # of the table when a real arm follows it.
++            MAX_HOLE = 8
+             entries = 0
+-            while entries < max_entries:
+-                target = self.image.read_u32_at_va(tbl + entries * 4)
++            scan = 0
++            while scan < max_entries:
++                target = self.image.read_u32_at_va(tbl + scan * 4)
++                if target == 0 and entries and scan - entries < MAX_HOLE:
++                    scan += 1
++                    continue
+                 if target is None or not (lo <= target < hi):
+                     break
+-                entries += 1
++                scan += 1
++                entries = scan
+             # The displacement need not be the first slot. MSVC's memmove
+             # dispatches its backward tail through `jmp [ecx*4 + LAST]`, the
+             # table's last entry, with the index counting down from there --
+@@ -332,6 +362,14 @@ class DisasmEngine:
+ 
+             self.jump_tables[tbl] = end
+             self.decode_at(end)
++            # The arms too. Where the sweep was out of phase before the
++            # dispatch, the arms were decoded out of phase with it, and the
++            # function-end walk stops at the first arm it finds no instruction
++            # for (0x216B08 here: the function then ended at its own jmp).
++            for slot in range(tbl, end, 4):
++                arm = self.image.read_u32_at_va(slot)
++                if arm and lo <= arm < hi and arm not in self.instructions:
++                    self.decode_at(arm)
+             resynced += 1
+ 
+         return resynced
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index e7ab880..cb5c5c8 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -127,6 +127,11 @@ def _fmt_reg(name, size=4):
+     if name in ("fs", "gs", "cs", "ds", "es", "ss"):
+         return f"0 /* seg:{name} */"
+ 
++    # Debug/control registers are ring 0 only; a title never touches them, so
++    # one showing up means data was decoded as code. Read as 0, like segments.
++    if len(name) == 3 and name[:2] in ("dr", "cr", "tr") and name[2].isdigit():
++        return f"0 /* privileged:{name} */"
++
+     # Map sub-registers to expressions on 32-bit locals
+     SUB_REGS = {
+         "al": "LO8(eax)", "ah": "HI8(eax)", "ax": "LO16(eax)",
+@@ -146,6 +151,8 @@ def _fmt_set_reg(name, value_expr):
+     # Segment registers → no-op
+     if name in ("fs", "gs", "cs", "ds", "es", "ss"):
+         return f"/* mov {name}, {value_expr} - segment register */;"
++    if len(name) == 3 and name[:2] in ("dr", "cr", "tr") and name[2].isdigit():
++        return f"/* mov {name}, {value_expr} - privileged register */;"
+ 
+     SET_MAP = {
+         "al": f"SET_LO8(eax, {value_expr})",
+@@ -1374,6 +1381,24 @@ class Lifter:
+         ops = insn.operands
+         nops = len(ops)
+ 
++        # ── lock prefix ──
++        #
++        # Capstone keeps the prefix in the mnemonic. Only "lock xadd" and
++        # "lock cmpxchg" were recognised (further down); every other locked
++        # instruction -- `lock xchg [ecx], eax` releasing a spinlock, `lock
++        # inc`, `lock or` -- fell to RECOMP_UNIMPL and was dropped whole, so
++        # the lock was never released and the counter never moved. Lift the
++        # instruction under the prefix instead. xchg with memory goes through
++        # RECOMP_ATOMIC_XCHG32 (see _lift_xchg); the rest are a plain
++        # read-modify-write, which is what they already were without the
++        # prefix.
++        if m.startswith("lock ") and m[5:] not in ("xadd", "cmpxchg"):
++            insn.mnemonic = m[5:]
++            try:
++                return self.lift_instruction(insn)
++            finally:
++                insn.mnemonic = m
++
+         # ── NOP ──
+         if m == "nop" or (m == "lea" and nops == 2 and
+                           ops[0].type == "reg" and ops[1].type == "mem" and
+@@ -1677,6 +1702,39 @@ class Lifter:
+         # The runtime scales the host's counter to the console's clock rate
+         # rather than returning the host TSC, so the guest's own division by
+         # its hardcoded frequency yields real seconds.
++        # ── CPU identification and the flags register ──
++        # All three used to fall to RECOMP_UNIMPL, and the damage was not just
++        # a missing answer. MSVC-era feature checks are
++        #     pushfd; pop eax; ...; push eax; popfd; pushfd; pop eax; push ebx; popfd
++        # so with pushfd/popfd as no-ops the ordinary pops read words nobody
++        # pushed and the pushes were never popped: the test compared stack
++        # garbage and the function returned with a callee-saved register
++        # replaced. Then cpuid left edx as it was, so "is MMX there" was
++        # answered by whatever edx held. Bink read that as "no MMX", never
++        # installed its row converters, and called null pointers every scanline.
++        #
++        # pushfd/popfd carry one flags word (g_recomp_eflags) so the ID-bit
++        # toggle that asks "does cpuid exist" gets a yes. The arithmetic flags
++        # in it are not the lifter's lazily tracked ones: a popfd is not a way
++        # to hand CF or ZF to a following jcc here.
++        if m == "cpuid":
++            return ["recomp_cpuid(&eax, &ebx, &ecx, &edx); /* cpuid */"]
++        # stmxcsr/ldmxcsr were no-ops: the store left stack garbage where the
++        # title expected the control word, and the rounding mode it then
++        # loaded never took effect. One guest word per thread; the scalar
++        # float-to-int conversions read its rounding field.
++        if m == "stmxcsr" and ops and ops[0].type == "mem":
++            return [f"MEM32({_fmt_mem(ops[0])}) = g_recomp_mxcsr; /* stmxcsr */"]
++        if m == "ldmxcsr" and ops and ops[0].type == "mem":
++            return [f"g_recomp_mxcsr = MEM32({_fmt_mem(ops[0])}) & 0xFFFFu;"
++                    " /* ldmxcsr */"]
++        if m in ("pushfd", "pushf"):
++            return ["PUSH32(esp, g_recomp_eflags); /* pushfd */"]
++        if m in ("popfd", "popf"):
++            return ["{ uint32_t _fl; POP32(esp, _fl);"
++                    " g_recomp_eflags = (_fl & 0x00240DD5u) | 0x00000202u; }"
++                    " /* popfd */"]
++
+         if m == "rdtsc":
+             return [
+                 "{ uint64_t _tsc = xbox_ReadTimeStampCounter();",
+@@ -1838,6 +1896,19 @@ class Lifter:
+     def _lift_xchg(self, insn, ops):
+         if len(ops) < 2:
+             return [f"/* xchg: bad operands */"]
++        mem = [o for o in ops[:2] if o.type == "mem"]
++        reg = [o for o in ops[:2] if o.type == "reg"]
++        if (len(mem) == 1 and len(reg) == 1
++                and (_operand_width(mem[0]) or 4) == 4
++                and (_operand_width(reg[0]) or 4) == 4):
++            # xchg with memory locks the bus whether or not it carries the
++            # prefix; titles use it as their spinlock primitive.
++            r = _fmt_operand_read(reg[0])
++            return [
++                "{ uint32_t _old = RECOMP_ATOMIC_XCHG32("
++                f"XBOX_PTR({_fmt_mem(mem[0])}), {r});",
++                "  " + _fmt_operand_write(reg[0], "_old") + " }  /* xchg (atomic) */",
++            ]
+         a = _fmt_operand_read(ops[0])
+         b = _fmt_operand_read(ops[1])
+         return [
+@@ -2507,13 +2578,20 @@ class Lifter:
+         if offset is None:
+             return []
+         targets = []
++        holes = 0
+         for i in range(max_entries):
+             o = offset + i * 4
+             if o + 4 > len(self.xbe_data):
+                 break
+             val = struct.unpack_from('<I', self.xbe_data, o)[0]
++            if val == 0 and targets and holes < 8:
++                # Null slot of a sparse switch; see
++                # DisasmEngine.resync_jump_tables. Not an arm, not the end.
++                holes += 1
++                continue
+             if not is_code_address(val):
+                 break
++            holes = 0
+             targets.append(val)
+         return targets
+ 
+@@ -3293,14 +3371,16 @@ class Lifter:
+                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
+         if m in ("cvtss2si", "cvttss2si"):
+             if nops >= 2:
+-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
++                fn = "recomp_cvtt_f2i" if m == "cvttss2si" else "recomp_cvt_f2i"
++                return [_fmt_operand_write(ops[0], f"{fn}((double){_sse_read(ops[1])})") + f" /* {m} */"]
+         if m == "cvtsi2sd":
+             if nops >= 2:
+                 src = _fmt_operand_read(ops[1])
+                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
+         if m in ("cvtsd2si", "cvttsd2si"):
+             if nops >= 2:
+-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
++                fn = "recomp_cvtt_f2i" if m == "cvttsd2si" else "recomp_cvt_f2i"
++                return [_fmt_operand_write(ops[0], f"{fn}((double){_sse_read(ops[1])})") + f" /* {m} */"]
+         if m == "cvtss2sd":
+             if nops >= 2:
+                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 3cd9250..b5a5098 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -1316,6 +1316,7 @@ class FunctionTranslator:
+         """Read the contiguous pointer cluster around an indexed-jump base."""
+         def scan(step, first):
+             targets = []
++            holes = 0
+             for index in range(first, max_entries + first):
+                 entry_va = table_va + step * index * 4
+                 if min_entry_va is not None and entry_va < min_entry_va:
+@@ -1324,8 +1325,14 @@ class FunctionTranslator:
+                 if offset is None or offset + 4 > len(self.xbe_data):
+                     break
+                 target = struct.unpack_from('<I', self.xbe_data, offset)[0]
++                if target == 0 and targets and step > 0 and holes < 8:
++                    # Null slot of a sparse switch (forward scan only); see
++                    # DisasmEngine.resync_jump_tables.
++                    holes += 1
++                    continue
+                 if not (lower <= target < upper):
+                     break
++                holes = 0
+                 targets.append(target)
+             return targets
+ 
+@@ -1377,6 +1384,9 @@ class FunctionTranslator:
+             m = insn.mnemonic
+             if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr"):
+                 return True
++            # lahf copies CF into AH through the same _cf the jb forms read.
++            if m == "lahf" and last_setter is not None:
++                return True
+             cc = None
+             if m.startswith("j") and len(m) > 1:
+                 cc = m[1:]
