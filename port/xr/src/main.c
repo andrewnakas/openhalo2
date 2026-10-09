@@ -257,16 +257,10 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
                 return EXCEPTION_CONTINUE_EXECUTION;
         }
 
-        /*
-         * GPU register probe at 0xFD000000 range.
-         * Some games probe NV2A registers directly. On real hardware this
-         * returns GPU state; here we just skip the instruction.
-         * TODO: Implement mini x86-64 decoder for instruction skipping,
-         * or connect to the xbox_nv2a library for proper handling.
-         */
-        if (fault_addr >= 0xFD000000 && fault_addr < 0xFE000000) {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
+        /* A fault at host 0xFD000000-0xFE000000 used to return
+         * EXCEPTION_CONTINUE_SEARCH here with no output. Nothing further down
+         * the chain handles it, so the process ended without a word. It now
+         * falls through to the report below like any other fault. */
 
         /* APU registers -> the emulated APU.
          *

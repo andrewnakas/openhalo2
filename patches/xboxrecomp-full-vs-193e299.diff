@@ -11,7 +11,7 @@ index a045752..880f260 100644
      nv2a_vsh_interp.c
      nv2a_combiner.c
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..e51fa1b 100644
+index c65ba43..45a1243 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
@@ -49,7 +49,7 @@ index c65ba43..e51fa1b 100644
  
      {
          static unsigned n;
-@@ -2284,6 +2294,53 @@ static void kernel_vblank_tick(void)
+@@ -2284,6 +2294,56 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -64,6 +64,7 @@ index c65ba43..e51fa1b 100644
 + * xbox_SetD3DSoftwareInterruptRoutine, and until it does nothing is delivered. */
 +static uint32_t g_xbox_d3d_swi_routine;
 +int nv2a_swi_take(uint32_t *param);
++void nv2a_swi_done(void);
 +
 +void xbox_SetD3DSoftwareInterruptRoutine(uint32_t guest_va)
 +{
@@ -88,6 +89,7 @@ index c65ba43..e51fa1b 100644
 +    if (!kint || !fn || !BRIDGE_MEM32(kint + 0) || !BRIDGE_MEM32(kint + 4)) {
 +        while (nv2a_swi_take(&param))
 +            ;
++        nv2a_swi_done();
 +        return;
 +    }
 +
@@ -97,13 +99,14 @@ index c65ba43..e51fa1b 100644
 +        { static unsigned n; static int tr = -1; if (tr < 0) tr = getenv("RECOMP_SWI_TRACE") != NULL; if (n++ < 12 || tr) { fprintf(stderr, "  [NV2A] software interrupt 0x%08X -> handler (this=0x%08X)\n", param, g_ecx); fflush(stderr); } }
 +        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
 +        { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
++        nv2a_swi_done();
 +    }
 +}
 +
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2572,6 +2629,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2572,6 +2632,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
  
          Sleep(10);
          kernel_vblank_tick();  /* the GPU's frame clock */
@@ -111,7 +114,7 @@ index c65ba43..e51fa1b 100644
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -3880,6 +3938,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3880,6 +3941,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
@@ -128,7 +131,7 @@ index c65ba43..e51fa1b 100644
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
-@@ -9391,24 +9459,45 @@ void guest_cpu_part(void)
+@@ -9391,24 +9462,45 @@ void guest_cpu_part(void)
      t_guest_thread = 0;
  }
  
@@ -174,7 +177,7 @@ index c65ba43..e51fa1b 100644
      }
      (void)held;
  }
-@@ -9473,6 +9562,28 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9473,6 +9565,28 @@ static void kernel_thunk_dispatch_body(void)
                      fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
                              (unsigned long long)g_ordinal_calls[best]);
                  }
@@ -335,10 +338,21 @@ index caf6390..6d79f72 100644
          fflush(stderr);
          return TRUE;
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..9c2a038 100644
+index c65632c..04d100b 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
-@@ -679,12 +679,44 @@ static void clear_surface(uint32_t param)
+@@ -583,8 +583,10 @@ static uint32_t surface_bpp(void)
+  * the sequence. */
+ static int s_flip_dumping;
+ 
++void nv2a_pb_exec_flush(void);
+ static void dump_surface_bmp(void)
+ {
++    nv2a_pb_exec_flush();
+     const char *prefix = getenv("RECOMP_FB_DUMP");
+     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+     int drawn = s_gpu.drawn_offset != 0;
+@@ -679,12 +681,44 @@ static void clear_surface(uint32_t param)
          s_gpu.color_base = base;
      }
  
@@ -385,7 +399,7 @@ index c65632c..9c2a038 100644
                  p[x] = s_gpu.clear_color;
          } else if (bpp == 2) {
              /* The clear value is always given as A8R8G8B8; a 16-bit surface
-@@ -693,7 +725,7 @@ static void clear_surface(uint32_t param)
+@@ -693,7 +727,7 @@ static void clear_surface(uint32_t param)
                                    | ((s_gpu.clear_color >> 5) & 0x07E0)
                                    | ((s_gpu.clear_color >> 3) & 0x001F));
              uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
@@ -394,7 +408,151 @@ index c65632c..9c2a038 100644
                  p[x] = v;
          }
      }
-@@ -2855,8 +2887,233 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -1904,12 +1938,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+ #define NV_RASTER_MAX_THREADS 16
+ #define NV_RASTER_MT_MIN_PIXELS 8192
+ 
++/* The triangles of one draw batch, held back so they can be rasterised
++ * together.
++ *
++ * Splitting only single big triangles across threads left the executor
++ * thread doing nearly all the work: a mesh is thousands of small triangles,
++ * each under the threshold (sampled on Halo 2's opening scene: the executor
++ * thread 82% busy, each worker about 20%). Nothing between BEGIN and END can
++ * change render state, so the whole batch is queued and then every thread
++ * walks ALL of it, each drawing only the rows it owns (y mod threads). A row
++ * has one owner and sees the triangles in submission order, so the result is
++ * the same as drawing them one by one.
++ *
++ * Flushed before any method that is not vertex data (see
++ * nv2a_pb_exec_method), at the end of each scanned segment, when full, and
++ * before the surface is read. RECOMP_RASTER_BATCH=0 goes back to one
++ * triangle at a time. */
++#define XF_QUEUE_MAX 8192
++typedef struct { XfTri T; Nv2aVshOutput v[3]; } XfQueued;
++static XfQueued *s_xfq;
++static int s_xfq_n;
++static uint64_t s_xfq_area;
++
++/* The rows of T that thread k of n owns. */
++static void xf_rows_owned(const XfTri *T, int k, int n, XfCount *cnt)
++{
++    int first = T->miny + (((k - T->miny) % n) + n) % n;
++    xf_rows(T, first, n, cnt);
++}
++
+ #if defined(_WIN32)
+ static struct {
+     int n;                                  /* threads incl. the caller */
+     HANDLE start[NV_RASTER_MAX_THREADS], done;
+     volatile LONG pending;
+     const XfTri *tri;
++    const XfQueued *batch;                  /* a queue to run, or NULL */
++    int batch_n;
+     XfCount cnt[NV_RASTER_MAX_THREADS];
+ } s_pool;
+ 
+@@ -1919,7 +1984,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+     for (;;) {
+         WaitForSingleObject(s_pool.start[k], INFINITE);
+         memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
+-        xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
++        if (s_pool.batch) {
++            int i;
++            for (i = 0; i < s_pool.batch_n; i++)
++                xf_rows_owned(&s_pool.batch[i].T, k, s_pool.n, &s_pool.cnt[k]);
++        } else {
++            xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
++        }
+         if (InterlockedDecrement(&s_pool.pending) == 0)
+             SetEvent(s_pool.done);
+     }
+@@ -1985,6 +2056,75 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+ }
+ #endif
+ 
++/* Rasterise everything queued. */
++void nv2a_pb_exec_flush(void)
++{
++    XfCount total = {0, 0, 0};
++    int i, n;
++
++    if (!s_xfq_n)
++        return;
++#if defined(_WIN32)
++    n = raster_pool_size();
++    if (n > 1 && s_xfq_area >= NV_RASTER_MT_MIN_PIXELS) {
++        int k;
++        s_pool.batch = s_xfq;
++        s_pool.batch_n = s_xfq_n;
++        s_pool.pending = n - 1;
++        for (k = 0; k < n - 1; k++)
++            SetEvent(s_pool.start[k]);
++        for (i = 0; i < s_xfq_n; i++)
++            xf_rows_owned(&s_xfq[i].T, n - 1, n, &total);
++        WaitForSingleObject(s_pool.done, INFINITE);
++        s_pool.batch = NULL;
++        for (k = 0; k < n - 1; k++) {
++            total.depth_fail += s_pool.cnt[k].depth_fail;
++            total.pixels += s_pool.cnt[k].pixels;
++            total.zpass += s_pool.cnt[k].zpass;
++        }
++    } else
++#endif
++    {
++        (void)n;
++        for (i = 0; i < s_xfq_n; i++)
++            xf_rows(&s_xfq[i].T, s_xfq[i].T.miny, 1, &total);
++    }
++    s_gpu.xf_depth_fail += total.depth_fail;
++    s_gpu.xf_pixels += total.pixels;
++    s_gpu.zpass_count += total.zpass;
++    s_xfq_n = 0;
++    s_xfq_area = 0;
++}
++
++/* Queue T (with its own copy of the three vertices), or draw it now. */
++static void xf_submit(const XfTri *T, XfCount *cnt)
++{
++    static int batching = -1;
++    XfQueued *q;
++
++    if (batching < 0) {
++        const char *e = getenv("RECOMP_RASTER_BATCH");
++        batching = !(e && *e == '0');
++        if (batching) {
++            s_xfq = (XfQueued *)malloc(sizeof(XfQueued) * XF_QUEUE_MAX);
++            if (!s_xfq)
++                batching = 0;
++        }
++    }
++    if (!batching) {
++        xf_rows_parallel(T, cnt);
++        return;
++    }
++    if (s_xfq_n == XF_QUEUE_MAX)
++        nv2a_pb_exec_flush();
++    q = &s_xfq[s_xfq_n++];
++    q->T = *T;
++    q->v[0] = *T->va; q->v[1] = *T->vb; q->v[2] = *T->vc;
++    q->T.va = &q->v[0]; q->T.vb = &q->v[1]; q->T.vc = &q->v[2];
++    q->T.a = q->v[0].pos; q->T.b = q->v[1].pos; q->T.c = q->v[2].pos;
++    s_xfq_area += (uint64_t)(T->maxx - T->minx) * (uint64_t)(T->maxy - T->miny);
++}
++
+ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+                                const Nv2aVshOutput *vc)
+ {
+@@ -2070,7 +2210,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     s_gpu.xf_drawn++;
+     T.inv_area = 1.0f / area;
+ 
+-    xf_rows_parallel(&T, &cnt);
++    xf_submit(&T, &cnt);
+     s_gpu.xf_depth_fail += cnt.depth_fail;
+     s_gpu.xf_pixels += cnt.pixels;
+     s_gpu.zpass_count += cnt.zpass;
+@@ -2855,8 +2995,272 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          record_tex_reg(method, param);
  }
  
@@ -413,6 +571,23 @@ index c65632c..9c2a038 100644
 +#define NV2A_SWI_QUEUE 4096u
 +static volatile uint32_t s_swi_head, s_swi_tail;
 +static uint32_t s_swi_param[NV2A_SWI_QUEUE];
++/* The handler's arguments travel with the interrupt. D3D passes them in the
++ * two clear-value latches (see nv2a_pb_exec_method), and the handler runs on
++ * another thread: if the executor has moved on by then -- its wait is bounded
++ * -- the latches hold a real clear value, and "write register [0x401A88]"
++ * becomes a write to register 0xFFFFFF00 (seen: a fault at 0xFCFFFF00 in the
++ * handler, one boot in three). So each queued interrupt carries the latches
++ * as they were when it was reached, and they are put back for its handler. */
++static uint32_t s_swi_zclear[NV2A_SWI_QUEUE], s_swi_cclear[NV2A_SWI_QUEUE];
++static volatile uint32_t s_swi_next;          /* next to hand to the handler */
++static uint32_t s_latch_zclear, s_latch_cclear;   /* as the stream last set them */
++
++static void nv2a_latch_write(uint32_t zclear, uint32_t cclear)
++{
++    uint8_t *m = (uint8_t *)(uintptr_t)xbox_GetMemoryOffset();
++    *(volatile uint32_t *)(m + 0xFD401A88u) = zclear;
++    *(volatile uint32_t *)(m + 0xFD40186Cu) = cclear;
++}
 +
 +static void nv2a_swi_post(uint32_t param)
 +{
@@ -428,6 +603,8 @@ index c65632c..9c2a038 100644
 +        return;
 +    }
 +    s_swi_param[t % NV2A_SWI_QUEUE] = param;
++    s_swi_zclear[t % NV2A_SWI_QUEUE] = s_latch_zclear;
++    s_swi_cclear[t % NV2A_SWI_QUEUE] = s_latch_cclear;
 +    s_swi_tail = t + 1;
 +    {
 +        static int tr = -1;
@@ -516,18 +693,39 @@ index c65632c..9c2a038 100644
 +                value, va, s_sem_handle, base, s_sem_offset);
 +}
 +
++/* Hand the next queued interrupt to the caller, with the latches as they
++ * were when the executor reached it. The executor's wait in nv2a_swi_post
++ * ends at nv2a_swi_done, not here: taking is not having run the handler, and
++ * letting the executor go at the take had it racing the handler it was
++ * waiting for. */
 +int nv2a_swi_take(uint32_t *param)
 +{
-+    uint32_t h = s_swi_head;
++    uint32_t h = s_swi_next;
 +    if (h == s_swi_tail)
 +        return 0;
 +    *param = s_swi_param[h % NV2A_SWI_QUEUE];
-+    s_swi_head = h + 1;
++    nv2a_latch_write(s_swi_zclear[h % NV2A_SWI_QUEUE],
++                     s_swi_cclear[h % NV2A_SWI_QUEUE]);
++    s_swi_next = h + 1;
 +    return 1;
++}
++
++/* The handler for everything taken so far has returned (or it was dropped). */
++void nv2a_swi_done(void)
++{
++    nv2a_latch_write(s_latch_zclear, s_latch_cclear);
++    s_swi_head = s_swi_next;
 +}
 +
  void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  {
++    /* Queued triangles were set up under the state as it is now. Anything
++     * that is not vertex data (immediate attributes 0x15xx, array elements,
++     * draws and inline data 0x1800-0x1AFF) may change it, or read what they
++     * were going to draw. */
++    if (s_xfq_n && !(subch == 0 && ((method >= 0x1500u && method < 0x1600u)
++                                 || (method >= 0x1800u && method < 0x1B00u))))
++        nv2a_pb_exec_flush();
 +    /* NV097_NO_OPERATION with a non-zero parameter: see nv2a_swi_post. */
 +    /* The last methods seen, for the moment one of them is nonsense. A clip
 +     * 44925 pixels wide says the stream was mis-read some way back; the
@@ -576,10 +774,9 @@ index c65632c..9c2a038 100644
 +     * 0x3FA910 for a tile register it had "written" (0x400B10) never ended
 +     * once the ring filled. */
 +    if (subch == 0 && (method == 0x1D8Cu || method == 0x1D90u)) {
-+        volatile uint32_t *reg = (volatile uint32_t *)
-+            ((uintptr_t)xbox_GetMemoryOffset() + 0xFD000000u
-+             + (method == 0x1D8Cu ? 0x00401A88u : 0x0040186Cu));
-+        *reg = param;
++        if (method == 0x1D8Cu) s_latch_zclear = param;
++        else                   s_latch_cclear = param;
++        nv2a_latch_write(s_latch_zclear, s_latch_cclear);
 +    }
 +    /* D3D's front-end fence. Beside each back-end semaphore write, the
 +     * library (Halo 2 0x3FA69E) sends method 0x310 on its subchannel 5 with
@@ -629,7 +826,7 @@ index c65632c..9c2a038 100644
      if (!inited) {
          inited = 1;
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index 65bbedb..172cd5c 100644
+index 65bbedb..3b603ff 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
 @@ -163,14 +163,53 @@ void nv2a_pb_scan_report(void)
@@ -712,6 +909,19 @@ index 65bbedb..172cd5c 100644
                  note(subch, m);
                  /* Same walk, two consumers: the survey counts, the executor
                   * acts. Keeping them on one decode means they can never
+@@ -237,6 +283,12 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+         end_va = start_va + 0x400000u;
+ 
+     words = pb_walk(start_va, end_va, 0, &jumps, &unknown);
++    /* Nothing stays queued past the segment: the caller reports the GPU as
++     * having consumed it. */
++    if (s_exec_enabled) {
++        extern void nv2a_pb_exec_flush(void);
++        nv2a_pb_exec_flush();
++    }
+ 
+     s_tot_words += words;
+     s_tot_unknown += unknown;
 diff --git a/src/kernel/nv2a_reg_trap.c b/src/kernel/nv2a_reg_trap.c
 new file mode 100644
 index 0000000..a021daa
