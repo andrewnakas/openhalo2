@@ -1353,7 +1353,7 @@ index 83e652d..a413366 100644
 +
  #endif /* APU_XAUDIO2_H */
 diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
-index a91edbe..4766861 100644
+index a91edbe..0c134ec 100644
 --- a/src/input/xinput_device.c
 +++ b/src/input/xinput_device.c
 @@ -13,6 +13,7 @@
@@ -1624,6 +1624,87 @@ index a91edbe..4766861 100644
          (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
      pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
      pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
+@@ -247,6 +338,80 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
+ }
+ 
+ /* ======================================================================== */
++#elif defined(__EMSCRIPTEN__)
++/* ====================  Web page backend  ================================ */
++/* ======================================================================== */
++/*
++ * The page owns the keyboard, the mouse and the Gamepad API, and they live
++ * on the browser's main thread; the title polls from a worker. The two meet
++ * in shared memory: the page writes one record per port (a connected flag
++ * and an XBOX_GAMEPAD exactly as laid out in xinput_xbox.h, 18 bytes) at the
++ * address xbox_web_pad_buffer() returns, once a frame, and the title reads
++ * it here. No locking: a torn read mixes two consecutive frames of input,
++ * which a pad report does anyway.
++ */
++#include <emscripten.h>
++
++#define WEB_PAD_RECORD 24               /* uint32 connected, XBOX_GAMEPAD, pad */
++
++static uint8_t s_web_pads[XBOX_MAX_CONTROLLERS * WEB_PAD_RECORD];
++static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
++static DWORD g_packet[XBOX_MAX_CONTROLLERS];
++
++EMSCRIPTEN_KEEPALIVE uint8_t *xbox_web_pad_buffer(void)
++{
++    return s_web_pads;
++}
++
++void xbox_InputInit(void)
++{
++}
++
++DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
++{
++    const uint8_t *rec;
++    uint32_t connected;
++
++    if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
++        return ERROR_DEVICE_NOT_CONNECTED;
++    rec = s_web_pads + dwPort * WEB_PAD_RECORD;
++    memcpy(&connected, rec, 4);
++    g_controller_connected[dwPort] = connected != 0;
++    if (!connected)
++        return ERROR_DEVICE_NOT_CONNECTED;
++    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
++    pState->dwPacketNumber = ++g_packet[dwPort];
++    memcpy(&pState->Gamepad, rec + 4, sizeof(XBOX_GAMEPAD));
++    return ERROR_SUCCESS;
++}
++
++DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
++{
++    if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
++        return ERROR_DEVICE_NOT_CONNECTED;
++    return ERROR_SUCCESS;               /* rumble: accepted and discarded */
++}
++
++BOOL xbox_InputIsConnected(DWORD dwPort)
++{
++    uint32_t connected;
++
++    if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
++    memcpy(&connected, s_web_pads + dwPort * WEB_PAD_RECORD, 4);
++    return connected != 0;
++}
++
++DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
++{
++    (void)dwFlags;
++    if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps || !xbox_InputIsConnected(dwPort))
++        return ERROR_DEVICE_NOT_CONNECTED;
++    memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
++    pCaps->Type    = 1;
++    pCaps->SubType = 1;
++    return ERROR_SUCCESS;
++}
++
+ #else /* !_WIN32 */
+ /* ====================  SDL2 GameController backend  ===================== */
+ /* ======================================================================== */
 diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
 index a045752..8987665 100644
 --- a/src/kernel/CMakeLists.txt
