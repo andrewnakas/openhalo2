@@ -6814,7 +6814,7 @@ index 65bbedb..039dd4f 100644
      s_tot_unknown += unknown;
 diff --git a/src/kernel/nv2a_reg_trap.c b/src/kernel/nv2a_reg_trap.c
 new file mode 100644
-index 0000000..9ac3257
+index 0000000..4e2069c
 --- /dev/null
 +++ b/src/kernel/nv2a_reg_trap.c
 @@ -0,0 +1,266 @@
@@ -6879,8 +6879,8 @@ index 0000000..9ac3257
 +static const uint32_t s_page_off[TRAP_PAGES] = { 0x000000u, 0x100000u, 0x600000u };
 +static volatile uint32_t s_shadow[TRAP_PAGES][PAGE_BYTES / 4];
 +static int s_active;
-+static volatile LONG s_faults, s_undecoded;
-+static volatile LONG s_direct;
++static volatile long s_faults, s_undecoded;
++static volatile long s_direct;
 +
 +static int page_of(uint32_t off)
 +{
@@ -7000,13 +7000,13 @@ index 0000000..9ac3257
 + * accessors, recomp_mmio.h): the same register semantics with no fault. */
 +uint32_t xbox_Nv2aRegTrapRead(uint32_t xbox_va, int size)
 +{
-+    InterlockedIncrement(&s_direct);
++    s_direct++;
 +    return (uint32_t)trap_rd(NULL, xbox_va - NV2A_APERTURE, size);
 +}
 +
 +void xbox_Nv2aRegTrapWrite(uint32_t xbox_va, uint32_t val, int size)
 +{
-+    InterlockedIncrement(&s_direct);
++    s_direct++;
 +    trap_wr(NULL, xbox_va - NV2A_APERTURE, val, size);
 +}
 +
@@ -7634,7 +7634,7 @@ index 8acb0af..5b533f5 100644
  /* Run the program from the start slot on one vertex. Inputs are the ten
   * attribute values as floats. Returns 0 if there is no program to run (no
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..ff6aaaa 100644
+index 72d5131..19e8990 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -152,6 +152,9 @@ static size_t xbox_TiledApertureSize(void)
@@ -7647,7 +7647,25 @@ index 72d5131..ff6aaaa 100644
  static HANDLE g_nv2a_ack_thread = NULL;
  static volatile LONG g_nv2a_ack_stop = 0;
  
-@@ -880,6 +883,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -353,6 +356,9 @@ static void ac97_clear_reset_bits(void)
+ 
+ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
+ {
++#if !defined(_WIN32)   /* no fault contexts off Windows: the trap is never armed */
++    (void)ep;
++#else
+     DWORD code = ep->ExceptionRecord->ExceptionCode;
+     DWORD old;
+ 
+@@ -386,6 +392,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
+             return EXCEPTION_CONTINUE_EXECUTION;
+         }
+     }
++#endif
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
+ 
+@@ -880,6 +887,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
              volatile uint32_t *r =
                  (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
@@ -7657,7 +7675,7 @@ index 72d5131..ff6aaaa 100644
              if (*r & NV2A_ACK[i].busy_mask) {
                  *r &= ~NV2A_ACK[i].busy_mask;
              }
-@@ -966,18 +972,96 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -966,18 +976,96 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      static uint32_t put_lo, put_hi;
                      if (!put_lo || put < put_lo) put_lo = put;
                      if (put > put_hi) put_hi = put;
@@ -7763,7 +7781,7 @@ index 72d5131..ff6aaaa 100644
                          if (getenv("RECOMP_PB_WRAP_TRACE")) {
                              static unsigned wraps;
                              if (wraps++ < 8)
-@@ -1032,7 +1116,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1032,7 +1120,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          }
          if (s_nv2a_trace) {
              static uint32_t last_start = 0xFFFFFFFFu;
@@ -7772,7 +7790,7 @@ index 72d5131..ff6aaaa 100644
              if (start != last_start) {
                  last_start = start;
                  fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
-@@ -1057,6 +1141,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1057,6 +1145,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                 + g_memory_offset) = GetTickCount();
  
@@ -7780,7 +7798,7 @@ index 72d5131..ff6aaaa 100644
          Sleep(0);  /* yield; the waiter is spinning on another core */
      }
      return 0;
-@@ -1176,6 +1261,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+@@ -1176,6 +1265,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  /* SEH frame pointer bridge (see recomp_types.h for explanation) */
  RECOMP_TLS uint32_t g_seh_ebp = 0;
  RECOMP_TLS double g_fp_stack[8];
@@ -7793,7 +7811,25 @@ index 72d5131..ff6aaaa 100644
  RECOMP_TLS int g_fp_top = 0;
  
  /* Set once at startup. The generated code reads it at the ret of every
-@@ -1761,11 +1852,22 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -1387,6 +1482,9 @@ static void watch_report(void)
+ 
+ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+ {
++#if !defined(_WIN32)   /* no fault contexts off Windows: the trap is never armed */
++    (void)ep;
++#else
+     DWORD code = ep->ExceptionRecord->ExceptionCode;
+     DWORD old;
+ 
+@@ -1414,6 +1512,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+             return EXCEPTION_CONTINUE_EXECUTION;
+         }
+     }
++#endif
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
+ 
+@@ -1761,11 +1860,22 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
       */
      {
          static const uintptr_t try_bases[] = {
@@ -7816,7 +7852,7 @@ index 72d5131..ff6aaaa 100644
              0,                      /* sentinel - let OS choose */
          };
  
-@@ -2548,7 +2650,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -2548,7 +2658,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          uint64_t tiled_lo = XBOX_TILED_BASE;
          uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
  
@@ -7832,7 +7868,16 @@ index 72d5131..ff6aaaa 100644
              uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                      (uintptr_t)(m + 1) * g_memory_size;
              uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
-@@ -3094,6 +3203,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+@@ -2627,7 +2744,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+          */
+         if (tiled_size > XBOX_CONTIG_SIZE)
+             tiled_size = XBOX_CONTIG_SIZE;
+-        g_tiled_view = g_contig_mapping
++        g_tiled_view = (g_contig_mapping && !getenv("RECOMP_NO_TILED"))  /* RECOMP_NO_TILED=1: leave it unmapped, so a title that uses it faults and says where */
+             ? MapViewOfFileEx(
+                 g_contig_mapping,
+                 FILE_MAP_ALL_ACCESS,
+@@ -3094,6 +3211,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
      g_contig_block_count++;
  }
  
