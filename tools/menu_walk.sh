@@ -7,7 +7,7 @@ OUT=$1; WD=$2; WAIT=$3; shift 3
 mkdir -p "$OUT"
 rm -f "$OUT/pad.txt" "$OUT/dumpflag"
 : > "$OUT/pad.txt"
-cd /d/n64work/halo2/build/xr
+cd ${XRDIR:-/d/n64work/halo2/build/xr}   # XRDIR=/d/n64work/halo2/build/xr32 runs the 32-bit build
 env "$@" RECOMP_WATCHDOG_SECS=$WD RECOMP_PB_REPORT_MS=${REPORT_MS:-5000} \
     RECOMP_PAD_LIVE=$OUT/pad.txt RECOMP_FB_DUMP_FLIPS=$OUT/dumpflag \
     RECOMP_FB_DUMP=$OUT/fb ./halo2_recomp.exe > "$OUT/out.log" 2>&1 &

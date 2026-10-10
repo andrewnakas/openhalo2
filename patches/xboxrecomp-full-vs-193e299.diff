@@ -7634,7 +7634,7 @@ index 8acb0af..5b533f5 100644
  /* Run the program from the start slot on one vertex. Inputs are the ten
   * attribute values as floats. Returns 0 if there is no program to run (no
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..5ab9070 100644
+index 72d5131..ff6aaaa 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -152,6 +152,9 @@ static size_t xbox_TiledApertureSize(void)
@@ -7793,7 +7793,30 @@ index 72d5131..5ab9070 100644
  RECOMP_TLS int g_fp_top = 0;
  
  /* Set once at startup. The generated code reads it at the ret of every
-@@ -2548,7 +2639,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -1761,11 +1852,22 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+      */
+     {
+         static const uintptr_t try_bases[] = {
++#if UINTPTR_MAX == 0xFFFFFFFFu
++            /* 32-bit host: guest addresses wrap modulo 4 GB, so the offset
++             * must also keep the high apertures off host page 0 (at
++             * 0x10000000 the tiled aperture, guest 0xF0000000, lands on host
++             * 0). With 0x20000000: RAM 0x20000000, contiguous 0xA0000000,
++             * tiled 0x10000000, NV2A 0x1D000000, MCPX 0x1E800000, flash
++             * 0x1F000000. */
++            0x20000000,
++            0x30000000,
++#else
+             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
+             0x00800000,             /* 8 MB - above typical PEB/TEB region */
+             0x01000000,             /* 16 MB */
+             0x02000000,             /* 32 MB */
+             0x10000000,             /* 256 MB */
++#endif
+             0,                      /* sentinel - let OS choose */
+         };
+ 
+@@ -2548,7 +2650,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          uint64_t tiled_lo = XBOX_TILED_BASE;
          uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
  
@@ -7809,7 +7832,7 @@ index 72d5131..5ab9070 100644
              uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                      (uintptr_t)(m + 1) * g_memory_size;
              uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
-@@ -3094,6 +3192,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+@@ -3094,6 +3203,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
      g_contig_block_count++;
  }
  
