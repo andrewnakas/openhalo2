@@ -93,6 +93,13 @@ async function importTree() {
     if (q.get('import') === 'only') return;
     // Frames from the WebGL2 backend come straight from its worker as
     // {nv2aFrame: ImageBitmap}; every worker the runtime starts gets a listener.
+    // frames shown on the page, every 10 s
+    let lastFrames = 0;
+    setInterval(() => {
+      const n = Module.h2frames || 0;
+      say('page: ' + ((n - lastFrames) / 10).toFixed(1) + ' frames a second shown (' + n + ' in all)');
+      lastFrames = n;
+    }, 10000);
     const RealWorker = window.Worker;
     window.Worker = class extends RealWorker {
       constructor(...a) {
