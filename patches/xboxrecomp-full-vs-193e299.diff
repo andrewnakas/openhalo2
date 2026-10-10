@@ -1,5 +1,5 @@
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index 258048c..5841f53 100644
+index 258048c..1be8db8 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
 @@ -119,6 +119,8 @@ extern uint32_t xbox_AllocThreadTib(void);
@@ -36,12 +36,15 @@ index 258048c..5841f53 100644
          qatomic_set(&d->regs[addr], (uint32_t)val);
          /* Starting the APU has to start the frame thread.
           *
-@@ -312,6 +324,24 @@ typedef struct {
+@@ -312,6 +324,27 @@ typedef struct {
  
  static WaveOutState g_waveout = { 0 };
  
 +/* Front-end traps the frame thread waited out, for the report. */
 +static uint64_t g_apu_trap_waits, g_apu_trap_wait_us, g_apu_trap_unanswered;
++static uint64_t g_apu_trap_wait_max_us, g_apu_clock_restarts, g_apu_clock_lost_us;
++extern uint64_t g_apu_gps_acks;
++static uint64_t g_apu_pause_kind_n[2], g_apu_pause_kind_us[2];   /* counter off, trapped */
 +/* Sub-frames the voice processor did not run, by why: counter off, front
 + * end halted, front end trapped. */
 +static uint64_t g_apu_idle_sub[3];
@@ -61,7 +64,7 @@ index 258048c..5841f53 100644
  void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
  {
      (void)errp;
-@@ -319,156 +349,195 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
+@@ -319,162 +352,245 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
      d->monitor.queued_bytes_low = 1024;
      d->monitor.queued_bytes_high = 3072;
  
@@ -283,13 +286,25 @@ index 258048c..5841f53 100644
 +        fprintf(stderr, "[APU] out: %.1f blocks/s (48000 Hz, %d samples each), "
 +                "%llu of %llu blocks not silent, peak %d rms %.0f, voices %d | "
 +                "device queue %d, underruns %u, dropped %u | pauses waited out %llu "
-+                "(%.1f ms, %llu unanswered)\n",
++                "(%.1f ms, longest %.1f, %llu unanswered), GP commands %llu, clock restarts %llu (%.0f ms lost)\n",
 +                (double)(blocks - blocks_prev) * 1000.0 / (double)(now - last_report),
 +                n, (unsigned long long)(loud_blocks - loud_prev),
 +                (unsigned long long)(blocks - blocks_prev), peak, rms, voices,
 +                xq, xu, xd, (unsigned long long)g_apu_trap_waits,
 +                (double)g_apu_trap_wait_us / 1000.0,
-+                (unsigned long long)g_apu_trap_unanswered);
++                (double)g_apu_trap_wait_max_us / 1000.0,
++                (unsigned long long)g_apu_trap_unanswered,
++                (unsigned long long)g_apu_gps_acks,
++                (unsigned long long)g_apu_clock_restarts,
++                (double)g_apu_clock_lost_us / 1000.0);
++        if (getenv("RECOMP_APU_VOICES"))
++            fprintf(stderr, "[APU] pauses by kind: counter off %llu (%.1f ms), front end trapped %llu (%.1f ms)%c",
++                    (unsigned long long)g_apu_pause_kind_n[0], (double)g_apu_pause_kind_us[0] / 1000.0,
++                    (unsigned long long)g_apu_pause_kind_n[1], (double)g_apu_pause_kind_us[1] / 1000.0, 10);
++        g_apu_pause_kind_n[0] = g_apu_pause_kind_n[1] = 0;
++        g_apu_pause_kind_us[0] = g_apu_pause_kind_us[1] = 0;
++        g_apu_trap_wait_max_us = 0; g_apu_gps_acks = 0;
++        g_apu_clock_restarts = 0; g_apu_clock_lost_us = 0;
 +        g_apu_trap_waits = 0; g_apu_trap_wait_us = 0; g_apu_trap_unanswered = 0;
 +        if (g_apu_idle_sub[0] | g_apu_idle_sub[1] | g_apu_idle_sub[2])
 +            fprintf(stderr, "[APU] idle sub-frames: counter off %llu, halted %llu, trapped %llu%c",
@@ -298,6 +313,12 @@ index 258048c..5841f53 100644
 +                    (unsigned long long)g_apu_idle_sub[2], 10);
 +        g_apu_idle_sub[0] = g_apu_idle_sub[1] = g_apu_idle_sub[2] = 0;
 +        { extern void mcpx_apu_dsp_bin_report(void); mcpx_apu_dsp_bin_report(); }
++        {
++            extern int g_apu_voice_dump;
++            static int vd = -1;
++            if (vd < 0) vd = getenv("RECOMP_APU_VOICES") != NULL;
++            if (vd) g_apu_voice_dump = 1;
++        }
 +        fflush(stderr);
 +        blocks_prev = blocks;
 +        loud_prev = loud_blocks;
@@ -379,7 +400,39 @@ index 258048c..5841f53 100644
  }
  
  /* ============================================================
-@@ -483,8 +552,11 @@ static void throttle(MCPXAPUState *d)
+  * Throttle (timing control for frame pacing)
+  * ============================================================ */
+ 
++/* Answer the GP doorbell, and if a command was there keep looking for a
++ * moment with the lock released: DirectSound posts its commands in bursts
++ * (two or three a game frame, back to back) and spins on each one
++ * (0x37E390), so the ones behind the first are answered in microseconds
++ * instead of at the next 1 ms slice. */
++static void apu_ack_burst(MCPXAPUState *d)
++{
++    uint64_t before = g_apu_gps_acks;
++    int64_t t_end;
++
++    mcpx_apu_dsp_ack_poll(d);
++    if (g_apu_gps_acks == before)
++        return;
++    qemu_mutex_unlock(&d->lock);
++    t_end = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + 300;
++    while (qemu_clock_get_us(QEMU_CLOCK_REALTIME) < t_end) {
++        before = g_apu_gps_acks;
++        mcpx_apu_dsp_ack_poll(d);
++        if (g_apu_gps_acks != before)
++            t_end = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + 300;
++        else
++            SwitchToThread();
++    }
++    qemu_mutex_lock(&d->lock);
++}
++
+ static void throttle(MCPXAPUState *d)
+ {
+     if (d->ep_frame_div % 8) {
+@@ -483,8 +599,15 @@ static void throttle(MCPXAPUState *d)
  
      int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
  
@@ -389,10 +442,27 @@ index 258048c..5841f53 100644
      if (d->next_frame_time_us == 0 ||
 -        now_us - d->next_frame_time_us > EP_FRAME_US) {
 +        now_us - d->next_frame_time_us > 40000) {
++        if (d->next_frame_time_us) {
++            g_apu_clock_restarts++;
++            g_apu_clock_lost_us += (uint64_t)(now_us - d->next_frame_time_us);
++        }
          d->next_frame_time_us = now_us;
      }
  
-@@ -570,6 +642,66 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -492,7 +615,11 @@ static void throttle(MCPXAPUState *d)
+         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+         int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
+         if (remaining_ms > 0) {
+-            qemu_cond_timedwait(&d->cond, &d->lock, (int)remaining_ms);
++            /* In 1 ms slices, answering the GP doorbell in each: the title
++             * spins on it (0x37E390) and used to spin for the whole wait,
++             * up to 5.3 ms a command. */
++            qemu_cond_timedwait(&d->cond, &d->lock, 1);
++            apu_ack_burst(d);
+         } else {
+             break;
+         }
+@@ -570,6 +697,73 @@ static void *mcpx_apu_frame_thread(void *arg)
          int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                  NV_PAPU_SECTL_XCNTMODE);
          uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -429,6 +499,7 @@ index 258048c..5841f53 100644
 +            if (paused && !gave_up) {
 +                extern void xbox_TimerThreadWake(void);
 +                int tries;
++                int kind = xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF ? 0 : 1;
 +                int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 +                for (tries = 0; tries < 25 && paused; tries++) {
 +                    if (d->set_irq) {
@@ -437,6 +508,7 @@ index 258048c..5841f53 100644
 +                    }
 +                    apu_deliver_irq(d);
 +                    xbox_TimerThreadWake();
++                    apu_ack_burst(d);
 +                    qemu_cond_timedwait(&d->cond, &d->lock, 1);
 +                    xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
 +                                        NV_PAPU_SECTL_XCNTMODE);
@@ -446,8 +518,13 @@ index 258048c..5841f53 100644
 +                             == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
 +                }
 +                g_apu_trap_waits++;
-+                g_apu_trap_wait_us +=
-+                    (uint64_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0);
++                {
++                    uint64_t w = (uint64_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0);
++                    g_apu_trap_wait_us += w;
++                    g_apu_pause_kind_n[kind]++;
++                    g_apu_pause_kind_us[kind] += w;
++                    if (w > g_apu_trap_wait_max_us) g_apu_trap_wait_max_us = w;
++                }
 +                if (paused) {
 +                    g_apu_trap_unanswered++;
 +                    gave_up = 1;
@@ -459,7 +536,7 @@ index 258048c..5841f53 100644
          bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                            !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                            !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
-@@ -578,7 +710,13 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -578,7 +772,13 @@ static void *mcpx_apu_frame_thread(void *arg)
              /* Full pipeline: VP voices → DSP → monitor → waveOut */
              se_frame(d);
          } else {
@@ -475,10 +552,19 @@ index 258048c..5841f53 100644
              d->ep_frame_div++;
          }
 diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
-index 7156be9..996aa97 100644
+index 7156be9..efb9c8f 100644
 --- a/src/apu/apu_dsp.c
 +++ b/src/apu/apu_dsp.c
-@@ -89,17 +89,84 @@ static int mcpx_apu_mixdown_all(void)
+@@ -52,6 +52,8 @@
+  * 0x014F8810 -- inside none of them. So it has to be observed: run with
+  * RECOMP_WATCHDOG_SECS and the spin shows up as ebx plus the poll offset.
+  */
++uint64_t g_apu_gps_acks;        /* doorbells answered, for the report */
++uint64_t g_apu_clipped;         /* output samples that hit the clamp */
+ #define APU_DSP_ACK_MAX 8
+ static uint32_t s_dsp_ack[APU_DSP_ACK_MAX];
+ static int s_dsp_ack_count = -1;
+@@ -89,19 +91,150 @@ static int mcpx_apu_mixdown_all(void)
      static int on = -1;
      if (on < 0) {
          const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
@@ -518,6 +604,11 @@ index 7156be9..996aa97 100644
 +    int b;
 +    if (on < 0)
 +        on = getenv("RECOMP_APU_BINS") != NULL;
++    if (g_apu_clipped) {
++        fprintf(stderr, "[APU] clipped output samples: %llu%c",
++                (unsigned long long)g_apu_clipped, 10);
++        g_apu_clipped = 0;
++    }
 +    if (!on)
 +        return;
 +    fprintf(stderr, "[APU] mixbin energy:");
@@ -543,6 +634,64 @@ index 7156be9..996aa97 100644
 +static uint32_t s_gps_ack[APU_DSP_ACK_GPS_MAX];
 +static int s_gps_ack_count = -1;
 +
++/* RECOMP_APU_DSP_SENTINEL=<guest address of a pointer>,<value>: a word the
++ * running GP DSP program keeps at a fixed value and the title watches.
++ *
++ * Halo 2's DirectSound, once a game frame (0x37EC7A):
++ *
++ *     eax = [0x387108];  if ([eax] != 0x00CCCCCC) call 0x37E9AB
++ *
++ * and 0x37E9AB is its recovery from a crashed DSP: stop the sample counter,
++ * reset the GP and the EP, KeStallExecutionProcessor(10000), start the
++ * counter. With no DSP program running here the word never held that value,
++ * so the title reset the DSPs thirty times a second: a 10 ms busy stall of
++ * the game's main thread in every 33 ms frame, and the voice processor
++ * stopped for those 10 ms each time (the "counter off" pauses, 150 per five
++ * seconds at 8.7 ms each). Writing the value the program would have written
++ * is all the title checks. */
++static uint32_t s_sentinel_ptr, s_sentinel_value;
++static int s_sentinel_state = -1;
++uint64_t g_apu_sentinel_writes;
++
++static void dsp_sentinel_poll(MCPXAPUState *d)
++{
++    uint32_t va;
++    volatile uint32_t *w;
++
++    if (s_sentinel_state < 0) {
++        const char *spec = getenv("RECOMP_APU_DSP_SENTINEL");
++        char *end;
++        s_sentinel_state = 0;
++        if (spec && *spec) {
++            s_sentinel_ptr = (uint32_t)strtoul(spec, &end, 0);
++            if (*end == ',') {
++                s_sentinel_value = (uint32_t)strtoul(end + 1, NULL, 0);
++                s_sentinel_state = s_sentinel_ptr != 0;
++            }
++        }
++    }
++    if (!s_sentinel_state)
++        return;
++    va = *(volatile uint32_t *)(d->ram_ptr + s_sentinel_ptr);
++    if (!((va >= 0x10000u && va < 0x04000000u - 4u)
++          || (va >= 0x80000000u && va < 0x84000000u - 4u)
++          /* the DSPs' own memory windows, plain RAM here: Halo 2's word is
++           * EP program memory, P:6 at 0xFE85A018, which the EP's boot
++           * loader fills from the image DirectSound puts in its scratch */
++          || (va >= 0xFE830000u && va < 0xFE880000u - 4u)))
++        return;
++    w = (volatile uint32_t *)(d->ram_ptr + va);
++    if (*w != s_sentinel_value) {
++        static int shown;
++        if (shown++ < 4)
++            fprintf(stderr, "[APU] DSP sentinel at 0x%08X (via [0x%08X]) was 0x%08X,"
++                            " set to 0x%08X%c", va, s_sentinel_ptr, *w,
++                    s_sentinel_value, 10);
++        *w = s_sentinel_value;
++        g_apu_sentinel_writes++;
++    }
++}
++
  void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
  {
      int i;
@@ -563,8 +712,11 @@ index 7156be9..996aa97 100644
 +    }
      if (!d->ram_ptr)
          return;
++    dsp_sentinel_poll(d);
      for (i = 0; i < s_dsp_ack_count; i++) {
-@@ -112,6 +179,29 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
+         uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
+         if (*slot) {
+@@ -112,6 +245,30 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
              *slot = 0;
          }
      }
@@ -588,13 +740,14 @@ index 7156be9..996aa97 100644
 +                                    " command 0x%08X acknowledged\n",
 +                            s_gps_ack[i], phys, *slot);
 +                *slot = 0;
++                g_apu_gps_acks++;
 +            }
 +        }
 +    }
  }
  
  void mcpx_apu_dsp_init(MCPXAPUState *d)
-@@ -187,7 +277,11 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+@@ -187,7 +344,11 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
               * counts. This is not what a real EP does; it is the cheapest
               * mixdown that stops discarding audio. */
              float left, right;
@@ -607,6 +760,392 @@ index 7156be9..996aa97 100644
                  left = 0.0f;
                  right = 0.0f;
                  for (int b = 0; b < NUM_MIXBINS; ++b) {
+@@ -198,7 +359,32 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+                 left = mixbins[0][i];
+                 right = mixbins[1][i];
+             }
+-            /* Clamp to [-1, 1] range */
++            /* Peaks over full scale used to be cut flat (the owner's session
++             * log shows peak 32767 in a dozen five-second intervals). Above
++             * 0.75 the curve now bends over smoothly and reaches full scale
++             * only asymptotically; below it nothing changes.
++             * RECOMP_APU_LIMIT=0 = the hard clamp alone. */
++            {
++                static int soft = -1;
++                if (soft < 0) {
++                    const char *e = getenv("RECOMP_APU_LIMIT");
++                    soft = !(e && *e == '0');
++                }
++                if (left > 1.0f || left < -1.0f || right > 1.0f || right < -1.0f)
++                    g_apu_clipped++;
++                if (soft) {
++                    float a = fabsf(left);
++                    if (a > 0.75f) {
++                        a = 0.75f + 0.25f * tanhf((a - 0.75f) * 4.0f);
++                        left = left < 0.0f ? -a : a;
++                    }
++                    a = fabsf(right);
++                    if (a > 0.75f) {
++                        a = 0.75f + 0.25f * tanhf((a - 0.75f) * 4.0f);
++                        right = right < 0.0f ? -a : a;
++                    }
++                }
++            }
+             if (left > 1.0f) left = 1.0f;
+             if (left < -1.0f) left = -1.0f;
+             if (right > 1.0f) right = 1.0f;
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index f45b42b..8470266 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -66,9 +66,15 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
+  * Filter helpers
+  * ============================================================ */
+ 
++static void voice_src_reset(uint16_t v);
++int g_apu_hrtf_default = 1;  /* on: measured, STATUS decision 41 */
++int g_apu_voice_dump;       /* set by the report (RECOMP_APU_VOICES) for one frame */
++extern uint64_t g_apu_src_in, g_apu_src_out;
++
+ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
+ {
+     assert(v < MCPX_HW_MAX_VOICES);
++    voice_src_reset(v);
+     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
+     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
+     if (d->vp.filters[v].resampler) {
+@@ -171,6 +177,26 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
+                                int8_t value)
+ {
+     int entry = d->vp.hrtf.current_entry;
++    /* The coefficient byte is sign and magnitude, not two's complement.
++     * Read as two's complement, the filters Halo 2 loads look like
++     *     8 52 65 65 54 44 45 37 16 8 14 20 15 11 16 18 7 -116 -114 -123 ...
++     * a smooth decaying response that jumps to large negative values the
++     * moment it crosses zero; as sign and magnitude the same bytes continue
++     * 7 -12 -14 -5 ..., which is what an impulse response does. With the
++     * wrong reading the two ears came out in anti-phase (left/right
++     * correlation -0.9 over whole seconds, reports/refine1/c).
++     * RECOMP_APU_HRIR_TWOS=1 restores the old reading. */
++    {
++        static int twos = -1;
++        uint8_t b = (uint8_t)value;
++        if (twos < 0)
++            twos = getenv("RECOMP_APU_HRIR_TWOS") != NULL;
++        if (!twos) {
++            float m = (float)(b & 0x7F) / 128.0f;
++            d->vp.hrtf.entries[entry].hrir[channel][coeff_idx] = (b & 0x80) ? -m : m;
++            return;
++        }
++    }
+     d->vp.hrtf.entries[entry].hrir[channel][coeff_idx] = int8_to_float(value);
+ }
+ 
+@@ -911,7 +937,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+         }
+     }
+ 
+-    if (cbo >= ebo) {
++    /* Past the last sample (ebo is the last one played). This tested
++     * cbo >= ebo, which also fires when a request happens to end with ebo
++     * still unread, and dropped that sample. */
++    if (cbo > ebo) {
+         if (stream) {
+             d->vp.ssl[v].ssl_seg += 1;
+             cbo = 0;
+@@ -946,26 +975,144 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+  * resample. This gives us functional audio at the cost of quality.
+  * ============================================================ */
+ 
++/* Sample-rate conversion.
++ *
++ * `rate` is output samples per input sample: 48000 / the voice's own rate,
++ * from its pitch register. This function used to ignore it and hand every
++ * voice's samples to the 48 kHz mix one for one, so a 22.05 kHz effect or
++ * line of dialogue played 2.18 times too fast (more than an octave high) and
++ * 44.1 kHz music 8.8% fast (a semitone and a half sharp), and every pitch
++ * bend the title asked for (Doppler, engine revs) did nothing.
++ *
++ * Each voice keeps the last four input samples and a fractional read
++ * position between the middle two; an output sample is the 4-point Hermite
++ * interpolation there, and the position then advances by 1/rate input
++ * samples. Input is fetched only as far as the frame needs, so the buffer
++ * offset the title reads back stays within a few samples of what was heard.
++ * At exactly 48 kHz the position stays 0 and the samples pass through
++ * unchanged (two samples late).
++ *
++ * RECOMP_APU_NO_RESAMPLE=1 restores the old behaviour, for comparison. */
++typedef struct {
++    double pos;                 /* in [0,1): between h[1] and h[2] */
++    float h[4][2];
++    float in[64][2];
++    int in_n, in_i;
++    int ended;                  /* the voice stopped: zeros follow */
++} VoiceSrc;
++static VoiceSrc s_src[MCPX_HW_MAX_VOICES];
++uint64_t g_apu_src_in, g_apu_src_out;   /* totals, for the report */
++
++static void voice_src_reset(uint16_t v)
++{
++    memset(&s_src[v], 0, sizeof s_src[v]);
++}
++
++static int apu_hrtf_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_APU_HRTF");
++        on = e ? atoi(e) : g_apu_hrtf_default;
++    }
++    return on;
++}
++
++static int apu_no_resample(void)
++{
++    static int off = -1;
++    if (off < 0)
++        off = getenv("RECOMP_APU_NO_RESAMPLE") != NULL;
++    return off;
++}
++
++/* The next input sample of voice v into S->h[3]; zeros once it has ended. */
++static void voice_src_next(MCPXAPUState *d, uint16_t v, VoiceSrc *S, int want)
++{
++    memmove(S->h[0], S->h[1], sizeof(float) * 6);
++    if (S->in_i >= S->in_n && !S->ended) {
++        int tries = 0;
++        S->in_i = S->in_n = 0;
++        if (want < 1) want = 1;
++        if (want > 64) want = 64;
++        while (!S->ended && S->in_n == 0) {
++            int count;
++            if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
++                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
++                S->ended = 1;
++                break;
++            }
++            count = voice_get_samples(d, v, S->in, want);
++            if (count < 0 || (count == 0 && ++tries > 4))
++                S->ended = 1;
++            else
++                S->in_n = count;
++        }
++        g_apu_src_in += (uint64_t)S->in_n;
++    }
++    if (S->in_i < S->in_n) {
++        S->h[3][0] = S->in[S->in_i][0];
++        S->h[3][1] = S->in[S->in_i][1];
++        S->in_i++;
++    } else {
++        S->h[3][0] = S->h[3][1] = 0.0f;
++    }
++}
++
+ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
+                           int requested_num, float rate)
+ {
+-    /* Without libsamplerate, just fetch raw samples at native rate.
+-     * Rate < 1.0 means we need more source samples than output samples.
+-     * For initial functionality, just get the samples directly. */
+-    int sample_count = 0;
+-    while (sample_count < requested_num) {
+-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+-        if (!active) break;
+-
+-        int count = voice_get_samples(d, v, &samples[sample_count],
+-                                      requested_num - sample_count);
+-        if (count < 0) break;
+-        if (count == 0) return -1;
+-        sample_count += count;
++    VoiceSrc *S = &s_src[v];
++    double step;
++    int n, ch;
++
++    if (apu_no_resample()) {
++        int sample_count = 0;
++        while (sample_count < requested_num) {
++            int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
++                                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
++            if (!active) break;
++
++            int count = voice_get_samples(d, v, &samples[sample_count],
++                                          requested_num - sample_count);
++            if (count < 0) break;
++            if (count == 0) return -1;
++            sample_count += count;
++        }
++        return sample_count;
+     }
+-    (void)rate; /* Ignored until we add proper resampling */
+-    return sample_count;
++
++    S->ended = 0;       /* a starved stream may have been fed since last frame */
++    step = (rate > 0.0f && rate == rate) ? 1.0 / (double)rate : 1.0;
++    if (step < 1.0 / 64.0) step = 1.0 / 64.0;
++    if (step > 64.0) step = 64.0;
++
++    for (n = 0; n < requested_num; n++) {
++        float t = (float)S->pos;
++        if (S->ended && S->in_i >= S->in_n
++            && S->h[1][0] == 0.0f && S->h[2][0] == 0.0f && S->h[3][0] == 0.0f
++            && S->h[1][1] == 0.0f && S->h[2][1] == 0.0f && S->h[3][1] == 0.0f)
++            break;                           /* nothing left to ring out */
++        for (ch = 0; ch < 2; ch++) {
++            float xm1 = S->h[0][ch], x0 = S->h[1][ch];
++            float x1 = S->h[2][ch], x2 = S->h[3][ch];
++            float c1 = 0.5f * (x1 - xm1);
++            float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
++            float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
++            samples[n][ch] = ((c3 * t + c2) * t + c1) * t + x0;
++        }
++        S->pos += step;
++        while (S->pos >= 1.0) {
++            /* What the rest of this frame will still consume. */
++            int want = (int)(S->pos + step * (double)(requested_num - 1 - n));
++            voice_src_next(d, v, S, want);
++            S->pos -= 1.0;
++        }
++    }
++    g_apu_src_out += (uint64_t)n;
++    if (n == 0)
++        return -1;
++    return n;
+ }
+ 
+ /* ============================================================
+@@ -1017,6 +1164,7 @@ static void voice_process(MCPXAPUState *d,
+     if (ea_value > 1.0f) ea_value = 1.0f;
+ 
+     float samples[NUM_SAMPLES_PER_FRAME][2];
++    int got = 0;
+     memset(samples, 0, sizeof(samples));
+ 
+     bool multipass = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+@@ -1042,7 +1190,14 @@ static void voice_process(MCPXAPUState *d,
+         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
+             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+-            if (!active) return;
++            /* A voice that ran out during this frame still has the samples
++             * it produced before it did: they are mixed (they used to be
++             * dropped, cutting the last fraction of a millisecond off every
++             * one-shot sound). */
++            if (!active) {
++                if (apu_no_resample() || !got) return;
++                break;
++            }
+             int count = voice_resample(d, v, &samples[sample_count],
+                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
+             if (count < 0) break;
+@@ -1052,12 +1207,13 @@ static void voice_process(MCPXAPUState *d,
+              * sat here indefinitely while the title waited in voice_lock. */
+             if (count == 0 && ++empty > 4) break;
+             sample_count += count;
++            got = sample_count;
+         }
+     }
+ 
+     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+-    if (!active) return;
++    if (!active && (multipass || apu_no_resample() || !got)) return;
+ 
+     /* Get volume bins */
+     int bin[8];
+@@ -1096,6 +1252,37 @@ static void voice_process(MCPXAPUState *d,
+         dbg->vol[i] = vol[i];
+     }
+ 
++    /* RECOMP_APU_VOICES=1: one line per playing voice with each report. */
++    if (g_apu_voice_dump) {
++        uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
++        uint32_t st = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFF);
++        fprintf(stderr, "[APUV] v%-3u list %d %s rate %.4f (%.0f Hz) fmt %08X state %08X"
++                " ea %.2f cbo %u ebo %u hrtf %u | bins",
++                v, voice_list, stereo ? "st" : "mo", rate, 48000.0f / rate, fmt, st,
++                ea_value,
++                voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
++                voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
++                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
++                               NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE));
++        for (int b = 0; b < 8; b++)
++            fprintf(stderr, " %d:%03X", bin[b], vol[b] & 0xFFF);
++        fprintf(stderr, " | vbin %08X", voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, 0xFFFFFFFF));
++        fputc(10, stderr);
++        if (v < MCPX_HW_MAX_3D_VOICES) {
++            uint32_t h = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
++                                        NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
++            if (h < HRTF_ENTRY_COUNT) {
++                for (int c = 0; c < 2; c++) {
++                    fprintf(stderr, "[APUH] v%u entry %u %s itd %.3f:", v, h,
++                            c ? "R" : "L", d->vp.hrtf.entries[h].itd);
++                    for (int k = 0; k < HRTF_NUM_TAPS; k++)
++                        fprintf(stderr, " %.0f", d->vp.hrtf.entries[h].hrir[c][k] * 128.0f);
++                    fputc(10, stderr);
++                }
++            }
++        }
++    }
++
+     if (voice_should_mute(v)) return;
+ 
+     /* Low-pass filter */
+@@ -1126,13 +1313,18 @@ static void voice_process(MCPXAPUState *d,
+         }
+     }
+ 
+-    /* HRTF processing for 3D voices */
+-    if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
++    /* HRTF processing for 3D voices: the title's head-related filter pair
++     * and inter-aural delay for the voice's direction. It was compiled in
++     * and switched off, so every 3D voice reached both ears identical: no
++     * left/right, no front/back. RECOMP_APU_HRTF=0 turns it off again. */
++    int hrtf_stereo = 0;
++    if (v < MCPX_HW_MAX_3D_VOICES && apu_hrtf_on()) {
+         uint16_t hrtf_handle =
+             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
+                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
+         if (hrtf_handle != HRTF_NULL_HANDLE) {
+             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
++            hrtf_stereo = 1;
+         }
+     }
+ 
+@@ -1146,8 +1338,14 @@ static void voice_process(MCPXAPUState *d,
+             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
+         }
+         g *= attenuate(vol[b]) / hr;
++        /* The filter's output is a left and a right signal whatever the
++         * source was; the four HRTF submixes are left front, left back,
++         * right front, right back (Halo 2 sets 6, 8, 7, 9). */
++        int src_ch = (hrtf_stereo && b < 4) ? (b >> 1) : (b % (int)channels);
++        if (g == 0.0f)
++            continue;
+         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+-            mixbins[bin[b]][i] += g * samples[i][b % channels];
++            mixbins[bin[b]][i] += g * samples[i][src_ch];
+         }
+     }
+ 
+@@ -1209,6 +1407,17 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+         }
+     }
+ 
++    if (g_apu_voice_dump) {
++        fprintf(stderr, "[APUV] hrtf submix %u %u %u %u headroom %u | submix headroom",
++                d->vp.hrtf_submix[0], d->vp.hrtf_submix[1], d->vp.hrtf_submix[2],
++                d->vp.hrtf_submix[3], d->vp.hrtf_headroom);
++        for (int b = 0; b < NUM_MIXBINS; b++)
++            fprintf(stderr, " %u", d->vp.submix_headroom[b]);
++        fprintf(stderr, " | resampler in %llu out %llu%c",
++                (unsigned long long)g_apu_src_in, (unsigned long long)g_apu_src_out, 10);
++        g_apu_voice_dump = 0;
++    }
++
+     /* VP monitor output */
+     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
+         int16_t isamp[NUM_SAMPLES_PER_FRAME * 2];
 diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
 index cd69e57..7d67821 100644
 --- a/src/apu/apu_xaudio2.c
@@ -1723,10 +2262,10 @@ index caf6390..6d79f72 100644
          return TRUE;
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..0272041
+index 0000000..3687246
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,2699 @@
+@@ -0,0 +1,2736 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -1860,11 +2399,13 @@ index 0000000..0272041
 +    X(GLint,  GetUniformLocation, (GLuint, const char *)) \
 +    X(void,   Uniform1i, (GLint, GLint)) \
 +    X(void,   Uniform1f, (GLint, GLfloat)) \
++    X(void,   Uniform2f, (GLint, GLfloat, GLfloat)) \
 +    X(void,   Uniform3f, (GLint, GLfloat, GLfloat, GLfloat)) \
 +    X(void,   Uniform1fv, (GLint, GLsizei, const GLfloat *)) \
 +    X(void,   Uniform3fv, (GLint, GLsizei, const GLfloat *)) \
 +    X(void,   Uniform4fv, (GLint, GLsizei, const GLfloat *)) \
 +    X(void,   Uniform4iv, (GLint, GLsizei, const GLint *)) \
++    X(void,   Uniform1uiv, (GLint, GLsizei, const GLuint *)) \
 +    X(void,   GenBuffers, (GLsizei, GLuint *)) \
 +    X(void,   BindBuffer, (GLenum, GLuint)) \
 +    X(void,   BufferData, (GLenum, ptrdiff_t, const void *, GLenum)) \
@@ -1923,7 +2464,7 @@ index 0000000..0272041
 +} GlTexEntry;
 +
 +typedef struct {
-+    uint32_t mode, afunc, kind[4], akill;
++    uint32_t mode, afunc, kind[4], akill, zpersp;
 +    uint32_t control, stage_program, clip_plane_mode, final0, final1;
 +    uint32_t cicw[8], aicw[8], cocw[8], aocw[8];
 +} ProgKey;
@@ -1933,6 +2474,7 @@ index 0000000..0272041
 +    int     used;
 +    GLuint  prog;
 +    GLint   u_scale, u_c0, u_c1, u_fc0, u_fc1, u_fogc, u_aref, u_zcut;
++    GLint   u_stipon, u_stip, u_wdepth;
 +    GLint   u_tsc, u_tsz, u_taf;
 +} GlProg;
 +
@@ -2703,6 +3245,7 @@ index 0000000..0272041
 +    "noperspective out vec4 v_d1;\n"
 +    "noperspective out float v_fog;\n"
 +    "noperspective out float v_z;\n"
++    "out float v_zp;\n"
 +    "out vec4 v_t0;\n"
 +    "out vec4 v_t1;\n"
 +    "out vec4 v_t2;\n"
@@ -2715,12 +3258,12 @@ index 0000000..0272041
 +     * 0 is framebuffer row 0 (no flip), so read-back needs no reordering. */
 +    "  float w = a_pos.w;\n"
 +    "  v_z = a_pos.z * u_scale.z;\n"
++    "  v_zp = v_z;\n"
 +    "  vec3 n = vec3(a_pos.xy * u_scale.xy - 1.0, a_pos.z * u_scale.z * 2.0 - 1.0);\n"
 +    "  gl_Position = vec4(n * w, w);\n"
 +    "}\n";
 +
 +static const char *const FS_HEAD =
-+    "#version 330 core\n"
 +    "noperspective in vec4 v_d0;\n"
 +    "noperspective in vec4 v_d1;\n"
 +    "noperspective in float v_fog;\n"
@@ -2739,7 +3282,27 @@ index 0000000..0272041
 +    "uniform vec3 u_fogc;\n"
 +    "uniform int u_aref;\n"
 +    "uniform float u_zcut;\n"
++    "uniform int u_stipon;\n"
++    "uniform vec2 u_wdepth;\n"
++    "uniform uint u_stip[32];\n"
++    "in float v_zp;\n"
 +    "out vec4 o_col;\n"
++    /* What drops a fragment before any shading: the far cut (see u_zcut in
++     * nv2a_gl_draw) and the polygon stipple. With ZPERSP the depth written
++     * is the perspective-interpolated one. */
++    "bool cut() {\n"
++    "  if (v_z > u_zcut) return true;\n"
++    "  if (u_stipon != 0) {\n"
++    "    ivec2 p = ivec2(gl_FragCoord.xy) & 31;\n"
++    "    if (((u_stip[p.y] >> uint(p.x)) & 1u) == 0u) return true;\n"
++    "  }\n"
++    /* gl_FragCoord.w is 1/w interpolated across the screen, so its
++     * reciprocal is the pixel's own w. */
++    "#ifdef ZPERSP\n"
++    "  gl_FragDepth = clamp((1.0 / gl_FragCoord.w + u_wdepth.y) * u_wdepth.x, 0.0, 1.0);\n"
++    "#endif\n"
++    "  return false;\n"
++    "}\n"
 +    /* wrap_coord() of the software path. */
 +    "int wrapi(int p, int n, int m) {\n"
 +    "  if (m == 1) return p - n * int(floor(float(p) / float(n)));\n"
@@ -2819,7 +3382,7 @@ index 0000000..0272041
 +            sb_f(sb, "uniform %s u_tex%d;\n",
 +                 (k->kind[st] & KIND_CUBE) ? "samplerCube" : "sampler2D", st);
 +    }
-+    sb_f(sb, "void main() {\n  if (v_z > u_zcut) discard;\n  vec4 R[16];\n  vec4 T;\n"
++    sb_f(sb, "void main() {\n  if (cut()) discard;\n  vec4 R[16];\n  vec4 T;\n"
 +             "  for (int i = 0; i < 16; i++) R[i] = vec4(0.0);\n");
 +    for (st = 0; st < 4; st++) {
 +        uint32_t mode = (k->stage_program >> (st * 5)) & 0x1F;
@@ -2995,7 +3558,8 @@ index 0000000..0272041
 +        return NULL;                    /* table full: 512 distinct set-ups */
 +
 +    sb.p = src; sb.n = 0; sb.cap = sizeof src - 1;
-+    sb_f(&sb, "%s", FS_HEAD);
++    sb_f(&sb, "#version 330 core\n%s%s", k->zpersp ? "#define ZPERSP 1\n" : "",
++         FS_HEAD);
 +    switch (k->mode) {
 +    case NV2A_GL_MODE_2D:
 +        /* raster_triangle: the texel as it is, or the flat vertex colour. */
@@ -3007,7 +3571,7 @@ index 0000000..0272041
 +    case NV2A_GL_MODE_XF:
 +        /* xf_rows without combiners: nearest texel times diffuse. */
 +        sb_f(&sb, "uniform sampler2D u_tex0;\nvoid main() {\n"
-+                  "  if (v_z > u_zcut) discard;\n"
++                  "  if (cut()) discard;\n"
 +                  "  o_col = clamp(v_d0, 0.0, 1.0);\n");
 +        if (k->kind[0])
 +            sb_f(&sb, "  o_col = clamp(o_col * fetch2(u_tex0, v_t0.xy * u_tsc[0].zw,"
@@ -3019,7 +3583,7 @@ index 0000000..0272041
 +        emit_rc(&sb, k);
 +        break;
 +    default:
-+        sb_f(&sb, "void main() { if (v_z > u_zcut) discard; o_col = vec4(0.0); }\n");
++        sb_f(&sb, "void main() { if (cut()) discard; o_col = vec4(0.0); }\n");
 +        break;
 +    }
 +    src[sb.n] = 0;
@@ -3054,6 +3618,9 @@ index 0000000..0272041
 +    p->u_fogc = glGetUniformLocation(p->prog, "u_fogc");
 +    p->u_aref = glGetUniformLocation(p->prog, "u_aref");
 +    p->u_zcut = glGetUniformLocation(p->prog, "u_zcut");
++    p->u_stipon = glGetUniformLocation(p->prog, "u_stipon");
++    p->u_stip = glGetUniformLocation(p->prog, "u_stip");
++    p->u_wdepth = glGetUniformLocation(p->prog, "u_wdepth");
 +    p->u_tsc = glGetUniformLocation(p->prog, "u_tsc");
 +    p->u_tsz = glGetUniformLocation(p->prog, "u_tsz");
 +    p->u_taf = glGetUniformLocation(p->prog, "u_taf");
@@ -3978,6 +4545,7 @@ index 0000000..0272041
 +    memset(&key, 0, sizeof key);
 +    key.mode = (uint32_t)st->mode;
 +    key.afunc = 0x207;
++    key.zpersp = st->mode != NV2A_GL_MODE_2D && st->zpersp && st->use_depth;
 +    if (st->mode != NV2A_GL_MODE_2D && st->mode != NV2A_GL_MODE_DEPTH
 +        && st->alpha_test && st->alpha_func >= 0x200 && st->alpha_func <= 0x206)
 +        key.afunc = st->alpha_func;
@@ -4112,6 +4680,14 @@ index 0000000..0272041
 +        glUniform3fv(p->u_fogc, 1, st->fog_color);
 +    }
 +    glUniform1i(p->u_aref, (GLint)(st->alpha_ref & 0xFF));
++    if (p->u_wdepth >= 0)
++        glUniform2f(p->u_wdepth, st->zmax > 0.0f ? 1.0f / st->zmax : 1.0f, st->zbias);
++    if (p->u_stipon >= 0) {
++        int on = st->mode != NV2A_GL_MODE_2D && st->stipple_enable;
++        glUniform1i(p->u_stipon, on);
++        if (on && p->u_stip >= 0)
++            glUniform1uiv(p->u_stip, 32, (const GLuint *)st->stipple);
++    }
 +    /* Depth beyond the buffer's range. GL always clamps here (there is no
 +     * near or far plane in the software path either). With the title's depth
 +     * clamp on that is the whole story; with it off the software path's
@@ -4428,10 +5004,10 @@ index 0000000..0272041
 +#endif
 diff --git a/src/kernel/nv2a_gl.h b/src/kernel/nv2a_gl.h
 new file mode 100644
-index 0000000..3e21c69
+index 0000000..1c749f8
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.h
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,149 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor (nv2a_pb_exec.c).
 + *
@@ -4501,6 +5077,14 @@ index 0000000..3e21c69
 +    uint32_t depth_test, depth_func, depth_mask;
 +    uint32_t alpha_test, alpha_func, alpha_ref;
 +    uint32_t zpass_enable;
++    /* SET_CONTROL0 bit 16: a w-buffer. The depth of a pixel is its w (which
++     * the title scales to depth-buffer units), not the vertex z; zbias is
++     * the polygon offset bias in the same units. */
++    int      zpersp;
++    float    zbias;
++    /* Polygon stipple: SET_POLYGON_STIPPLE_ENABLE and the 32 pattern rows.
++     * Pixel (x, y) is drawn when bit (x & 31) of row (y & 31) is set. */
++    uint32_t stipple_enable, stipple[32];
 +    /* Shading. */
 +    int      mode;
 +    Nv2aCombiner rc;
@@ -4574,7 +5158,7 @@ index 0000000..3e21c69
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..10f3a8b 100644
+index c65632c..c6a35d7 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -37,6 +37,7 @@
@@ -4585,7 +5169,23 @@ index c65632c..10f3a8b 100644
  #if defined(_WIN32)
  #include <windows.h>
  #define NV_TLS __declspec(thread)
-@@ -234,18 +235,9 @@ typedef struct {
+@@ -225,7 +226,14 @@ typedef struct {
+ } VertexAttr;
+ 
+ #define NV_VERTEX_ATTRS 16
+-#define NV_MAX_INDICES  4096
++/* Indices held for one BEGIN..END. It was 4096 and anything past it was
++ * dropped without a word: D3D sends a whole DrawIndexedVertices call inside
++ * one BEGIN..END (in commands of at most 1022 indices), and a level's terrain
++ * strips are far longer than 4096, so the far end of every big mesh was
++ * simply not drawn. A batch that outgrows even this is drawn in pieces (see
++ * idx_push). The number divides by 2, 3 and 4 so a piece ends on a whole
++ * triangle, quad or strip pair. */
++#define NV_MAX_INDICES  65532
+ #define NV_MAX_INLINE   65536           /* dwords of INLINE_ARRAY per batch */
+ 
+ /* Texture stage 0, decoded from what the title programmed.
+@@ -234,24 +242,28 @@ typedef struct {
   * nothing writes to is a stage nothing can be sampled from. The rest arrive
   * as unhandled methods and are counted as such, which is how the next title
   * that needs them will say so. */
@@ -4607,7 +5207,35 @@ index c65632c..10f3a8b 100644
  
  static struct {
      VertexAttr attr[NV_VERTEX_ATTRS];
-@@ -322,6 +314,7 @@ static struct {
+     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
+-    uint16_t   idx[NV_MAX_INDICES];
++    uint32_t   idx[NV_MAX_INDICES];     /* 32 bits: DRAW_ARRAYS starts are 24 */
+     uint32_t   idx_count;
++    uint32_t   idx_split, idx_lost;     /* batches drawn in pieces; indices dropped */
++    uint32_t   idx_max, idx_over4096, idx_elem32;   /* evidence for the report */
++    uint64_t   idx_past4096;
++    /* Face culling (SET_CULL_FACE_ENABLE / _CULL_FACE / _FRONT_FACE). */
++    uint32_t   cull_enable, cull_face, front_face;
++    uint32_t   tris_culled, tris_offset;
++    uint32_t   control0;                /* SET_CONTROL0; bit 16 = z perspective */
++    uint32_t   stipple_enable, stipple[32];
++    uint64_t   stipple_tris, zpersp_tris;
++    uint64_t   zfit_n[2], zfit_w[2], zfit_iw[2];
++    /* Polygon offset (SET_POLY_OFFSET_FILL_ENABLE, _SCALE_FACTOR, _BIAS). */
++    uint32_t   poly_offset_enable;
++    float      poly_offset_factor, poly_offset_bias;
+     /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
+      * instead of into a buffer the title points at. Same vertex format, a
+      * different place to read them from. */
+@@ -315,13 +327,14 @@ static struct {
+     uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
+     uint32_t batches_program, verts_program, tris_behind;
+     /* Where program-path triangles go, so "nothing drew" has a reason. */
+-    uint32_t xf_degenerate, xf_offscreen, xf_drawn;
++    uint32_t xf_degenerate, xf_offscreen, xf_drawn, xf_nan;
+     uint64_t xf_depth_fail, xf_pixels;
+     float xf_min[3], xf_max[3];
+     uint32_t xf_fmt[16];  /* attribute formats seen: type | size<<4 | slot<<8 */
      int xf_nfmt, xf_seeded;
      uint32_t depth_test, depth_func, depth_mask;
      uint32_t zeta_offset, zstencil_clear;
@@ -4615,7 +5243,100 @@ index c65632c..10f3a8b 100644
  } s_gpu;
  
  /* Unhandled methods, ranked. The interesting output is not that something was
-@@ -583,12 +576,18 @@ static uint32_t surface_bpp(void)
+@@ -440,8 +453,92 @@ static void note_texture_use(void)
+     }
+ }
+ 
++/* The distinct values a few state methods carry (RECOMP_PB_VALUES=1), for
++ * deciding what an unimplemented feature is actually asked to do. */
++#define PB_VALUE_SLOTS 24
++static struct { uint32_t method, n, v[12], c[12]; } s_values[PB_VALUE_SLOTS];
++
++static void note_value(uint32_t method, uint32_t param)
++{
++    static int on = -1;
++    int i;
++    uint32_t k;
++    if (on < 0)
++        on = getenv("RECOMP_PB_VALUES") != NULL;
++    if (!on)
++        return;
++    for (i = 0; i < PB_VALUE_SLOTS && s_values[i].method
++                && s_values[i].method != method; i++)
++        ;
++    if (i == PB_VALUE_SLOTS)
++        return;
++    s_values[i].method = method;
++    for (k = 0; k < s_values[i].n && s_values[i].v[k] != param; k++)
++        ;
++    if (k == s_values[i].n) {
++        if (k == 12)
++            return;
++        s_values[i].v[k] = param;
++        s_values[i].n++;
++    }
++    s_values[i].c[k]++;
++}
++
++static void report_values(void)
++{
++    int i;
++    uint32_t k;
++    for (i = 0; i < PB_VALUE_SLOTS && s_values[i].method; i++) {
++        fprintf(stderr, "[GPUV] %04X:", s_values[i].method);
++        for (k = 0; k < s_values[i].n; k++) {
++            union { uint32_t u; float f; } v;
++            v.u = s_values[i].v[k];
++            fprintf(stderr, " %08X(%g)x%u", v.u, v.f, s_values[i].c[k]);
++        }
++        fputc(10, stderr);
++    }
++}
++
++/* RECOMP_GPU_AB=<dir>: switches that can be thrown while the game runs, read
++ * once a frame, so the same camera position can be captured with and without
++ * a fix. A file named oldidx, nocull or nopoly in that directory turns the
++ * old behaviour back on while it exists. */
++static int s_ab_oldidx, s_ab_nocull, s_ab_nopoly, s_ab_nozpersp, s_ab_nostipple;
++
++static void ab_poll(void)
++{
++    static const char *dir = (const char *)-1;
++    static const char *const names[5] = { "oldidx", "nocull", "nopoly",
++                                          "nozpersp", "nostipple" };
++    int *const flags[5] = { &s_ab_oldidx, &s_ab_nocull, &s_ab_nopoly,
++                            &s_ab_nozpersp, &s_ab_nostipple };
++    char path[600];
++    int i;
++    if (dir == (const char *)-1)
++        dir = getenv("RECOMP_GPU_AB");
++    if (!dir)
++        return;
++    for (i = 0; i < 5; i++) {
++        FILE *f;
++        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
++        f = fopen(path, "rb");
++        *flags[i] = f != NULL;
++        if (f)
++            fclose(f);
++    }
++}
++
+ static void note_unhandled(uint32_t method, uint32_t param)
+ {
++    switch (method) {
++    case 0x0364: case 0x0368: case 0x0370: case 0x0374: case 0x0378:
++    case 0x0360: case 0x036C: case 0x1480: case 0x0290: case 0x0394:
++    case 0x0398: case 0x043C: case 0x1D84: case 0x0294: case 0x0314:
++        note_value(method, param);
++        break;
++    default:
++        break;
++    }
+     int i;
+ 
+     s_gpu.unhandled_total++;
+@@ -583,12 +680,18 @@ static uint32_t surface_bpp(void)
   * the sequence. */
  static int s_flip_dumping;
  
@@ -4634,7 +5355,7 @@ index c65632c..10f3a8b 100644
      uint32_t pitch = drawn ? s_gpu.drawn_pitch : s_gpu.pitch;
      uint32_t cx = drawn ? s_gpu.drawn_x : s_gpu.clip_x;
      uint32_t cy = drawn ? s_gpu.drawn_y : s_gpu.clip_y;
-@@ -649,6 +648,11 @@ static void dump_surface_bmp(void)
+@@ -649,6 +752,11 @@ static void dump_surface_bmp(void)
          }
      }
      fclose(f);
@@ -4646,7 +5367,7 @@ index c65632c..10f3a8b 100644
      if (seq == 1)
          fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
                  path, w, h, s_gpu.color_offset, bpp);
-@@ -659,6 +663,7 @@ static void dump_surface_bmp(void)
+@@ -659,6 +767,7 @@ static void dump_surface_bmp(void)
  static void raster_triangle(const float a[2], const float b[2],
                              const float c[2], uint32_t argb,
                              const float uv[3][2]);
@@ -4654,7 +5375,7 @@ index c65632c..10f3a8b 100644
  
  static void clear_surface(uint32_t param)
  {
-@@ -679,12 +684,52 @@ static void clear_surface(uint32_t param)
+@@ -679,12 +788,52 @@ static void clear_surface(uint32_t param)
          s_gpu.color_base = base;
      }
  
@@ -4709,7 +5430,7 @@ index c65632c..10f3a8b 100644
                  p[x] = s_gpu.clear_color;
          } else if (bpp == 2) {
              /* The clear value is always given as A8R8G8B8; a 16-bit surface
-@@ -693,7 +738,7 @@ static void clear_surface(uint32_t param)
+@@ -693,7 +842,7 @@ static void clear_surface(uint32_t param)
                                    | ((s_gpu.clear_color >> 5) & 0x07E0)
                                    | ((s_gpu.clear_color >> 3) & 0x001F));
              uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
@@ -4718,7 +5439,7 @@ index c65632c..10f3a8b 100644
                  p[x] = v;
          }
      }
-@@ -854,6 +899,11 @@ static uint32_t linear_twin(uint32_t fmt)
+@@ -854,6 +1003,11 @@ static uint32_t linear_twin(uint32_t fmt)
  {
      switch (fmt) {
      case 0x00: return 0x13;                /* L8        -> LIN_L8        */
@@ -4730,7 +5451,7 @@ index c65632c..10f3a8b 100644
      case 0x02: return 0x10;                /* A1R5G5B5  -> LIN_A1R5G5B5  */
      case 0x03: return 0x1C;                /* X1R5G5B5  -> LIN_X1R5G5B5  */
      case 0x04: return 0x1D;                /* A4R4G4B4  -> LIN_A4R4G4B4  */
-@@ -1006,6 +1056,20 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1006,6 +1160,20 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
      case 0x1F:                                      /* LIN_A8 */
          *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
          return 1;
@@ -4751,7 +5472,7 @@ index c65632c..10f3a8b 100644
  
      /* 4:2:2 packed YUV, two texels per four bytes.
       *
-@@ -1245,6 +1309,55 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
+@@ -1245,6 +1413,55 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
      }
  }
  
@@ -4807,7 +5528,7 @@ index c65632c..10f3a8b 100644
  /* Half-space fill. Barycentric edge functions rather than scanline slopes:
   * the same test decides both windings, so a title that emits clockwise
   * triangles does not silently render nothing. */
-@@ -1285,6 +1398,15 @@ static void raster_triangle(const float a[2], const float b[2],
+@@ -1285,6 +1502,15 @@ static void raster_triangle(const float a[2], const float b[2],
          return;
      }
  
@@ -4823,7 +5544,7 @@ index c65632c..10f3a8b 100644
      for (y = miny; y < maxy; y++) {
          for (x = minx; x < maxx; x++) {
              float px = (float)x + 0.5f, py = (float)y + 0.5f;
-@@ -1620,9 +1742,12 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+@@ -1620,9 +1846,12 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
  {
      switch (fmt) {
      case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
@@ -4837,7 +5558,7 @@ index c65632c..10f3a8b 100644
          return 2;
      default:
          return 4;
-@@ -1702,14 +1827,17 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
+@@ -1702,14 +1931,17 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
          return 1;
      case 1: case 2:                               /* PROJECT2D / 3D */
          rc_texel(t, 0, c[0] / q, c[1] / q, out);
@@ -4857,10 +5578,49 @@ index c65632c..10f3a8b 100644
          }
          if (ax >= ay && ax >= az) {
              face = x > 0 ? 0 : 1; ma = ax; sc = x > 0 ? -z : z; tc = -y;
-@@ -1785,6 +1913,66 @@ static int alpha_test_pass(float a)
+@@ -1785,6 +2017,109 @@ static int alpha_test_pass(float a)
      }
  }
  
++/* SET_CONTROL0 bit 16 (z perspective) and the polygon stipple, each with a
++ * switch: RECOMP_GPU_ZPERSP=0 / RECOMP_GPU_STIPPLE=0, or a file named
++ * nozpersp / nostipple in the RECOMP_GPU_AB directory. */
++static int xf_zpersp(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_GPU_ZPERSP");
++        on = !(e && *e == '0');
++    }
++    return on && !s_ab_nozpersp && (s_gpu.control0 & 0x10000u) != 0;
++}
++
++/* The polygon offset bias of a w-buffered batch, in w (= depth) units. */
++static int xf_polyoffset_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_GPU_POLYOFFSET");
++        on = !(e && *e == '0');
++    }
++    return on && !s_ab_nopoly && s_gpu.poly_offset_enable;
++}
++
++static float xf_zbias(void)
++{
++    return xf_zpersp() && xf_polyoffset_on() ? s_gpu.poly_offset_bias : 0.0f;
++}
++
++static int xf_stipple(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_GPU_STIPPLE");
++        on = !(e && *e == '0');
++    }
++    return on && !s_ab_nostipple && s_gpu.stipple_enable != 0;
++}
++
 +/* The state a queued hardware batch is drawn under: everything put_pixel
 + * and xf_rows consult, copied out for nv2a_gl.c. */
 +static void gl_fill_state(Nv2aGlState *st, int mode)
@@ -4894,6 +5654,10 @@ index c65632c..10f3a8b 100644
 +    st->alpha_func = s_gpu.alpha_func;
 +    st->alpha_ref = s_gpu.alpha_ref;
 +    st->zpass_enable = mode != NV2A_GL_MODE_2D && s_gpu.zpass_enable;
++    st->zpersp = xf_zpersp();
++    st->zbias = xf_zbias();
++    st->stipple_enable = xf_stipple();
++    memcpy(st->stipple, s_gpu.stipple, sizeof st->stipple);
 +    st->mode = mode;
 +    st->rc = s_gpu.rc;
 +    st->clip_plane_mode = s_gpu.clip_plane_mode;
@@ -4924,24 +5688,36 @@ index c65632c..10f3a8b 100644
  /* Everything a triangle's pixels need, computed once per triangle, so the
   * pixel loop can run over any subset of rows on any thread. */
  typedef struct {
-@@ -1794,6 +1982,7 @@ typedef struct {
+@@ -1794,7 +2129,10 @@ typedef struct {
      const float *a, *b, *c;
      float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
      float *zb;
 +    float zclamp;                       /* depth clamp on: the largest depth */
      int minx, maxx, miny, maxy, use_rc, textured;
++    int zpersp, stipple;
++    float zbias;
  } XfTri;
  
-@@ -1820,6 +2009,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+ typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
+@@ -1819,7 +2157,16 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+                 continue;
              /* w1 is opposite a, w2 opposite b, w0 opposite c. */
              l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
-             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
+-            z = l0 * a[2] + l1 * b[2] + l2 * c[2];
++            if (T->stipple
++                && !((s_gpu.stipple[y & 31] >> (x & 31)) & 1u))
++                continue;
++            if (T->zpersp)                  /* w-buffer: the pixel's w */
++                z = 1.0f / (l0 * T->iw[0] + l1 * T->iw[1] + l2 * T->iw[2])
++                  + T->zbias;
++            else
++                z = l0 * a[2] + l1 * b[2] + l2 * c[2];
 +            if (T->zclamp > 0.0f)
 +                z = z < 0.0f ? 0.0f : (z > T->zclamp ? T->zclamp : z);
              {
                  float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
                  int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
-@@ -1904,12 +2095,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -1904,12 +2251,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -4985,7 +5761,7 @@ index c65632c..10f3a8b 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -1919,7 +2141,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -1919,7 +2297,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -5000,7 +5776,7 @@ index c65632c..10f3a8b 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -1985,6 +2213,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -1985,12 +2369,92 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
  }
  #endif
  
@@ -5081,19 +5857,146 @@ index c65632c..10f3a8b 100644
 +    s_xfq_area += (uint64_t)(T->maxx - T->minx) * (uint64_t)(T->maxy - T->miny);
 +}
 +
++static int s_xf_flip;       /* odd triangle of a strip: its winding is reversed */
++
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                 const Nv2aVshOutput *vc)
  {
-@@ -2004,6 +2309,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     XfTri T;
+     XfCount cnt = {0, 0, 0};
+     const Nv2aVshOutput *v[3];
++    Nv2aVshOutput ofs[3];
+     const float *a, *b, *c;
+     float area, su = 1.0f, sv = 1.0f;
+     int k;
+@@ -2004,6 +2468,42 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      T.textured = s_gpu.texs[0].valid;
      T.use_rc = s_gpu.rc_seen && !no_rc;
      T.va = va; T.vb = vb; T.vc = vc;
++    T.zpersp = xf_zpersp();
++    T.stipple = xf_stipple();
++    if (T.zpersp) s_gpu.zpersp_tris++;
++    /* RECOMP_PB_VALUES: is the depth these triangles carry affine in w (a
++     * w-buffer: perspective interpolation is the right one) or in 1/w (an
++     * ordinary z-buffer: linear across the screen)? Counted by CONTROL0
++     * bit 16, [0] off, [1] on. */
++    {
++        static int on = -1;
++        if (on < 0)
++            on = getenv("RECOMP_PB_VALUES") != NULL;
++        if (on) {
++            const float *A = va->pos, *B = vb->pos, *C = vc->pos;
++            int g = (s_gpu.control0 & 0x10000u) != 0;
++            if (A[3] > 0 && B[3] > 0 && C[3] > 0
++                && fabsf(A[3] - B[3]) > 1e-3f * A[3]
++                && fabsf(A[3] - C[3]) > 1e-3f * A[3]
++                && fabsf(B[3] - C[3]) > 1e-3f * A[3]) {
++                double ew = (double)(A[2] - B[2]) * (A[3] - C[3])
++                          - (double)(A[2] - C[2]) * (A[3] - B[3]);
++                double ia = 1.0 / A[3], ib = 1.0 / B[3], ic = 1.0 / C[3];
++                double ei = (double)(A[2] - B[2]) * (ia - ic)
++                          - (double)(A[2] - C[2]) * (ia - ib);
++                double sw = fabs((double)(A[2] - B[2]) * (A[3] - C[3]))
++                          + fabs((double)(A[2] - C[2]) * (A[3] - B[3])) + 1e-30;
++                double si = fabs((double)(A[2] - B[2]) * (ia - ic))
++                          + fabs((double)(A[2] - C[2]) * (ia - ib)) + 1e-30;
++                s_gpu.zfit_n[g]++;
++                if (fabs(ew) / sw < 1e-3) s_gpu.zfit_w[g]++;
++                if (fabs(ei) / si < 1e-3) s_gpu.zfit_iw[g]++;
++            }
++        }
++    }
++    if (T.stipple) s_gpu.stipple_tris++;
 +    if (s_gpu.zminmax_control & 0x10)
 +        T.zclamp = ((s_gpu.format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
  
      v[0] = va; v[1] = vb; v[2] = vc;
      a = va->pos; b = vb->pos; c = vc->pos;
-@@ -2028,7 +2335,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2016,9 +2516,83 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     }
+     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+     if (area == 0.0f || area != area) {
++        if (area != area) s_gpu.xf_nan++;
+         s_gpu.xf_degenerate++;
+         return;
+     }
++    /* Face culling. `area` is positive for a triangle that runs clockwise on
++     * the screen (y down); s_xf_flip undoes the alternation of a strip.
++     * Without it every back face was drawn: twice the fill, and wrong
++     * wherever a back face is not hidden by a front one -- the inside of a
++     * closed shell seen through a gap, both sides of blended geometry, and
++     * depth-only passes that are meant to lay down one side. */
++    {
++        static int mode = -1;
++        if (mode < 0) {
++            const char *e = getenv("RECOMP_GPU_CULL");
++            mode = e ? atoi(e) : 1;
++        }
++        if (mode && !s_ab_nocull && s_gpu.cull_enable) {
++            uint32_t ff = s_gpu.front_face == 0x901u ? 0x901u : 0x900u;
++            uint32_t drop = s_gpu.cull_face == 0x404u ? ff : (ff ^ 1u);
++            /* The winding from the homogeneous determinant, not from
++             * `area`: a triangle cut at the near plane comes back with
++             * corners millions of pixels away, where the float area is
++             * rounding noise and its sign a coin toss -- the floor under
++             * the camera was culled at random. x*w, y*w, w are moderate
++             * numbers and their determinant has the area's sign for w > 0. */
++            double ax = (double)a[0] * a[3], ay = (double)a[1] * a[3], aw = a[3];
++            double bx = (double)b[0] * b[3], by = (double)b[1] * b[3], bw = b[3];
++            double cx = (double)c[0] * c[3], cy = (double)c[1] * c[3], cw = c[3];
++            double det = ax * (by * cw - cy * bw) - ay * (bx * cw - cx * bw)
++                       + aw * (bx * cy - cx * by);
++            uint32_t wind = ((det > 0.0) != (s_xf_flip != 0)) ? 0x900u : 0x901u;
++            if (mode == 2)
++                wind ^= 1u;
++            if (s_gpu.cull_face == 0x408u || wind == drop) {
++                s_gpu.tris_culled++;
++                return;
++            }
++        }
++    }
++    /* Polygon offset: one depth offset for the whole triangle,
++     * factor * (its steepest depth slope per pixel) + bias, in depth-buffer
++     * units -- which is what pos[2] is in. Added to copies of the three
++     * vertices, so both pixel paths get it and the shared originals do not. */
++    if (T.zpersp) {
++        T.zbias = xf_zbias();               /* applied per pixel, to w */
++        if (T.zbias != 0.0f)
++            s_gpu.tris_offset++;
++    } else if (s_gpu.poly_offset_enable
++        && (s_gpu.poly_offset_factor != 0.0f || s_gpu.poly_offset_bias != 0.0f)) {
++        if (xf_polyoffset_on()) {
++            float dzdx = ((b[2] - a[2]) * (c[1] - a[1])
++                        - (c[2] - a[2]) * (b[1] - a[1])) / area;
++            float dzdy = ((c[2] - a[2]) * (b[0] - a[0])
++                        - (b[2] - a[2]) * (c[0] - a[0])) / area;
++            float m = fmaxf(fabsf(dzdx), fabsf(dzdy));
++            float off;
++            /* No trustworthy slope for a triangle with corners far off the
++             * surface (see the winding above): the bias alone. */
++            if (s_gpu.poly_offset_factor == 0.0f || m != m
++                || fabsf(a[0]) > 1.0e5f || fabsf(b[0]) > 1.0e5f || fabsf(c[0]) > 1.0e5f
++                || fabsf(a[1]) > 1.0e5f || fabsf(b[1]) > 1.0e5f || fabsf(c[1]) > 1.0e5f)
++                m = 0.0f;
++            off = s_gpu.poly_offset_factor * m + s_gpu.poly_offset_bias;
++            if (off == off && fabsf(off) < 1.0e9f) {
++                ofs[0] = *va; ofs[1] = *vb; ofs[2] = *vc;
++                for (k = 0; k < 3; k++) {
++                    ofs[k].pos[2] += off;
++                    v[k] = &ofs[k];
++                }
++                va = v[0]; vb = v[1]; vc = v[2];
++                T.va = va; T.vb = vb; T.vc = vc;
++                a = va->pos; b = vb->pos; c = vc->pos;
++                T.a = a; T.b = b; T.c = c;
++                s_gpu.tris_offset++;
++            }
++        }
++    }
+     for (k = 0; k < 3; k++) {
+         if (!s_gpu.xf_seeded)
+             s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
+@@ -2028,7 +2602,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_seeded = 1;
      if (!surface_begin_batch(T.mem))
          return;
@@ -5103,7 +6006,7 @@ index c65632c..10f3a8b 100644
          T.zb = zbuf_current(1);
      if (tex_size_from_format(s_gpu.texs[0].color)) {
          su = (float)s_gpu.texs[0].width;
-@@ -2070,7 +2378,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2070,7 +2645,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -5134,7 +6037,7 @@ index c65632c..10f3a8b 100644
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
      s_gpu.zpass_count += cnt.zpass;
-@@ -2180,9 +2510,30 @@ static void raster_batch_program(void)
+@@ -2180,9 +2777,35 @@ static void raster_batch_program(void)
  {
      uint32_t i, n = s_gpu.idx_count;
  
@@ -5154,7 +6057,12 @@ index c65632c..10f3a8b 100644
 +            gen = 1;
 +        }
 +        for (i = 0; i < n; i++) {
-+            uint16_t ix = s_gpu.idx[i];
++            uint32_t ix = s_gpu.idx[i];
++            if (ix >= 65536u) {                        /* beyond the table */
++                if (!transform_vertex(ix, &s_xf[i]))
++                    return;
++                continue;
++            }
 +            if (reuse && stamp[ix] == gen) {
 +                s_xf[i] = s_xf[first[ix]];
 +                continue;
@@ -5168,7 +6076,32 @@ index c65632c..10f3a8b 100644
      s_gpu.batches_program++;
      s_gpu.verts_program += n;
      if (s_gpu.blend_enable) {
-@@ -2840,6 +3191,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2250,8 +2873,11 @@ static void raster_batch_program(void)
+             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+         break;
+     case NV_PRIM_TRIANGLE_STRIP:
+-        for (i = 0; i + 2 < n; i++)
++        for (i = 0; i + 2 < n; i++) {
++            s_xf_flip = (int)(i & 1);
+             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
++        }
++        s_xf_flip = 0;
+         break;
+     case NV_PRIM_TRIANGLE_FAN:
+     case NV_PRIM_POLYGON:
+@@ -2417,6 +3043,11 @@ static void draw_primitive(void)
+     if (!s_gpu.prim || !s_gpu.idx_count)
+         return;
+     s_gpu.draws++;
++    if (s_gpu.idx_count > s_gpu.idx_max) s_gpu.idx_max = s_gpu.idx_count;
++    if (s_gpu.idx_count > 4096u) {
++        s_gpu.idx_over4096++;
++        s_gpu.idx_past4096 += s_gpu.idx_count - 4096u;
++    }
+     if ((s_gpu.draws % 200) == 0)
+         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
+     s_gpu.verts += s_gpu.idx_count;
+@@ -2840,6 +3471,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
      case NV097_SET_TEXTURE_CONTROL1:
          t->pitch = param >> 16;          /* linear formats only */
          break;
@@ -5178,7 +6111,7 @@ index c65632c..10f3a8b 100644
      case NV097_SET_TEXTURE_IMAGE_RECT:
          t->width  = param >> 16;
          t->height = param & 0xFFFF;
-@@ -2851,12 +3205,305 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2851,12 +3485,359 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          break;
      }
      tex_update_valid(t);
@@ -5375,6 +6308,60 @@ index c65632c..10f3a8b 100644
 +        SetEvent(s_swi_done_event);
 +}
 +
++/* One more index of the open batch. A batch longer than the buffer is drawn
++ * in pieces: what is held is drawn as it stands, and the vertices the next
++ * piece needs to continue the same primitive are carried over (the last two
++ * of a strip, the hub and the last of a fan). NV_MAX_INDICES is even and a
++ * multiple of 3 and 4, so lists end on a whole primitive and a strip keeps
++ * its winding parity. */
++static void draw_primitive(void);
++static int idx_old_limits(void)
++{
++    /* RECOMP_GPU_OLDIDX=1: the behaviour before the fix (4096 indices a
++     * batch, no ARRAY_ELEMENT32), for before/after pictures. */
++    static int old = -1;
++    if (old < 0)
++        old = getenv("RECOMP_GPU_OLDIDX") != NULL;
++    return old;
++}
++
++static void idx_push(uint32_t ix)
++{
++    if ((idx_old_limits() || s_ab_oldidx) && s_gpu.idx_count >= 4096u)
++        return;
++    if (s_gpu.idx_count >= NV_MAX_INDICES) {
++        uint32_t keep[2], nkeep = 0, n = s_gpu.idx_count;
++        switch (s_gpu.prim) {
++        case NV_PRIM_TRIANGLE_STRIP:
++        case NV_PRIM_QUAD_STRIP:
++            keep[0] = s_gpu.idx[n - 2]; keep[1] = s_gpu.idx[n - 1]; nkeep = 2;
++            break;
++        case NV_PRIM_TRIANGLE_FAN:
++        case NV_PRIM_POLYGON:
++            keep[0] = s_gpu.idx[0]; keep[1] = s_gpu.idx[n - 1]; nkeep = 2;
++            break;
++        case NV_PRIM_LINE_STRIP:
++        case NV_PRIM_LINE_LOOP:
++            keep[0] = s_gpu.idx[n - 1]; nkeep = 1;
++            break;
++        default:
++            break;
++        }
++        if (s_gpu.inline_active || s_gpu.imm_count || s_gpu.inline_count) {
++            s_gpu.idx_lost++;                 /* not an indexed batch: no split */
++            return;
++        }
++        draw_primitive();
++        s_gpu.idx_split++;
++        s_gpu.idx_count = 0;
++        while (s_gpu.idx_count < nkeep) {
++            s_gpu.idx[s_gpu.idx_count] = keep[s_gpu.idx_count];
++            s_gpu.idx_count++;
++        }
++    }
++    s_gpu.idx[s_gpu.idx_count++] = ix;
++}
++
  void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  {
 +    /* Queued triangles were set up under the state as it is now. Anything
@@ -5484,7 +6471,7 @@ index c65632c..10f3a8b 100644
      static int inited;
      if (!inited) {
          inited = 1;
-@@ -3004,8 +3651,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3004,8 +3985,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -5501,7 +6488,72 @@ index c65632c..10f3a8b 100644
          break;
  
      case NV097_SET_BEGIN_END:
-@@ -3119,6 +3772,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3052,19 +4039,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ 
+         if (!s_gpu.prim)
+             break;
+-        for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
+-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
++        for (i = 0; i < count; i++)
++            idx_push(start + i);
+         break;
+     }
+ 
+     case NV097_ARRAY_ELEMENT16:
+         /* Two 16-bit indices per parameter word. */
+-        if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
+-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
+-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
++        if (s_gpu.prim) {
++            idx_push(param & 0xFFFF);
++            idx_push(param >> 16);
+         }
+         break;
+ 
++    case 0x1808:                                  /* ARRAY_ELEMENT32 */
++        /* One index per word. D3D's DrawIndexedVertices sends pairs through
++         * ARRAY_ELEMENT16 and, when the count is odd, the last index through
++         * this method (Halo 2 0x3FB22E). Unhandled, every indexed draw with
++         * an odd index count lost its last vertex: the final triangle of a
++         * strip, or of a list of 3, 9, 15... indices. */
++        if (s_gpu.prim) {
++            if (!idx_old_limits() && !s_ab_oldidx)
++                idx_push(param);
++            s_gpu.idx_elem32++;
++        }
++        break;
++
++    /* Face culling. D3D (Halo 2 0x3F53E0): CULL_FACE_ENABLE 0 for
++     * D3DCULL_NONE; otherwise CULL_FACE is FRONT (0x404) when the cull mode
++     * equals the front-face winding and BACK (0x405) when it does not, and
++     * FRONT_FACE is 0x900 (CW) or 0x901 (CCW). */
++    case 0x0308: s_gpu.cull_enable = param; break;
++    case 0x039C: s_gpu.cull_face = param; break;
++    case 0x03A0: s_gpu.front_face = param; break;
++
++    /* Polygon offset: depth = z + factor * slope + bias, in depth-buffer
++     * units (decals and shadow passes lie exactly on the surface under them
++     * and are pulled toward the eye with this). */
++    case 0x0290: s_gpu.control0 = param; note_value(method, param); break;
++    case 0x147C: s_gpu.stipple_enable = param; break;
++    case 0x0338: s_gpu.poly_offset_enable = param; break;
++    case 0x0384: memcpy(&s_gpu.poly_offset_factor, &param, 4);
++                 note_value(method, param); break;
++    case 0x0388: memcpy(&s_gpu.poly_offset_bias, &param, 4);
++                 note_value(method, param); break;
++
+     case NV097_SET_FLIP_READ:
+         if (s_ftrace == 2)
+             fprintf(stderr, "[FTRACE] P_READ %u%c", param, 10);
+@@ -3099,6 +4118,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         /* And this is a completed swap, which is what a title's own swap
+          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
+         xbox_Nv2aFrameCounterFlip();
++        ab_poll();
+         /* Hand the window a copy of the frame just finished.
+          *
+          * The buffer the title has finished is the one the last batch drew
+@@ -3119,6 +4139,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -5525,7 +6577,7 @@ index c65632c..10f3a8b 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-@@ -3146,6 +3816,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3146,6 +4183,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -5534,7 +6586,7 @@ index c65632c..10f3a8b 100644
  
          if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
              static unsigned n;
-@@ -3181,6 +3853,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3181,8 +4220,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
      case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
      case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
@@ -5558,8 +6610,15 @@ index c65632c..10f3a8b 100644
 +    }
  
      default:
++        if (method >= 0x1480 && method < 0x1500) {         /* POLYGON_STIPPLE_PATTERN(i) */
++            s_gpu.stipple[(method - 0x1480) / 4] = param;
++            note_value(0x1480, param);
++            break;
++        }
          if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
-@@ -3449,6 +4139,20 @@ void nv2a_pb_exec_report(void)
+             s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
+             break;
+@@ -3449,6 +4511,20 @@ void nv2a_pb_exec_report(void)
      /* Drawn and skipped separately: "nothing appeared" and "every batch needed
       * a vertex program we do not run" look identical on screen, and only one
       * of them means the rasteriser is broken. */
@@ -5580,6 +6639,33 @@ index c65632c..10f3a8b 100644
      fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
      fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
                      " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
+@@ -3462,6 +4538,26 @@ void nv2a_pb_exec_report(void)
+     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
+                     " %u triangles dropped behind the eye\n",
+             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
++    fprintf(stderr, "[GPU]   indices: longest batch %u, %u batches over 4096 (%llu indices"
++                    " past it), %u odd tails (ARRAY_ELEMENT32), %u batches drawn in"
++                    " pieces, %u indices lost; %u triangles face-culled; %u NaN\n",
++            s_gpu.idx_max, s_gpu.idx_over4096,
++            (unsigned long long)s_gpu.idx_past4096, s_gpu.idx_elem32,
++            s_gpu.idx_split, s_gpu.idx_lost, s_gpu.tris_culled, s_gpu.xf_nan);
++    report_values();
++    if (s_gpu.zfit_n[0] | s_gpu.zfit_n[1])
++        fprintf(stderr, "[GPUV] depth fit: bit16 off: %llu tris, %llu affine in w, %llu in 1/w;"
++                " bit16 on: %llu tris, %llu affine in w, %llu in 1/w%c",
++                (unsigned long long)s_gpu.zfit_n[0], (unsigned long long)s_gpu.zfit_w[0],
++                (unsigned long long)s_gpu.zfit_iw[0], (unsigned long long)s_gpu.zfit_n[1],
++                (unsigned long long)s_gpu.zfit_w[1], (unsigned long long)s_gpu.zfit_iw[1], 10);
++    fprintf(stderr, "[GPU]   polygon offset: %u triangles, last factor %g bias %g;"
++                    " z-perspective %llu, stippled %llu triangles;"
++                    " cull enable %u face %X front %X\n",
++            s_gpu.tris_offset, s_gpu.poly_offset_factor, s_gpu.poly_offset_bias,
++            (unsigned long long)s_gpu.zpersp_tris,
++            (unsigned long long)s_gpu.stipple_tris,
++            s_gpu.cull_enable, s_gpu.cull_face, s_gpu.front_face);
+     fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
+                     " %u drawn; pixels %llu written, %llu depth-failed;"
+                     " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
 index 65bbedb..039dd4f 100644
 --- a/src/kernel/nv2a_pb_scan.c

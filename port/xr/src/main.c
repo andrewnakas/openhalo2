@@ -477,6 +477,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             _putenv_s("RECOMP_AC97_READY", "1");
             if (!getenv("RECOMP_APU_DSP_ACK_GPS"))
                 _putenv_s("RECOMP_APU_DSP_ACK_GPS", "0x810");
+            /* The word DirectSound checks each frame to see that the GP DSP
+             * program is alive (0x37EC7A); see apu_dsp.c. =0 turns it off. */
+            if (!getenv("RECOMP_APU_DSP_SENTINEL"))
+                _putenv_s("RECOMP_APU_DSP_SENTINEL", "0x387108,0xCCCCCC");
             /* Fold the mixbins down as speakers (centre to both sides,
              * effect sends dropped), not by parity. Measured over a boot to
              * the armory: bins 0, 1, 2, 6, 7 and 10 carry sound. */
