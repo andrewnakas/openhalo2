@@ -66,6 +66,15 @@ int main(void)
     def("RECOMP_USB", "1");
     def("RECOMP_NO_MIRRORS", "1");
     def("RECOMP_NO_TILED", "1");
+    {   /* Sound: on unless ?env=RECOMP_SOUND=0 (the same switches main.c sets). */
+        const char *snd = getenv("RECOMP_SOUND");
+        if (!snd || *snd != '0') {
+            def("RECOMP_AC97_READY", "1");
+            def("RECOMP_APU_DSP_ACK_GPS", "0x810");
+            def("RECOMP_APU_DSP_SENTINEL", "0x387108,0xCCCCCC");
+            def("RECOMP_APU_MIXDOWN_ALL", "2");
+        }
+    }
     def("RECOMP_GPU", "1");            /* WebGL2 pixel backend; ?env=RECOMP_GPU=0 = software */
 
     printf("=== Open Halo 2 (web) ===\n");

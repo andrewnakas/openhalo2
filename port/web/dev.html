@@ -27,7 +27,7 @@ var Module = {
     }
   }],
   onAbort: function (w) { say('ABORT: ' + w); },
-  onRuntimeInitialized: function () { Module.h2ready = true; },
+  onRuntimeInitialized: function () { Module.h2ready = true; Module.h2autoplay = !!q.get('autoplay'); },
   // A frame from the WebGL2 backend (nv2a_gl.c): an ImageBitmap made on the
   // executor's own canvas, shown on a second canvas over the first.
   nv2aFrame: function (bmp) {
@@ -113,4 +113,5 @@ async function importTree() {
 })();
 </script>
 <script src="input.js"></script>
+<script src="audio.js"></script>
 </body></html>

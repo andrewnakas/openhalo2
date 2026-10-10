@@ -32,8 +32,14 @@ extern MCPXAPUState *g_apu_state;
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
 void     mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
 
+/* The APU's registers, as the memory layout traps them (APU_TRAP_BYTES in
+ * xbox_memory_layout.c): the first 0x30000 only. Above that, to 0xFE880000,
+ * are the two DSPs' own memory windows, which are plain memory here; the DSP
+ * sentinel (RECOMP_APU_DSP_SENTINEL, a word at 0xFE85A018) lives there, and
+ * sending those reads to the register model made the title see 0 and reset
+ * its DSPs every frame again. */
 #define APU_TRAP_BASE 0xFE800000u
-#define APU_TRAP_END  0xFE880000u
+#define APU_TRAP_END  0xFE830000u
 
 static volatile long s_direct[4];   /* nv2a, ohci, apu, plain */
 static volatile long s_faults;
@@ -108,6 +114,19 @@ void recomp_mmio_write(uint32_t va, uint32_t val, int size)
         if (size == 1) *p = (uint8_t)val;
         else if (size == 2) *(volatile uint16_t *)p = (uint16_t)val;
         else *(volatile uint32_t *)p = val;
+
+        /* AC'97 bus-master control bytes (0xFEC0010B, +0x10 per channel up to
+         * 0x17B): bit 1 is "reset registers", which the controller clears by
+         * itself and DirectSound reads back exactly once, a few instructions
+         * after setting it (see ac97_clear_reset_bits in
+         * xbox_memory_layout.c, which does this from a page trap on 64-bit
+         * Windows). The write must never leave the bit set. */
+        if (va + (uint32_t)size > 0xFEC00100u && va < 0xFEC00180u) {
+            int k;
+            for (k = 0; k < size; k++)
+                if (((va + (uint32_t)k) & 0xFu) == 0xBu && va + (uint32_t)k >= 0xFEC0010Bu)
+                    p[k] = (uint8_t)(p[k] & ~0x02u);
+        }
     }
 }
 
