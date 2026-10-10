@@ -32,7 +32,26 @@
   addEventListener('mouseup', e => { mbuttons &= ~(1 << e.button); });
   addEventListener('contextmenu', e => { if (document.pointerLockElement) e.preventDefault(); });
 
-  const k = c => keys.has(c);
+  // ?script=2000:Enter:30,+300:Space:30,...  a test script keyed on FRAMES SHOWN
+  // (Module.h2frames), not seconds: how long the boot takes varies with the
+  // machine's load, the number of frames before the title screen much less.
+  // Each step is frame:key-code:frames-held; "+n" counts from the previous step.
+  const script = [];
+  {
+    let at = 0;
+    for (const step of (new URLSearchParams(location.search).get('script') || '').split(',')) {
+      const [f, code, hold] = step.split(':');
+      if (!code) continue;
+      at = f[0] === '+' ? at + Number(f.slice(1)) : Number(f);
+      script.push({ from: at, to: at + Number(hold || 30), code });
+    }
+  }
+  const scripted = c => {
+    if (!script.length) return false;
+    const n = (typeof Module !== 'undefined' && Module.h2frames) || 0;
+    return script.some(s => s.code === c && n >= s.from && n < s.to);
+  };
+  const k = c => keys.has(c) || scripted(c);
   const clamp16 = v => Math.max(-32768, Math.min(32767, Math.round(v)));
 
   function keyboardPad() {
