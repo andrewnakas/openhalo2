@@ -7795,10 +7795,25 @@ index 72d5131..8cc7bb8 100644
  {
      uint32_t result = 0;
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
-index 641a94d..4d81468 100644
+index 641a94d..f298482 100644
 --- a/src/usb/ohci.c
 +++ b/src/usb/ohci.c
-@@ -830,6 +830,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
+@@ -500,6 +500,14 @@ static uint32_t bus_resolve(uint32_t addr)
+ {
+     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
+         return addr;
++    /* Nor inside a guest thread's stack, for the same reason: XAPI issues
++     * some control transfers into a buffer on the caller's stack (Halo 2 does
++     * during enumeration when its cache partition is empty: buffer at
++     * 0x00F7FDB7), MmGetPhysicalAddress passes that through unchanged, and it
++     * is below the contiguous high-water mark. Sent to the window it faulted
++     * in the controller thread -- every boot of a fresh install. */
++    if (addr >= XBOX_STACK_BASE && addr < XBOX_STACK_BASE + XBOX_STACK_SIZE)
++        return addr;
+     if (addr && addr < xbox_ContiguousAllocatedBytes())
+         return OHCI_CONTIG_BASE + addr;
+     return addr;
+@@ -830,6 +838,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
                  }
              }
              fprintf(stderr, "\n");
@@ -7806,7 +7821,7 @@ index 641a94d..4d81468 100644
              /* A raised IRQL that never drops holds every interrupt off until
               * the forced-delivery timeout, which looks like a slow pad. Name
               * who is holding it. */
-@@ -896,7 +897,12 @@ static int ohci_call_isr(OhciController *hc)
+@@ -896,7 +905,12 @@ static int ohci_call_isr(OhciController *hc)
      g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
      g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
  
