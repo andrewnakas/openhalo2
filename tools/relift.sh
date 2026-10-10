@@ -18,6 +18,8 @@ mkdir -p "$TMP"
 python -m tools.recomp "$XBE" --all --split 250 --game-name halo2 --gen-dir "$TMP" 2>&1 | grep -v "gen_tmp" || true
 # the pipeline's recomp_types.h comes from the template; keep the project copy in step
 cp templates/runtime/recomp_types.h "$TMP/recomp_types.h"
+# hardware libraries get checked register access (no page faults): see h2lift/mmio_pass.py
+python /d/n64work/openhalo2/h2lift/mmio_pass.py "$TMP"
 changed=0
 for f in "$TMP"/*; do
   b=$(basename "$f")

@@ -794,6 +794,31 @@ index 7156be9..efb9c8f 100644
              if (left > 1.0f) left = 1.0f;
              if (left < -1.0f) left = -1.0f;
              if (right > 1.0f) right = 1.0f;
+diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
+index b3c9305..6f2cc49 100644
+--- a/src/apu/apu_mmio_hook.c
++++ b/src/apu/apu_mmio_hook.c
+@@ -18,7 +18,7 @@ MCPXAPUState *g_apu_state = NULL;
+ /* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
+  * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
+  * now the whole body is Windows-only so apu_emu links on Debian. */
+-#if defined(_WIN32)
++#if defined(_WIN32) && defined(_M_X64)
+ #include <windows.h>
+ 
+ /* APU MMIO base in Xbox VA space */
+@@ -280,4 +280,10 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+     return ok;
+ }
+ 
+-#endif /* _WIN32 */
++#else /* not x64 Windows: registers are reached through mcpx_apu_mmio_read/write directly */
++
++bool apu_hook_handle_mmio(void *ctx, uintptr_t fault_addr,
++                          uint32_t fault_xbox_va, int is_write)
++{ (void)ctx; (void)fault_addr; (void)fault_xbox_va; (void)is_write; return false; }
++
++#endif /* x64 Windows */
 diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
 index f45b42b..8470266 100644
 --- a/src/apu/apu_vp.c
@@ -6789,10 +6814,10 @@ index 65bbedb..039dd4f 100644
      s_tot_unknown += unknown;
 diff --git a/src/kernel/nv2a_reg_trap.c b/src/kernel/nv2a_reg_trap.c
 new file mode 100644
-index 0000000..a021daa
+index 0000000..9ac3257
 --- /dev/null
 +++ b/src/kernel/nv2a_reg_trap.c
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,266 @@
 +/*
 + * nv2a_reg_trap.c -- exact behaviour for the few NV2A registers a title
 + * handshakes with.
@@ -6855,6 +6880,7 @@ index 0000000..a021daa
 +static volatile uint32_t s_shadow[TRAP_PAGES][PAGE_BYTES / 4];
 +static int s_active;
 +static volatile LONG s_faults, s_undecoded;
++static volatile LONG s_direct;
 +
 +static int page_of(uint32_t off)
 +{
@@ -6970,6 +6996,20 @@ index 0000000..a021daa
 +    }
 +}
 +
++/* Direct entry for code that tests the address itself (h2lift's checked
++ * accessors, recomp_mmio.h): the same register semantics with no fault. */
++uint32_t xbox_Nv2aRegTrapRead(uint32_t xbox_va, int size)
++{
++    InterlockedIncrement(&s_direct);
++    return (uint32_t)trap_rd(NULL, xbox_va - NV2A_APERTURE, size);
++}
++
++void xbox_Nv2aRegTrapWrite(uint32_t xbox_va, uint32_t val, int size)
++{
++    InterlockedIncrement(&s_direct);
++    trap_wr(NULL, xbox_va - NV2A_APERTURE, val, size);
++}
++
 +int xbox_Nv2aRegTrapHandle(void *ctx, uint32_t xbox_va)
 +{
 +    uint32_t off = xbox_va - NV2A_APERTURE;
@@ -6980,7 +7020,7 @@ index 0000000..a021daa
 +    InterlockedIncrement(&s_faults);
 +    ok = mmio_emulate((PCONTEXT)ctx, off, NULL, trap_rd, trap_wr);
 +    if (!ok && InterlockedIncrement(&s_undecoded) <= 20) {
-+        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
++        const uint8_t *ip = (const uint8_t *)MMIO_CTX_IP((PCONTEXT)ctx);
 +        fprintf(stderr, "  [NV2A-REG] undecoded access at +0x%06X: "
 +                        "%02X %02X %02X %02X %02X %02X %02X %02X\n",
 +                off, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]);
@@ -7033,8 +7073,8 @@ index 0000000..a021daa
 +void xbox_Nv2aRegTrapReport(void)
 +{
 +    if (s_active)
-+        fprintf(stderr, "  [NV2A-REG] %ld trapped accesses, %ld undecoded\n",
-+                (long)s_faults, (long)s_undecoded);
++        fprintf(stderr, "  [NV2A-REG] %ld trapped accesses, %ld undecoded, %ld direct\n",
++                (long)s_faults, (long)s_undecoded, (long)s_direct);
 +}
 +
 +#else
@@ -7594,7 +7634,7 @@ index 8acb0af..5b533f5 100644
  /* Run the program from the start slot on one vertex. Inputs are the ten
   * attribute values as floats. Returns 0 if there is no program to run (no
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..8cc7bb8 100644
+index 72d5131..5ab9070 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -152,6 +152,9 @@ static size_t xbox_TiledApertureSize(void)
@@ -7753,7 +7793,23 @@ index 72d5131..8cc7bb8 100644
  RECOMP_TLS int g_fp_top = 0;
  
  /* Set once at startup. The generated code reads it at the ret of every
-@@ -3094,6 +3185,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+@@ -2548,7 +2639,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+         uint64_t tiled_lo = XBOX_TILED_BASE;
+         uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
+ 
+-        for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
++        /* A 32-bit host has no room for 1.8 GB of aliases and a WebAssembly
++         * memory cannot alias at all, so there the title runs without them
++         * (RECOMP_NO_MIRRORS=1 tries the same on a 64-bit host). A title
++         * that depended on address wrap would fault on an unmapped page. */
++        int n_mirrors = (sizeof(void *) == 4 || getenv("RECOMP_NO_MIRRORS"))
++                            ? 0 : XBOX_NUM_MIRRORS;
++
++        for (int m = 0; m < n_mirrors; m++) {
+             uintptr_t mirror_base = (uintptr_t)g_memory_base +
+                                     (uintptr_t)(m + 1) * g_memory_size;
+             uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
+@@ -3094,6 +3192,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
      g_contig_block_count++;
  }
  
@@ -7794,8 +7850,75 @@ index 72d5131..8cc7bb8 100644
  uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  {
      uint32_t result = 0;
+diff --git a/src/nv2a/nv2a_mmio_hook.c b/src/nv2a/nv2a_mmio_hook.c
+index d2b401d..615160d 100644
+--- a/src/nv2a/nv2a_mmio_hook.c
++++ b/src/nv2a/nv2a_mmio_hook.c
+@@ -28,7 +28,7 @@ static int g_mmio_decode_fail = 0;
+  * (regardless of whether the MMIO hook is active). Keep its definition
+  * outside the Win32 guard. */
+ 
+-#if defined(_WIN32)
++#if defined(_WIN32) && defined(_M_X64)
+ 
+ /* ============================================================
+  * x86-64 register access helpers
+@@ -417,7 +417,7 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
+     return false;
+ }
+ 
+-#else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
++#else /* not x64 Windows: no fault route (see platform/mmio_decode.h) */
+ 
+ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
+ { (void)xbox_mem_offset; }
+diff --git a/src/platform/mmio_decode.h b/src/platform/mmio_decode.h
+index c0dd9e0..a1c5b7c 100644
+--- a/src/platform/mmio_decode.h
++++ b/src/platform/mmio_decode.h
+@@ -30,11 +30,33 @@
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
++#endif
++
+ 
+ /* Service one register access. dev is passed straight back to the callbacks. */
+ typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
+ typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
+ 
++/* The decoder reads an x64 fault context. On any other host there is no
++ * fault route: register accesses arrive through the direct entry points
++ * (xbox_Nv2aRegTrapRead and friends), and a fault on a register page is a
++ * bug to be reported, not emulated. */
++#if !(defined(_WIN32) && defined(_M_X64))
++#if defined(_WIN32)
++#define MMIO_CTX_IP(c) ((uintptr_t)(c)->Eip)
++#else
++#define MMIO_CTX_IP(c) ((uintptr_t)0)
++#endif
++static inline int mmio_emulate(void *ctx, uint32_t off, void *dev,
++                               mmio_read_fn rd, mmio_write_fn wr)
++{
++    (void)ctx; (void)off; (void)dev; (void)rd; (void)wr;
++    return 0;
++}
++#else
++#define MMIO_CTX_IP(c) ((uintptr_t)(c)->Rip)
++
++
+ static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
+ {
+     switch (reg & 0xF) {
+@@ -202,5 +224,5 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+     }
+ }
+ 
+-#endif /* _WIN32 */
++#endif /* x64 Windows */
+ #endif /* MMIO_DECODE_H */
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
-index 641a94d..f298482 100644
+index 641a94d..52bf180 100644
 --- a/src/usb/ohci.c
 +++ b/src/usb/ohci.c
 @@ -500,6 +500,14 @@ static uint32_t bus_resolve(uint32_t addr)
@@ -7834,6 +7957,36 @@ index 641a94d..f298482 100644
  
      xbox_worker_stack_free(slot);
      return (int)(g_eax & 1u);
+@@ -1340,6 +1354,20 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
+     return hc_for(xbox_va) != NULL;
+ }
+ 
++/* Direct entry (no fault, no decoder): see recomp_mmio.h. */
++uint32_t xbox_OhciRead(uint32_t xbox_va, int size)
++{
++    OhciController *hc = hc_for(xbox_va);
++    return hc ? (uint32_t)ohci_read(hc, xbox_va - hc->base, size) : 0;
++}
++
++void xbox_OhciWrite(uint32_t xbox_va, uint32_t val, int size)
++{
++    OhciController *hc = hc_for(xbox_va);
++    if (hc)
++        ohci_write(hc, xbox_va - hc->base, val, size);
++}
++
+ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
+ {
+ #if defined(_WIN32)
+@@ -1351,7 +1379,7 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
+     ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
+                       ohci_read, ohci_write);
+     if (!ok && hc->decode_fail++ < 20) {
+-        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
++        const uint8_t *ip = (const uint8_t *)MMIO_CTX_IP((PCONTEXT)ctx);
+         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "
+                         "%02X %02X %02X %02X %02X %02X\n",
+                 hc->index, xbox_va - hc->base,
 diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
 index bd00f3f..da7f020 100644
 --- a/src/usb/usb_gamepad.c

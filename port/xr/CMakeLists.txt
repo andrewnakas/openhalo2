@@ -52,6 +52,7 @@ file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
+    src/mmio_direct.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -99,6 +100,12 @@ if(MSVC)
     )
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        # 32-bit host: the guest's RAM is mapped low (the first free of
+        # 0x10000, 8 MB, 16 MB, 32 MB, 256 MB) and its contiguous window at
+        # 0x80000000 + that offset, so the program itself sits out of the way.
+        target_link_options(${PROJECT_NAME} PRIVATE /BASE:0x60000000 /DYNAMICBASE:NO)
+    endif()
 endif()
 
 # ── Game-specific additions ─────────────────────────────────────

@@ -129,6 +129,15 @@ extern void xbe_entry_point(void);
  *
  * Requires linking dbghelp and keeping the .pdb beside the .exe.
  */
+/* The fault context's instruction and stack pointers on either Windows host. */
+#if defined(_M_X64)
+#define CTX_IP(c) ((uintptr_t)(c)->Rip)
+#define CTX_SP(c) ((uintptr_t)(c)->Rsp)
+#else
+#define CTX_IP(c) ((uintptr_t)(c)->Eip)
+#define CTX_SP(c) ((uintptr_t)(c)->Esp)
+#endif
+
 static void print_guest_context(void *rip)
 {
     /* SYMBOL_INFO is variable-length: the name is written past the struct, so
@@ -243,6 +252,11 @@ int  xbox_Nv2aRegTrapOwns(uint32_t xbox_va);
 int  xbox_Nv2aRegTrapHandle(void *ctx, uint32_t xbox_va);
 void xbox_Nv2aRegTrapReport(void);
 
+/* Register accesses that do not fault (mmio_direct.c), and the count of
+ * those that still do. */
+void recomp_mmio_note_fault(uintptr_t ip, uint32_t va);
+void recomp_mmio_report(void);
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -253,9 +267,13 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         {
             uint32_t reg_va =
                 (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
-            if (xbox_Nv2aRegTrapOwns(reg_va)
-                    && xbox_Nv2aRegTrapHandle(ep->ContextRecord, reg_va))
-                return EXCEPTION_CONTINUE_EXECUTION;
+            if (xbox_Nv2aRegTrapOwns(reg_va)) {
+                uintptr_t ip = CTX_IP(ep->ContextRecord);
+                if (xbox_Nv2aRegTrapHandle(ep->ContextRecord, reg_va)) {
+                    recomp_mmio_note_fault(ip, reg_va);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
         }
 
         /* A fault at host 0xFD000000-0xFE000000 used to return
@@ -275,21 +293,26 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
                 (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
 
             /* USB controller registers -> the OHCI model. */
+            uintptr_t ip = CTX_IP(ep->ContextRecord);
+
             if (xbox_OhciOwnsAddress(xbox_va)
-                    && xbox_OhciHandleMmio(ep->ContextRecord, xbox_va))
+                    && xbox_OhciHandleMmio(ep->ContextRecord, xbox_va)) {
+                recomp_mmio_note_fault(ip, xbox_va);
                 return EXCEPTION_CONTINUE_EXECUTION;
+            }
 
             if (xbox_va >= APU_TRAP_BASE && xbox_va < APU_TRAP_END
                     && apu_hook_handle_mmio(
                            ep->ContextRecord, fault_addr, xbox_va,
                            ep->ExceptionRecord->ExceptionInformation[0]
                                ? 1 : 0)) {
+                recomp_mmio_note_fault(ip, xbox_va);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
 
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
-            (unsigned long long)ep->ContextRecord->Rip,
+            (unsigned long long)CTX_IP(ep->ContextRecord),
             (unsigned long long)fault_addr,
             ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
         fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n",
@@ -298,7 +321,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             g_ebx, g_esi, g_edi);
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
             (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
-        print_guest_context((void *)ep->ContextRecord->Rip);
+        print_guest_context((void *)CTX_IP(ep->ContextRecord));
 
         /*
          * TODO: Add game-specific diagnostics here. Examples:
@@ -314,7 +337,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
         /* Print native stack return addresses for debugging */
         {
-            uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
+            uintptr_t *sp = (uintptr_t *)CTX_SP(ep->ContextRecord);
             fprintf(stderr, "  Native stack (first 8 return addrs):\n");
             for (int i = 0; i < 64 && sp[i]; i++) {
                 if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
@@ -550,6 +573,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* After start-up has seeded the register aperture. */
     xbox_Nv2aRegTrapInit();
     atexit(xbox_Nv2aRegTrapReport);
+    atexit(recomp_mmio_report);
 
     /* Step 4: Set game directory for file I/O path translation */
     {
