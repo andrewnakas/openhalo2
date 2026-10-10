@@ -21,8 +21,8 @@ var Module = {
   canvas: document.getElementById('canvas'),
   print: say, printErr: say,
   preRun: [function () {
-    // environment switches: ?env=RECOMP_X=1,RECOMP_Y=2
-    for (const kv of (q.get('env') || '').split(',')) {
+    // environment switches: ?env=RECOMP_X=1~RECOMP_Y=2  ('~' between them: values hold commas)
+    for (const kv of (q.get('env') || '').split('~')) {
       const i = kv.indexOf('='); if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1);
     }
   }],
