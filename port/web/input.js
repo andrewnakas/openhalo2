@@ -32,24 +32,32 @@
   addEventListener('mouseup', e => { mbuttons &= ~(1 << e.button); });
   addEventListener('contextmenu', e => { if (document.pointerLockElement) e.preventDefault(); });
 
-  // ?script=2000:Enter:30,+300:Space:30,...  a test script keyed on FRAMES SHOWN
-  // (Module.h2frames), not seconds: how long the boot takes varies with the
-  // machine's load, the number of frames before the title screen much less.
-  // Each step is frame:key-code:frames-held; "+n" counts from the previous step.
+  // ?script=2200:Enter:1,+8:Space:1,+8:Space:1,...   a test script.
+  // The first step waits for a number of FRAMES SHOWN (Module.h2frames): how
+  // long the boot takes varies with the machine's load, the number of frames
+  // before the title screen much less. Every later step is "+seconds" after
+  // the previous one began: menus present at anything from 15 to 60 frames a
+  // second, so counting frames there burns the presses during a transition.
+  // Each step is when:key-code:seconds-held.
   const script = [];
-  {
-    let at = 0;
-    for (const step of (new URLSearchParams(location.search).get('script') || '').split(',')) {
-      const [f, code, hold] = step.split(':');
-      if (!code) continue;
-      at = f[0] === '+' ? at + Number(f.slice(1)) : Number(f);
-      script.push({ from: at, to: at + Number(hold || 30), code });
-    }
+  for (const step of (new URLSearchParams(location.search).get('script') || '').split(',')) {
+    const [f, code, hold] = step.split(':');
+    if (!code) continue;
+    script.push({ frame: f[0] === '+' ? null : Number(f), after: f[0] === '+' ? Number(f.slice(1)) : 0,
+                  hold: Number(hold || 1), code, start: 0 });
   }
   const scripted = c => {
     if (!script.length) return false;
-    const n = (typeof Module !== 'undefined' && Module.h2frames) || 0;
-    return script.some(s => s.code === c && n >= s.from && n < s.to);
+    const n = (typeof Module !== 'undefined' && Module.h2frames) || 0, now = performance.now() / 1000;
+    for (let i = 0; i < script.length; i++) {
+      const s = script[i];
+      if (!s.start) {
+        if (s.frame !== null ? n >= s.frame : (i > 0 && script[i - 1].start && now >= script[i - 1].start + s.after)) s.start = now;
+        else break;
+      }
+      if (s.code === c && now < s.start + s.hold) return true;
+    }
+    return false;
   };
   const k = c => keys.has(c) || scripted(c);
   const clamp16 = v => Math.max(-32768, Math.min(32767, Math.round(v)));
