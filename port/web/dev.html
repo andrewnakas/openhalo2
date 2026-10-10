@@ -1,0 +1,30 @@
+<!doctype html>
+<!-- Open Halo 2: development page. Reads game files from ./game on the dev
+     server (a junction to the owner's own disc files in the work dir).
+     Never published. -->
+<html><head><meta charset="utf-8"><title>Open Halo 2 (dev)</title>
+<style>body{background:#111;color:#ccc;font:13px monospace;margin:8px}canvas{background:#000;display:block}
+#log{white-space:pre-wrap;max-height:40vh;overflow:auto}</style></head>
+<body><canvas id="canvas" width="640" height="480"></canvas><div id="log"></div>
+<script>
+const logEl = document.getElementById('log');
+function say(s) { console.log(s); logEl.textContent += s + '\n'; logEl.scrollTop = 1e9; }
+const q = new URLSearchParams(location.search);
+var Module = {
+  canvas: document.getElementById('canvas'),
+  print: say, printErr: say,
+  preRun: [function () {
+    // environment switches: ?env=RECOMP_X=1,RECOMP_Y=2
+    for (const kv of (q.get('env') || '').split(',')) {
+      const i = kv.indexOf('='); if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1);
+    }
+    FS.mkdir('/game'); FS.mkdir('/save');
+    FS.createPreloadedFile('/game', 'default.xbe', 'game/default.xbe', true, false);
+  }],
+  onAbort: function (w) { say('ABORT: ' + w); },
+};
+window.addEventListener('error', e => say('page error: ' + e.message));
+window.addEventListener('unhandledrejection', e => say('rejection: ' + e.reason));
+</script>
+<script src="halo2.js"></script>
+</body></html>

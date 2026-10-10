@@ -6814,10 +6814,10 @@ index 65bbedb..039dd4f 100644
      s_tot_unknown += unknown;
 diff --git a/src/kernel/nv2a_reg_trap.c b/src/kernel/nv2a_reg_trap.c
 new file mode 100644
-index 0000000..4e2069c
+index 0000000..8c0cdea
 --- /dev/null
 +++ b/src/kernel/nv2a_reg_trap.c
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,289 @@
 +/*
 + * nv2a_reg_trap.c -- exact behaviour for the few NV2A registers a title
 + * handshakes with.
@@ -6966,8 +6966,6 @@ index 0000000..4e2069c
 +                           + NV2A_APERTURE + OFF_PMC_INTR) |= (1u << 24);
 +}
 +
-+#if defined(_WIN32)
-+
 +/* mmio_decode callbacks: off is the aperture offset; sizes 1, 2 and 4. */
 +static uint64_t trap_rd(void *dev, uint32_t off, int size)
 +{
@@ -7009,6 +7007,8 @@ index 0000000..4e2069c
 +    s_direct++;
 +    trap_wr(NULL, xbox_va - NV2A_APERTURE, val, size);
 +}
++
++#if defined(_WIN32)
 +
 +int xbox_Nv2aRegTrapHandle(void *ctx, uint32_t xbox_va)
 +{
@@ -7080,8 +7080,31 @@ index 0000000..4e2069c
 +#else
 +
 +int  xbox_Nv2aRegTrapHandle(void *ctx, uint32_t xbox_va) { (void)ctx; (void)xbox_va; return 0; }
-+void xbox_Nv2aRegTrapInit(void) {}
-+void xbox_Nv2aRegTrapReport(void) {}
++/* No page protection here (a 32-bit-clean or WebAssembly host): the lifted
++ * hardware code reaches the registers through xbox_Nv2aRegTrapRead/Write
++ * (recomp_mmio.h), so the model only has to be seeded and switched on. */
++void xbox_Nv2aRegTrapInit(void)
++{
++    uintptr_t base = (uintptr_t)xbox_GetMemoryOffset() + NV2A_APERTURE;
++    int i;
++
++    if (s_active || getenv("RECOMP_NO_NV2A_TRAP"))
++        return;
++    for (i = 0; i < TRAP_PAGES; i++)
++        memcpy((void *)s_shadow[i], (const void *)(base + s_page_off[i]),
++               PAGE_BYTES);
++    s_shadow[0][(OFF_PMC_INTR & 0xFFFu) / 4] = 0;
++    s_shadow[2][(OFF_PCRTC_INTR & 0xFFFu) / 4] = 0;
++    s_shadow[1][(OFF_PFB_FLUSH & 0xFFFu) / 4] &= ~0x00010000u;
++    s_active = 1;
++    fprintf(stderr, "  [NV2A-REG] PMC, PFB and PCRTC registers modelled "
++                    "(direct access, no page trap)\n");
++}
++
++void xbox_Nv2aRegTrapReport(void)
++{
++    fprintf(stderr, "  [NV2A-REG] %ld direct accesses\n", (long)s_direct);
++}
 +
 +#endif
 diff --git a/src/kernel/nv2a_reg_trap.h b/src/kernel/nv2a_reg_trap.h
@@ -7634,7 +7657,7 @@ index 8acb0af..5b533f5 100644
  /* Run the program from the start slot on one vertex. Inputs are the ten
   * attribute values as floats. Returns 0 if there is no program to run (no
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..19e8990 100644
+index 72d5131..8dd6b89 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -152,6 +152,9 @@ static size_t xbox_TiledApertureSize(void)
@@ -7829,11 +7852,20 @@ index 72d5131..19e8990 100644
      return EXCEPTION_CONTINUE_SEARCH;
  }
  
-@@ -1761,11 +1860,22 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -1761,11 +1860,31 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
       */
      {
          static const uintptr_t try_bases[] = {
-+#if UINTPTR_MAX == 0xFFFFFFFFu
++#if defined(__EMSCRIPTEN__)
++            /* Guest 0 at 4 KB of a 4 GB linear memory, so that no guest
++             * address wraps: a WebAssembly access traps where a 32-bit
++             * pointer sum would wrap (the compiler folds a constant address
++             * into the access offset, which is added without wrap). RAM
++             * 0x1000, contiguous 0x80001000, NV2A 0xFD001000, MCPX
++             * 0xFE801000, flash 0xFF001000. Not 0: a null base means
++             * "not mapped" throughout this file. */
++            0x00001000,
++#elif UINTPTR_MAX == 0xFFFFFFFFu
 +            /* 32-bit host: guest addresses wrap modulo 4 GB, so the offset
 +             * must also keep the high apertures off host page 0 (at
 +             * 0x10000000 the tiled aperture, guest 0xF0000000, lands on host
@@ -7852,7 +7884,7 @@ index 72d5131..19e8990 100644
              0,                      /* sentinel - let OS choose */
          };
  
-@@ -2548,7 +2658,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -2548,7 +2667,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          uint64_t tiled_lo = XBOX_TILED_BASE;
          uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
  
@@ -7868,7 +7900,7 @@ index 72d5131..19e8990 100644
              uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                      (uintptr_t)(m + 1) * g_memory_size;
              uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
-@@ -2627,7 +2744,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -2627,7 +2753,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
           */
          if (tiled_size > XBOX_CONTIG_SIZE)
              tiled_size = XBOX_CONTIG_SIZE;
@@ -7877,7 +7909,7 @@ index 72d5131..19e8990 100644
              ? MapViewOfFileEx(
                  g_contig_mapping,
                  FILE_MAP_ALL_ACCESS,
-@@ -3094,6 +3211,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+@@ -3094,6 +3220,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
      g_contig_block_count++;
  }
  
@@ -7985,6 +8017,131 @@ index c0dd9e0..a1c5b7c 100644
 -#endif /* _WIN32 */
 +#endif /* x64 Windows */
  #endif /* MMIO_DECODE_H */
+diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
+index 93288d5..5093e6c 100644
+--- a/src/platform/win32_compat.c
++++ b/src/platform/win32_compat.c
+@@ -1124,8 +1124,30 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
+ void view_register(void *addr, size_t len);
+ size_t view_take(const void *addr);
+ 
++#if defined(__EMSCRIPTEN__)
++/* WebAssembly: one linear memory, no mmap at a chosen address and no page
++ * protection. The guest's address ranges are set aside by the link
++ * (GLOBAL_BASE above its RAM, a 4 GB memory, the program's own heap between
++ * 128 MB and 2 GB: see port/web/build_web.sh), so a request for a fixed address inside them is
++ * granted as it stands. The memory is zero at start; a decommit zeroes it
++ * again so that a later commit finds what Windows would give. */
++#define EM_GUEST_LOW_END  0x08000000u
++#define EM_GUEST_HIGH     0x80000000u
++static int em_guest_addr(const void *p)
++{
++    uintptr_t a = (uintptr_t)p;
++    return a && (a < EM_GUEST_LOW_END || a >= EM_GUEST_HIGH);
++}
++#endif
++
+ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
+ {
++#if defined(__EMSCRIPTEN__)
++    if (em_guest_addr(address)) {
++        (void)size; (void)allocationType; (void)protect;
++        return address;
++    }
++#endif
+     int prot  = prot_from_page(protect);
+     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+ 
+@@ -1171,6 +1193,13 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
+ 
+ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
+ {
++#if defined(__EMSCRIPTEN__)
++    if (em_guest_addr(address)) {
++        if ((freeType & MEM_DECOMMIT) && size)
++            memset(address, 0, size);
++        return TRUE;
++    }
++#endif
+     if (freeType & MEM_RELEASE) {
+         /* Win32 MEM_RELEASE passes size 0 and frees the whole allocation, so
+          * the length comes from the registry VirtualAlloc filled in. Returning
+@@ -1190,6 +1219,10 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
+ BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
+ {
+     if (oldProtect) *oldProtect = PAGE_READWRITE;
++#if defined(__EMSCRIPTEN__)
++    if (em_guest_addr(address))
++        return TRUE;
++#endif
+     return mprotect(address, size, prot_from_page(newProtect)) == 0;
+ }
+ 
+@@ -1613,9 +1646,22 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
+                           DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
+ {
+     (void)file; (void)sa; (void)protect;
+-    SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
++    /* 64-bit arithmetic: on a 32-bit host a shift of SIZE_T by 32 is undefined
++     * (clang compiles it to a trap). */
++    SIZE_T size = (SIZE_T)(((uint64_t)maxSizeHigh << 32) | maxSizeLow);
+     if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+ 
++#if defined(__EMSCRIPTEN__)
++    /* Nothing backs a mapping here: a view at a guest address is the linear
++     * memory itself (MapViewOfFileEx). */
++    {
++        w32_object *eo = obj_alloc(K_FILEMAP);
++        (void)name;
++        eo->fd       = -1;
++        eo->map_size = size;
++        return (HANDLE)eo;
++    }
++#endif
+     int fd = anon_map_fd(name);
+     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+     if (ftruncate(fd, (off_t)size) != 0) {
+@@ -1641,6 +1687,13 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
+                        SIZE_T count, LPVOID baseAddr)
+ {
+     w32_object *o = (w32_object *)mapping;
++#if defined(__EMSCRIPTEN__)
++    /* No aliasing in a linear memory: a view at a guest address is that
++     * memory itself (the title needs no two views of one section: measured
++     * with RECOMP_NO_MIRRORS and RECOMP_NO_TILED on the native build). */
++    if (em_guest_addr(baseAddr))
++        return baseAddr;
++#endif
+     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
+ 
+     off_t  off = ((off_t)offHigh << 32) | offLow;
+@@ -1691,6 +1744,10 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
+ 
+ BOOL UnmapViewOfFile(LPCVOID baseAddr)
+ {
++#if defined(__EMSCRIPTEN__)
++    if (em_guest_addr(baseAddr))
++        return TRUE;
++#endif
+     size_t len = view_take(baseAddr);
+     if (len == 0) return FALSE;
+     return munmap((void *)baseAddr, len) == 0;
+diff --git a/src/platform/win32_compat.h b/src/platform/win32_compat.h
+index 22762ee..a7e0ca6 100644
+--- a/src/platform/win32_compat.h
++++ b/src/platform/win32_compat.h
+@@ -89,6 +89,11 @@ LONG InterlockedIncrement(volatile LONG *Addend);
+ LONG InterlockedDecrement(volatile LONG *Addend);
+ LONG InterlockedExchange(volatile LONG *Target, LONG Value);
+ LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
++#if defined(__EMSCRIPTEN__)   /* provided by the web port (port/web/compat_web.c) */
++long long InterlockedExchangeAdd64(volatile long long *Addend, long long Value);
++void YieldProcessor(void);
++unsigned int timeBeginPeriod(unsigned int ms);
++#endif
+ LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
+ LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
+ PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
 index 641a94d..52bf180 100644
 --- a/src/usb/ohci.c
