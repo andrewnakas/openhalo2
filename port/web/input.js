@@ -43,7 +43,9 @@
   for (const step of (new URLSearchParams(location.search).get('script') || '').split(',')) {
     const [f, code, hold] = step.split(':');
     if (!code) continue;
-    script.push({ frame: f[0] === '+' ? null : Number(f), after: f[0] === '+' ? Number(f.slice(1)) : 0,
+    // "+8" arrives as " 8": a plus sign in a query string is a space
+    const rel = f[0] === '+' || f[0] === ' ';
+    script.push({ frame: rel ? null : Number(f), after: rel ? Number(f.slice(1)) : 0,
                   hold: Number(hold || 1), code, start: 0 });
   }
   const scripted = c => {

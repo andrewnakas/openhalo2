@@ -8895,10 +8895,26 @@ index 641a94d..0f481d9 100644
                          "%02X %02X %02X %02X %02X %02X\n",
                  hc->index, xbox_va - hc->base,
 diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
-index bd00f3f..da7f020 100644
+index bd00f3f..78ce2af 100644
 --- a/src/usb/usb_gamepad.c
 +++ b/src/usb/usb_gamepad.c
-@@ -628,5 +628,28 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+@@ -595,11 +595,13 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+                 DWORD rc = xbox_InputGetState(0, &probe);
+                 last = now;
+                 fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
+-                        "InputGetState=%lu buttons=0x%04X\n",
++                        "InputGetState=%lu buttons=0x%04X A=%u B=%u\n",
+                         getenv("RECOMP_KEYBOARD") ? 1 : 0,
+                         xbox_FramebufferKeyDown(0x0D),
+                         (unsigned long)rc,
+-                        rc == 0 ? probe.Gamepad.wButtons : 0);
++                        rc == 0 ? probe.Gamepad.wButtons : 0,
++                        rc == 0 ? probe.Gamepad.bAnalogButtons[0] : 0,
++                        rc == 0 ? probe.Gamepad.bAnalogButtons[1] : 0);
+                 fflush(stderr);
+             }
+         }
+@@ -628,5 +630,28 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
      out[18] = (uint8_t)(g->sThumbRY & 0xFF);
      out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
      pad_script_apply(pad, out);
