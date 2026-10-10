@@ -17,6 +17,7 @@
 #include <emscripten/threading.h>
 
 extern ptrdiff_t g_xbox_mem_offset;
+int nv2a_gl_active(void);
 
 #define FB_W 640
 #define FB_H 480
@@ -44,7 +45,7 @@ void xbox_web_present(uint32_t fb_va, uint32_t pitch)
     const uint8_t *src;
     uint32_t bpp, x, y;
 
-    if (!fb_va || !pitch)
+    if (!fb_va || !pitch || nv2a_gl_active())   /* the GL backend presents by itself */
         return;
     s_frames++;
     if (atomic_exchange(&s_pending, 1)) {

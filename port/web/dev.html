@@ -27,6 +27,19 @@ var Module = {
     }
   }],
   onAbort: function (w) { say('ABORT: ' + w); },
+  // A frame from the WebGL2 backend (nv2a_gl.c): an ImageBitmap made on the
+  // executor's own canvas, shown on a second canvas over the first.
+  nv2aFrame: function (bmp) {
+    let g = Module.nv2aView;
+    if (!g) {
+      const c = document.createElement('canvas'); c.id = 'glcanvas'; c.width = 640; c.height = 480;
+      Module.canvas.replaceWith(c);
+      g = Module.nv2aView = c.getContext('bitmaprenderer');
+      say('page: first WebGL frame ' + bmp.width + 'x' + bmp.height);
+    }
+    g.transferFromImageBitmap(bmp);
+    Module.h2frames = (Module.h2frames || 0) + 1;
+  },
 };
 window.addEventListener('error', e => say('page error: ' + e.message));
 window.addEventListener('unhandledrejection', e => say('rejection: ' + e.reason));
@@ -78,6 +91,15 @@ async function importTree() {
       if (q.get('ls') === 'only') return;
     }
     if (q.get('import') === 'only') return;
+    // Frames from the WebGL2 backend come straight from its worker as
+    // {nv2aFrame: ImageBitmap}; every worker the runtime starts gets a listener.
+    const RealWorker = window.Worker;
+    window.Worker = class extends RealWorker {
+      constructor(...a) {
+        super(...a);
+        this.addEventListener('message', e => { const d = e.data; if (d && d.nv2aFrame) Module.nv2aFrame(d.nv2aFrame); });
+      }
+    };
     const s = document.createElement('script'); s.src = 'halo2.js'; document.body.appendChild(s);
   } catch (e) { say('start failed: ' + (e && e.stack || e)); }
 })();

@@ -66,6 +66,7 @@ int main(void)
     def("RECOMP_USB", "1");
     def("RECOMP_NO_MIRRORS", "1");
     def("RECOMP_NO_TILED", "1");
+    def("RECOMP_GPU", "1");            /* WebGL2 pixel backend; ?env=RECOMP_GPU=0 = software */
 
     printf("=== Open Halo 2 (web) ===\n");
 

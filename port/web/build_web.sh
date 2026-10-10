@@ -25,7 +25,7 @@ fi
 # apertures begin. See win32_compat.c and xbox_memory_layout.c (__EMSCRIPTEN__).
 emcc -O1 -pthread -sUSE_SDL=2 -sPROXY_TO_PTHREAD -sALLOW_MEMORY_GROWTH=0 \
      -sGLOBAL_BASE=134217728 -sINITIAL_MEMORY=4294901760 -sMAXIMUM_MEMORY=4294901760 -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=4194304 \
-     -sPTHREAD_POOL_SIZE=24 -sERROR_ON_UNDEFINED_SYMBOLS=1 -sEXIT_RUNTIME=0 -sWASMFS -sFORCE_FILESYSTEM=1 \
+     -sPTHREAD_POOL_SIZE=24 -sERROR_ON_UNDEFINED_SYMBOLS=1 -sEXIT_RUNTIME=0 -sWASMFS -sFORCE_FILESYSTEM=1 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
      -sEXPORTED_RUNTIME_METHODS=ENV -sASSERTIONS=1 -g \
      lift/*.o rt/*.o -o site/halo2.js > link.log 2>&1
 echo "LINK_EXIT=$? undefined=$(grep -c 'undefined symbol' link.log) duplicate=$(grep -c 'duplicate symbol' link.log)"

@@ -2511,10 +2511,10 @@ index caf6390..d776633 100644
      }
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..3687246
+index 0000000..ae99be4
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,2736 @@
+@@ -0,0 +1,2982 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -2588,18 +2588,40 @@ index 0000000..3687246
 +#include <stdarg.h>
 +#include <stddef.h>
 +
-+#if defined(_WIN32)
++#if defined(_WIN32) || defined(__EMSCRIPTEN__)
 +
 +#include "kernel.h"                     /* XBOX_CONTIG_BASE / _SIZE */
 +#include "../d3d/d3d8_swizzle.h"
++#if defined(__EMSCRIPTEN__)
++/* WebGL2 (GLES 3.0) on a canvas the executor thread makes for itself. What
++ * differs from the desktop context, all under NV2A_GLES below:
++ *   - no BGRA transfers: pixels are swapped on the CPU at the five places
++ *     data crosses (px_swap), so GL holds true RGBA and the canvas needs no
++ *     conversion;
++ *   - no `noperspective`: colours, fog and z go out multiplied by w and come
++ *     back multiplied by gl_FragCoord.w (1/w), which is the same thing;
++ *   - no synchronous occlusion query (a WebGL query answers a task later);
++ *   - depth clamp is an extension (EXT_depth_clamp), used when present;
++ *   - no window: the frame is handed to the page as an ImageBitmap. */
++#define NV2A_GLES 1
++#include <GLES3/gl3.h>
++#include <emscripten.h>
++#ifndef APIENTRY
++#define APIENTRY
++#endif
++#else
++#define NV2A_GLES 0
 +#include <windows.h>
 +#include <GL/gl.h>
++#endif
 +
 +extern ptrdiff_t xbox_GetMemoryOffset(void);
 +
 +/* Laptops with two adapters: ask for the fast one. Harmless elsewhere. */
++#if !NV2A_GLES
 +__declspec(dllexport) DWORD NvOptimusEnablement = 1;
 +__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
++#endif
 +
 +/* ---- GL beyond 1.1 ------------------------------------------------------ */
 +
@@ -2682,9 +2704,36 @@ index 0000000..3687246
 +    X(GLenum, ClientWaitSync, (void *, GLbitfield, unsigned long long)) \
 +    X(void,   DeleteSync, (void *))
 +
++#if NV2A_GLES
++#undef GL_BGRA
++#define GL_BGRA GL_RGBA                 /* see px_swap */
++#define glClearDepth glClearDepthf
++#define glDrawBuffer(b) do { GLenum b_ = (b); glDrawBuffers(1, &b_); } while (0)
++#define GLSL_VERSION "#version 300 es\n#define NV2A_ES 1\n" \
++                     "precision highp float;\nprecision highp int;\n" \
++                     "precision highp sampler2D;\nprecision highp samplerCube;\n"
++#else
++#define GLSL_VERSION "#version 330 core\n"
 +#define X(ret, name, args) static ret (APIENTRY *gl##name) args;
 +GLFUNCS(X)
 +#undef X
++#endif
++
++/* Swap red and blue in n pixels: guest order (B G R A in memory) to and from
++ * the RGBA a GLES transfer takes. A no-op on the desktop, which transfers
++ * BGRA itself. */
++static void px_swap(uint32_t *p, size_t n)
++{
++#if NV2A_GLES
++    size_t i;
++    for (i = 0; i < n; i++) {
++        uint32_t v = p[i];
++        p[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) | ((v & 0x000000FFu) << 16);
++    }
++#else
++    (void)p; (void)n;
++#endif
++}
 +
 +/* ---- State -------------------------------------------------------------- */
 +
@@ -2989,10 +3038,22 @@ index 0000000..3687246
 +    bind_scratch(GL_TEXTURE_2D, s->tex);
 +    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 +    if (s->bpp == 4) {
++#if NV2A_GLES
++        uint32_t *tight = scratch((size_t)s->w * s->h);
++        int ty;
++        if (!tight)
++            return;
++        for (ty = 0; ty < s->h; ty++)
++            memcpy(tight + (size_t)ty * s->w, src + (size_t)ty * s->pitch, (size_t)s->w * 4);
++        px_swap(tight, (size_t)s->w * s->h);
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s->w, s->h, GL_BGRA,
++                        GL_UNSIGNED_BYTE, tight);
++#else
 +        glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(s->pitch / 4));
 +        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s->w, s->h, GL_BGRA,
 +                        GL_UNSIGNED_BYTE, src);
 +        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++#endif
 +    } else {
 +        uint32_t *buf = scratch((size_t)s->w * s->h);
 +        int x, y;
@@ -3007,6 +3068,7 @@ index 0000000..3687246
 +                                          | ((t & 0x07E0u) << 5) | ((t & 0x001Fu) << 3);
 +            }
 +        }
++        px_swap(buf, (size_t)s->w * s->h);
 +        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s->w, s->h, GL_BGRA,
 +                        GL_UNSIGNED_BYTE, buf);
 +    }
@@ -3044,12 +3106,20 @@ index 0000000..3687246
 +        glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(s->pitch / 4));
 +        glReadPixels(0, 0, s->w, s->h, GL_BGRA, GL_UNSIGNED_BYTE, dst);
 +        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++#if NV2A_GLES
++        {
++            int ry;
++            for (ry = 0; ry < s->h; ry++)
++                px_swap((uint32_t *)(void *)(dst + (size_t)ry * s->pitch), (size_t)s->w);
++        }
++#endif
 +    } else {
 +        uint32_t *buf = scratch((size_t)s->w * s->h);
 +        int x, y;
 +        if (!buf)
 +            return;
 +        glReadPixels(0, 0, s->w, s->h, GL_BGRA, GL_UNSIGNED_BYTE, buf);
++        px_swap(buf, (size_t)s->w * s->h);
 +        for (y = 0; y < s->h; y++) {
 +            uint16_t *row = (uint16_t *)(dst + (size_t)y * s->pitch);
 +            for (x = 0; x < s->w; x++) {
@@ -3208,6 +3278,18 @@ index 0000000..3687246
 + * as "far". */
 +static GLuint depth_for(uint32_t zeta, int need_w, int need_h)
 +{
++#if NV2A_GLES
++    /* WebGL wants every attachment of a framebuffer the same size, so a
++     * depth texture is made for the exact shape and one zeta offset may
++     * hold several (one per colour size it is used with). */
++    int i, w = need_w, h = need_h;
++
++    for (i = 0; i < 4; i++)
++        if (s_depth[i].used && s_depth[i].offset == zeta
++                && s_depth[i].w == need_w && s_depth[i].h == need_h)
++            return s_depth[i].tex;
++    i = 4;
++#else
 +    int i, w = need_w > 1024 ? need_w : 1024, h = need_h > 1024 ? need_h : 1024;
 +
 +    for (i = 0; i < 4; i++)
@@ -3215,6 +3297,7 @@ index 0000000..3687246
 +            break;
 +    if (i < 4 && s_depth[i].w >= need_w && s_depth[i].h >= need_h)
 +        return s_depth[i].tex;
++#endif
 +    if (i == 4)
 +        i = s_depth_next++ & 3;
 +    if (!s_depth[i].tex)
@@ -3294,6 +3377,7 @@ index 0000000..3687246
 +                if (!nv2a_exec_sample_tex(t, f * stride, x, y,
 +                                          &buf[(size_t)y * w + x]))
 +                    buf[(size_t)y * w + x] = 0xFFFFFFFFu;
++        px_swap(buf, (size_t)w * h);
 +        glTexImage2D(t->cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f : GL_TEXTURE_2D,
 +                     0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_BGRA,
 +                     GL_UNSIGNED_BYTE, buf);
@@ -3478,7 +3562,7 @@ index 0000000..3687246
 +}
 +
 +static const char *const VS_SRC =
-+    "#version 330 core\n"
++    GLSL_VERSION
 +    "layout(location=0) in vec4 a_pos;\n"
 +    "layout(location=1) in vec4 a_d0;\n"
 +    "layout(location=2) in vec4 a_d1;\n"
@@ -3490,10 +3574,23 @@ index 0000000..3687246
 +    "uniform vec3 u_scale;\n"
 +    /* Colours and fog interpolate in screen space, texture coordinates
 +     * with perspective: exactly what xf_rows does. */
++    "#ifdef NV2A_ES\n"
++    /* No noperspective in GLSL ES: sent multiplied by w, and the fragment
++     * side multiplies by gl_FragCoord.w (1/w). */
++    "out vec4 n_d0;\n"
++    "out vec4 n_d1;\n"
++    "out float n_fog;\n"
++    "out float n_z;\n"
++    "vec4 v_d0;\n"
++    "vec4 v_d1;\n"
++    "float v_fog;\n"
++    "float v_z;\n"
++    "#else\n"
 +    "noperspective out vec4 v_d0;\n"
 +    "noperspective out vec4 v_d1;\n"
 +    "noperspective out float v_fog;\n"
 +    "noperspective out float v_z;\n"
++    "#endif\n"
 +    "out float v_zp;\n"
 +    "out vec4 v_t0;\n"
 +    "out vec4 v_t1;\n"
@@ -3510,13 +3607,27 @@ index 0000000..3687246
 +    "  v_zp = v_z;\n"
 +    "  vec3 n = vec3(a_pos.xy * u_scale.xy - 1.0, a_pos.z * u_scale.z * 2.0 - 1.0);\n"
 +    "  gl_Position = vec4(n * w, w);\n"
++    "#ifdef NV2A_ES\n"
++    "  n_d0 = v_d0 * w; n_d1 = v_d1 * w; n_fog = v_fog * w; n_z = v_z * w;\n"
++    "#endif\n"
 +    "}\n";
 +
 +static const char *const FS_HEAD =
++    "#ifdef NV2A_ES\n"
++    "in vec4 n_d0;\n"
++    "in vec4 n_d1;\n"
++    "in float n_fog;\n"
++    "in float n_z;\n"
++    "#define v_d0 (n_d0 * gl_FragCoord.w)\n"
++    "#define v_d1 (n_d1 * gl_FragCoord.w)\n"
++    "#define v_fog (n_fog * gl_FragCoord.w)\n"
++    "#define v_z (n_z * gl_FragCoord.w)\n"
++    "#else\n"
 +    "noperspective in vec4 v_d0;\n"
 +    "noperspective in vec4 v_d1;\n"
 +    "noperspective in float v_fog;\n"
 +    "noperspective in float v_z;\n"
++    "#endif\n"
 +    "in vec4 v_t0;\n"
 +    "in vec4 v_t1;\n"
 +    "in vec4 v_t2;\n"
@@ -3807,7 +3918,7 @@ index 0000000..3687246
 +        return NULL;                    /* table full: 512 distinct set-ups */
 +
 +    sb.p = src; sb.n = 0; sb.cap = sizeof src - 1;
-+    sb_f(&sb, "#version 330 core\n%s%s", k->zpersp ? "#define ZPERSP 1\n" : "",
++    sb_f(&sb, GLSL_VERSION "%s%s", k->zpersp ? "#define ZPERSP 1\n" : "",
 +         FS_HEAD);
 +    switch (k->mode) {
 +    case NV2A_GL_MODE_2D:
@@ -3911,6 +4022,7 @@ index 0000000..3687246
 + * Keys and the mouse are recorded here and read by src/input (the keyboard
 + * stand-in for a controller); see xbox_GameWindowKeyDown / Mouse.
 + */
++#if !NV2A_GLES
 +#ifndef WM_INPUT
 +#define WM_INPUT 0x00FF
 +#endif
@@ -4406,6 +4518,8 @@ index 0000000..3687246
 +
 +/* ---- Context ------------------------------------------------------------ */
 +
++static int gl_setup(void);
++
 +static int gl_init(void)
 +{
 +    typedef HGLRC (WINAPI *CreateAttribs)(HDC, HGLRC, const int *);
@@ -4482,6 +4596,102 @@ index 0000000..3687246
 +        return 0;
 +    }
 +
++    return gl_setup();
++}
++
++#else  /* NV2A_GLES: WebGL2 */
++
++static int win_wanted(void) { return 1; }
++int xbox_GameWindowActive(void) { return 0; }
++int xbox_GameWindowKeyDown(int vk) { (void)vk; return 0; }
++int xbox_GameWindowMouse(int *dx, int *dy, unsigned *buttons)
++{
++    (void)dx; (void)dy; (void)buttons;
++    return 0;
++}
++
++static int s_depth_clamp;
++
++/* A canvas of the executor thread's own (a worker can make an
++ * OffscreenCanvas but cannot reach the page's), a WebGL2 context on it,
++ * registered with Emscripten's GL layer and made current. Returns the
++ * context handle, 0 on failure; bit 30 set when EXT_depth_clamp is there. */
++EM_JS(int, nv2a_web_gl_create, (int w, int h), {
++    try {
++        var c = new OffscreenCanvas(w, h);
++        var attrs = { alpha: false, depth: false, stencil: false, antialias: false,
++                      premultipliedAlpha: false, preserveDrawingBuffer: false,
++                      powerPreference: 'high-performance', majorVersion: 2, minorVersion: 0 };
++        var ctx = c.getContext('webgl2', attrs);
++        if (!ctx) return 0;
++        var clamp = ctx.getExtension('EXT_depth_clamp') ? 1 : 0;
++        var handle = GL.registerContext(ctx, attrs);
++        GL.makeContextCurrent(handle);
++        Module.nv2aCanvas = c;
++        return handle | (clamp << 30);
++    } catch (e) {
++        err('nv2a gl: ' + e);
++        return 0;
++    }
++});
++
++/* The finished frame to the page: the canvas's picture becomes an
++ * ImageBitmap (no copy) and goes to the main thread, whose Module.nv2aFrame
++ * shows it. */
++EM_JS(void, nv2a_web_gl_post, (void), {
++    var bmp = Module.nv2aCanvas.transferToImageBitmap();
++    /* No `cmd` field: Emscripten's own handler for worker messages ignores
++     * it, and the page's listener (see dev.html) takes it. */
++    postMessage({ nv2aFrame: bmp }, [bmp]);
++});
++
++void nv2a_gl_present(uint32_t color_base)
++{
++    GlSurface *s;
++
++    if (s_state <= 0)
++        return;
++    s = surf_find(color_base);
++    {
++        static unsigned said;
++        if (said < 3 && (said++, 1))
++            fprintf(stderr, "  [GL] present 0x%08X: %s\n", color_base,
++                    s ? "surface found" : "NO SURFACE (nothing shown)");
++    }
++    if (!s)
++        return;
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_for(s->tex, 0));
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++    glDisable(GL_SCISSOR_TEST);
++    /* Guest row 0 is framebuffer-object row 0; the canvas's row 0 is its
++     * bottom line, so the copy turns the picture over. */
++    glBlitFramebuffer(0, 0, s->w, s->h, 0, 480, 640, 0, GL_COLOR_BUFFER_BIT,
++                      (s->w == 640 && s->h == 480) ? GL_NEAREST : GL_LINEAR);
++    glFlush();
++    nv2a_web_gl_post();
++    gl_check("present");
++}
++
++static int gl_setup(void);
++
++static int gl_init(void)
++{
++    int h = nv2a_web_gl_create(640, 480);
++
++    if (!h)
++        return 0;
++    s_depth_clamp = (h >> 30) & 1;
++    return gl_setup();
++}
++
++#endif /* NV2A_GLES */
++
++/* What both contexts need once one is current. */
++static int gl_setup(void)
++{
++    int i, j, k;
++    static const uint32_t white = 0xFFFFFFFFu;
++
 +    s_q = (Nv2aGlVertex *)malloc(sizeof(Nv2aGlVertex) * 3 * GLQ_MAX_TRIS);
 +    s_tex = (GlTexEntry *)calloc(GL_TEX_SLOTS, sizeof(GlTexEntry));
 +    s_prog = (GlProg *)calloc(GL_PROG_SLOTS, sizeof(GlProg));
@@ -4531,7 +4741,14 @@ index 0000000..3687246
 +    glDisable(GL_CULL_FACE);
 +    /* The software path has no near or far plane: depth outside the buffer's
 +     * range is drawn, not clipped. */
++#if NV2A_GLES
++    if (s_depth_clamp)
++        glEnable(GL_DEPTH_CLAMP);
++    else
++        fprintf(stderr, "  [GL] no EXT_depth_clamp: geometry beyond the depth range is clipped\n");
++#else
 +    glEnable(GL_DEPTH_CLAMP);
++#endif
 +    {
 +        const char *d = getenv("RECOMP_GPU_DEBUG"), *v = getenv("RECOMP_GPU_VERIFY");
 +        s_debug = d ? atoi(d) : 0;
@@ -4561,8 +4778,10 @@ index 0000000..3687246
 +                                " the software rasteriser\n");
 +        }
 +        /* No backend, no direct window: the read-back one still works. */
++#if !NV2A_GLES
 +        if (s_state < 0 && win_wanted() && !s_win.hwnd)
 +            _putenv_s("RECOMP_FB_WINDOW", "1");
++#endif
 +    }
 +    return s_state > 0;
 +}
@@ -4973,10 +5192,19 @@ index 0000000..3687246
 +    if (st->zpass_enable && zpass) {
 +        GLuint r = 0;
 +        double tq = now_us();
++#if NV2A_GLES
++        /* A WebGL query result is not available until a later task, and the
++         * title wants the count now. Reported as "something passed" (16
++         * samples a triangle): a flare or corona that should be hidden
++         * behind geometry is drawn. NOT what the console does. */
++        glDrawArrays(GL_TRIANGLES, 0, n);
++        r = (GLuint)(n / 3) * 16u;
++#else
 +        glBeginQuery(GL_SAMPLES_PASSED, s_query);
 +        glDrawArrays(GL_TRIANGLES, 0, n);
 +        glEndQuery(GL_SAMPLES_PASSED);
 +        glGetQueryObjectuiv(s_query, GL_QUERY_RESULT, &r);
++#endif
 +        pt_add(PT_QUERY, tq);
 +        *zpass = r;
 +    } else {
@@ -5020,7 +5248,20 @@ index 0000000..3687246
 +        return;
 +    if (value01 < 0.0f) value01 = 0.0f;
 +    if (value01 > 1.0f) value01 = 1.0f;
++#if NV2A_GLES
++    {
++        /* Every shape this offset has been drawn with (see depth_for). One
++         * made later starts at 1.0 whatever was cleared here: a clear to
++         * another value followed by a first draw at a new size would differ
++         * from the console. */
++        int i;
++        for (i = 0; i < 4; i++)
++            if (s_depth[i].used && s_depth[i].offset == zeta_offset)
++                depth_clear_tex(s_depth[i].tex, value01);
++    }
++#else
 +    depth_clear_tex(depth_for(zeta_offset, 0, 0), value01);
++#endif
 +    gl_check("depth clear");
 +}
 +
@@ -5036,7 +5277,9 @@ index 0000000..3687246
 +
 +void nv2a_gl_flip(void)
 +{
++#if !NV2A_GLES
 +    MSG msg;
++#endif
 +    int i;
 +
 +    if (s_state <= 0)
@@ -5048,9 +5291,11 @@ index 0000000..3687246
 +        glFlush();
 +        pt_add(PT_FLIP, t0);
 +    }
++#if !NV2A_GLES
 +    /* The hidden window still has a queue; keep it empty. */
 +    while (PeekMessageA(&msg, s_hwnd, 0, 0, PM_REMOVE))
 +        DispatchMessageA(&msg);
++#endif
 +    /* Textures nothing has drawn with for a long time. */
 +    if ((s_flip & 255) == 0) {
 +        for (i = 0; i < GL_TEX_SLOTS; i++) {
@@ -5079,6 +5324,7 @@ index 0000000..3687246
 +    glPixelStorei(GL_PACK_ALIGNMENT, 1);
 +    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 +    glReadPixels(0, 0, s->w, s->h, GL_BGRA, GL_UNSIGNED_BYTE, buf);
++    px_swap(buf, (size_t)s->w * s->h);
 +    return buf;
 +}
 +
@@ -5222,7 +5468,7 @@ index 0000000..3687246
 +    }
 +}
 +
-+#else  /* not Windows: software only */
++#else  /* neither Windows nor the web: software only */
 +
 +int  nv2a_gl_active(void) { return 0; }
 +int  nv2a_gl_verify(void) { return 0; }
@@ -8391,7 +8637,7 @@ index 22762ee..a7e0ca6 100644
  LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
  PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
-index 641a94d..52bf180 100644
+index 641a94d..0f481d9 100644
 --- a/src/usb/ohci.c
 +++ b/src/usb/ohci.c
 @@ -500,6 +500,14 @@ static uint32_t bus_resolve(uint32_t addr)
@@ -8430,7 +8676,24 @@ index 641a94d..52bf180 100644
  
      xbox_worker_stack_free(slot);
      return (int)(g_eax & 1u);
-@@ -1340,6 +1354,20 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
+@@ -1314,13 +1328,14 @@ void xbox_OhciInit(void)
+             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
+     fflush(stderr);
+ 
+-#if defined(_WIN32)
++    /* The controller's frame clock. On every host: off Windows the registers
++     * are reached without a fault (xbox_OhciRead/Write), and without this
++     * thread the controller never becomes operational and no pad arrives. */
+     {
+         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
+         if (th)
+             CloseHandle(th);
+     }
+-#endif
+ }
+ 
+ static OhciController *hc_for(uint32_t va)
+@@ -1340,6 +1355,20 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
      return hc_for(xbox_va) != NULL;
  }
  
@@ -8451,7 +8714,7 @@ index 641a94d..52bf180 100644
  int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
  {
  #if defined(_WIN32)
-@@ -1351,7 +1379,7 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
+@@ -1351,7 +1380,7 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
      ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
                        ohci_read, ohci_write);
      if (!ok && hc->decode_fail++ < 20) {
