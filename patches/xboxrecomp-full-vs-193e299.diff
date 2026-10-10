@@ -1669,7 +1669,7 @@ index b9a02bc..69e4715 100644
  /* Total crossings of the DISPATCH boundary, and who is holding it up.
   * A depth that is non-zero while this stops moving is stuck, not busy. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..e2b4204 100644
+index c65ba43..4acb4a9 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
@@ -1728,7 +1728,7 @@ index c65ba43..e2b4204 100644
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
-@@ -2262,16 +2278,30 @@ static void kernel_vblank_tick(void)
+@@ -2262,16 +2278,34 @@ static void kernel_vblank_tick(void)
      if (!enabled)
          return;
  
@@ -1747,12 +1747,18 @@ index c65ba43..e2b4204 100644
      if (now < next_ms)
          return;
 -    next_ms = now + 16;                       /* ~60 Hz */
+-
+-    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
 +    next_ms += 16667;
 +    if (next_ms < now - 100000 || next_ms > now + 16667)
 +        next_ms = now + 16667;                /* first tick, or fell behind */
- 
-     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
++
++    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR)) {
++        static unsigned skipped;
++        if (getenv("RECOMP_TIMER_TRACE") && skipped++ % 300 == 0)
++            fprintf(stderr, "  [TIMER] vblank due, no interrupt connected (%u)\n", skipped);
          return;
++    }
  
 -    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
 -    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
@@ -1763,7 +1769,7 @@ index c65ba43..e2b4204 100644
  
      {
          static unsigned n;
-@@ -2284,6 +2314,68 @@ static void kernel_vblank_tick(void)
+@@ -2284,6 +2318,68 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -1832,7 +1838,7 @@ index c65ba43..e2b4204 100644
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2566,12 +2658,22 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2566,12 +2662,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          g_fs_base = tib;
      }
  
@@ -1851,12 +1857,21 @@ index c65ba43..e2b4204 100644
 +            WaitForSingleObject(g_timer_wake, 4);
 +        else
 +            Sleep(4);
++        {   /* RECOMP_TIMER_TRACE: is this thread turning over, and how fast */
++            static unsigned loops;
++            static int trace = -1;
++            if (trace < 0)
++                trace = getenv("RECOMP_TIMER_TRACE") != NULL;
++            if (trace && (++loops % 1000 == 0 || loops < 4))
++                fprintf(stderr, "  [TIMER] loop %u at %llu ms\n", loops,
++                        (unsigned long long)GetTickCount64());
++        }
          kernel_vblank_tick();  /* the GPU's frame clock */
 +        kernel_d3d_swi_tick(); /* pushbuffer fences */
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -2619,6 +2721,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -2619,6 +2734,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      if (!g_timer_started) {
          InitializeCriticalSection(&g_timer_lock);
          g_timer_started = 1;
@@ -1864,7 +1879,7 @@ index c65ba43..e2b4204 100644
          CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
      }
  
-@@ -3880,6 +3983,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3880,6 +3996,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
@@ -1881,7 +1896,7 @@ index c65ba43..e2b4204 100644
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
-@@ -9391,24 +9504,45 @@ void guest_cpu_part(void)
+@@ -9391,24 +9517,45 @@ void guest_cpu_part(void)
      t_guest_thread = 0;
  }
  
@@ -1927,7 +1942,7 @@ index c65ba43..e2b4204 100644
      }
      (void)held;
  }
-@@ -9473,6 +9607,28 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9473,6 +9620,28 @@ static void kernel_thunk_dispatch_body(void)
                      fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
                              (unsigned long long)g_ordinal_calls[best]);
                  }
@@ -1957,7 +1972,7 @@ index c65ba43..e2b4204 100644
              fflush(stderr);
              last_summary_tick = now;
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
-index 42135e0..9b87ad8 100644
+index 42135e0..7b420a1 100644
 --- a/src/kernel/kernel_file.c
 +++ b/src/kernel/kernel_file.c
 @@ -503,6 +503,37 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
@@ -2035,6 +2050,66 @@ index 42135e0..9b87ad8 100644
              ctx->find_handle = NULL;
              IoStatusBlock->Status = STATUS_NO_MORE_FILES;
              return STATUS_NO_MORE_FILES;
+@@ -824,16 +867,27 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+     }
+ 
+     int fd;
+-    if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
+-            mkdir(host_path, 0755);   /* EEXIST is fine */
+-        fd = open(host_path, O_RDONLY | O_DIRECTORY);
+-    } else {
+-        fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
++    {
++        /* A partition device (kernel_path.c maps it to PartitionN.img) is a
++         * file whatever the open asks for, and is there once opened. */
++        size_t hl = strlen(host_path);
++        const char *base = strrchr(host_path, '/');
++        int is_image = hl > 4 && strcmp(host_path + hl - 4, ".img") == 0
++                       && base && strncmp(base, "/Partition", 10) == 0;
++        if (is_image) {
++            fd = open(host_path, O_RDWR | O_CREAT, 0644);
++        } else if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
++            if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
++                mkdir(host_path, 0755);   /* EEXIST is fine */
++            fd = open(host_path, O_RDONLY | O_DIRECTORY);
++        } else {
++            fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
++        }
+     }
+ 
+     if (fd < 0) {
+         int e = errno;
++        fprintf(stderr, "  [FILE] open failed: %s (%s)\n", host_path, strerror(e));
+         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+         if (IoStatusBlock) {
+             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+@@ -1083,7 +1137,24 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
+              * XBOX_SECTORS_PER_CLUSTER above. */
+             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+             info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+-            if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
++            /* A partition image the title has formatted carries a FATX
++             * header (magic, volume id, sectors per cluster): XAPI's mount
++             * check fails the disk when the cluster size differs from the
++             * one it formatted with (as the Windows side does). */
++            if (fd >= 0) {
++                unsigned char hdr[12];
++                struct stat fst;
++                if (fstat(fd, &fst) == 0 && S_ISREG(fst.st_mode)
++                        && pread(fd, hdr, sizeof(hdr), 0) == (ssize_t)sizeof(hdr)
++                        && memcmp(hdr, "FATX", 4) == 0) {
++                    ULONG spc = (ULONG)hdr[8] | ((ULONG)hdr[9] << 8)
++                              | ((ULONG)hdr[10] << 16) | ((ULONG)hdr[11] << 24);
++                    if (spc && spc <= 2048 && (spc & (spc - 1)) == 0)
++                        info->SectorsPerAllocationUnit = spc;
++                }
++            }
++            if (fd >= 0 && fstatvfs(fd, &vfs) == 0
++                    && (ULONGLONG)vfs.f_blocks * vfs.f_frsize >= (64u << 20)) {
+                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
+                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
+                 ULONGLONG avail = (ULONGLONG)vfs.f_bavail * vfs.f_frsize;
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
 index 1ad4fff..0af83a3 100644
 --- a/src/kernel/kernel_hal.c
@@ -2234,7 +2309,7 @@ index 1ad4fff..0af83a3 100644
          irql_publish();
      }
 diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
-index caf6390..6d79f72 100644
+index caf6390..d776633 100644
 --- a/src/kernel/kernel_path.c
 +++ b/src/kernel/kernel_path.c
 @@ -66,8 +66,8 @@ static const path_rule s_rules[] = {
@@ -2285,6 +2360,155 @@ index caf6390..6d79f72 100644
          fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
          fflush(stderr);
          return TRUE;
+@@ -548,11 +561,127 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
+     strip_trailing_slash(s_game_dir);
+     strip_trailing_slash(s_save_dir);
+ 
++    /* As the Windows side does at every start: the save-side directories,
++     * and the partition table in sector 4 of the raw disk image. XAPI reads
++     * that table to find the cache partitions, and the title later writes
++     * its own data over the sector, so it has to be put back each time. */
++    {
++        static const char *subs[] = { "TitleData", "UserData", "Cache", "CacheX", "CacheY", "SystemData" };
++        static const struct { const char *name; unsigned start, size; } parts[] = {
++            { "XBOX_PART_X",  0x00000400, 0x00177000 },
++            { "XBOX_PART_Y",  0x00177400, 0x00177000 },
++            { "XBOX_PART_Z",  0x002EE400, 0x00177000 },
++            { "XBOX_PART_C",  0x00465400, 0x000FA000 },
++            { "XBOX_PART_E",  0x0055F400, 0x00465400 },
++        };
++        unsigned char sector[512];
++        char path[MAX_PATH];
++        size_t k;
++        FILE *img;
++
++        mkdir_p(s_save_dir);
++        for (k = 0; k < sizeof(subs) / sizeof(subs[0]); k++) {
++            snprintf(path, sizeof(path), "%s/%s", s_save_dir, subs[k]);
++            mkdir_p(path);
++        }
++        memset(sector, 0, sizeof(sector));
++        memcpy(sector, "****PARTINFO****", 16);
++        for (k = 0; k < sizeof(parts) / sizeof(parts[0]); k++) {
++            unsigned char *e = sector + 48 + k * 32;
++            size_t n = strlen(parts[k].name);
++            unsigned v[4] = { 0x80000000u, parts[k].start, parts[k].size, 0 };
++            memset(e, ' ', 16);
++            memcpy(e, parts[k].name, n < 16 ? n : 16);
++            memcpy(e + 16, v, 16);
++        }
++        snprintf(path, sizeof(path), "%s/Partition0.img", s_save_dir);
++        img = fopen(path, "r+b");
++        if (!img)
++            img = fopen(path, "w+b");
++        if (img) {
++            fseek(img, 0x800, SEEK_SET);
++            fwrite(sector, 1, sizeof(sector), img);
++            fclose(img);
++        }
++    }
++
+     s_initialized = TRUE;
+     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
+              s_game_dir, s_save_dir);
+ }
+ 
++/* A partition device opened as a device ("\Device\Harddisk0\PartitionN" with
++ * nothing below it) is an image file in the save directory, as on Windows:
++ * XAPI reads the partition table from Partition0 and formats the caches. */
++static BOOL xbox_partition_device_path(const char *xbox_path, char *out, DWORD n)
++{
++    static const char *prefix = "\\Device\\Harddisk0\\Partition";
++    int len = match_prefix(xbox_path, prefix);
++    int digit;
++    const char *rest;
++
++    if (!len)
++        return FALSE;
++    digit = xbox_path[len];
++    if (digit < '0' || digit > '9')
++        return FALSE;
++    rest = xbox_path + len + 1;
++    if (*rest == '\\' || *rest == '/')
++        rest++;
++    if (*rest != '\0')
++        return FALSE;
++    snprintf(out, n, "%s/Partition%c.img", s_save_dir, digit);
++    return TRUE;
++}
++
++/* The console's file systems do not distinguish case; the host's may. Where
++ * the path as spelled does not exist, each component below `fixed` (the part
++ * known to be right) is matched against its directory without regard to case.
++ * A component that matches nothing is left as spelled (a file to be created). */
++#include <dirent.h>
++#include <strings.h>
++static void xbox_fix_case(char *path, size_t fixed)
++{
++    struct stat st;
++    char *p;
++
++    if (stat(path, &st) == 0)
++        return;
++    p = path + fixed;
++    while (*p) {
++        char *name, *end, saved;
++        DIR *d;
++        struct dirent *e;
++
++        while (*p == '/') p++;
++        if (!*p) break;
++        name = p;
++        end = strchr(name, '/');
++        if (!end) end = name + strlen(name);
++        saved = *end;
++        *end = '\0';
++        if (stat(path, &st) != 0) {
++            char keep = name[0];
++            /* the directory holding this component */
++            if (name > path + 1) name[-1] = '\0';
++            name[0] = keep;
++            d = opendir(name > path + 1 ? path : "/");
++            if (name > path + 1) name[-1] = '/';
++            if (d) {
++                while ((e = readdir(d)) != NULL) {
++                    if (strcasecmp(e->d_name, name) == 0) {
++                        memcpy(name, e->d_name, strlen(name));
++                        break;
++                    }
++                }
++                closedir(d);
++            }
++        }
++        *end = saved;
++        p = end;
++    }
++}
++
+ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
+ {
+     const char* remainder = NULL;
+@@ -572,6 +701,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
+             return xbox_translate_path(linked, host_path_buf, buf_size);
+     }
+ 
++    if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
++        fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
++        return TRUE;
++    }
++
+     for (int i = 0; i < PATH_RULE_COUNT; i++) {
+         skip = match_prefix(xbox_path, s_rules[i].prefix);
+         if (skip) {
+@@ -616,6 +750,8 @@ translate:
+                 host_path_buf[--n] = '\0';
+         }
+ 
++        xbox_fix_case(host_path_buf, strlen(base_dir));
++        fprintf(stderr, "  [PATH] %s\n", xbox_path);
+         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+         return TRUE;
+     }
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
 index 0000000..3687246
@@ -8018,7 +8242,7 @@ index c0dd9e0..a1c5b7c 100644
 +#endif /* x64 Windows */
  #endif /* MMIO_DECODE_H */
 diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
-index 93288d5..5093e6c 100644
+index 93288d5..4ff3392 100644
 --- a/src/platform/win32_compat.c
 +++ b/src/platform/win32_compat.c
 @@ -1124,8 +1124,30 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
@@ -8077,7 +8301,31 @@ index 93288d5..5093e6c 100644
      return mprotect(address, size, prot_from_page(newProtect)) == 0;
  }
  
-@@ -1613,9 +1646,22 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
+@@ -1250,9 +1283,22 @@ DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
+ 
+ BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
+ {
++    /* Counted from the first call. A host whose monotonic clock runs from
++     * the epoch (Emscripten's does) gives 1.8e18 ns, and every caller that
++     * scales the count before dividing by the frequency (count * 1000000 /
++     * freq: the vblank clock, the APU clock) overflows 64 bits. */
++    static LONGLONG base;
++    static int have_base;
+     struct timespec ts;
++    LONGLONG now;
++
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+-    count->QuadPart = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++    now = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++    if (!have_base) {
++        base = now;
++        have_base = 1;
++    }
++    count->QuadPart = now - base;
+     return TRUE;
+ }
+ 
+@@ -1613,9 +1659,22 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                            DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
  {
      (void)file; (void)sa; (void)protect;
@@ -8101,7 +8349,7 @@ index 93288d5..5093e6c 100644
      int fd = anon_map_fd(name);
      if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
      if (ftruncate(fd, (off_t)size) != 0) {
-@@ -1641,6 +1687,13 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
+@@ -1641,6 +1700,13 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
                         SIZE_T count, LPVOID baseAddr)
  {
      w32_object *o = (w32_object *)mapping;
@@ -8115,7 +8363,7 @@ index 93288d5..5093e6c 100644
      if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
  
      off_t  off = ((off_t)offHigh << 32) | offLow;
-@@ -1691,6 +1744,10 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
+@@ -1691,6 +1757,10 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
  
  BOOL UnmapViewOfFile(LPCVOID baseAddr)
  {
@@ -8245,6 +8493,25 @@ index bd00f3f..da7f020 100644
 +    }
      return 20;
  }
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 08bae4b..922e860 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -392,7 +392,14 @@ void xbox_FramebufferWindowStart(void)
+ 
+ #else
+ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
++#if defined(__EMSCRIPTEN__)
++/* The web port shows the presented surface on the page's canvas
++ * (port/web/present_web.c): guest memory in, pixels out. */
++void xbox_web_present(uint32_t fb_va, uint32_t pitch);
++void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { xbox_web_present(fb_va, pitch); }
++#else
+ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
++#endif
+ void xbox_FramebufferWindowStart(void) {}
+ int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
+ void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
 index 8e9325e..6fc89a1 100644
 --- a/templates/runtime/recomp_types.h

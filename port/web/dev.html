@@ -8,7 +8,14 @@
 <body><canvas id="canvas" width="640" height="480"></canvas><div id="log"></div>
 <script>
 const logEl = document.getElementById('log');
-function say(s) { console.log(s); logEl.textContent += s + '\n'; logEl.scrollTop = 1e9; }
+// The log on the page is the last 40 lines, redrawn at most once a frame: the
+// runtime prints thousands of lines and a DOM update per line stalls the page.
+const tailLines = []; let tailDirty = false;
+function say(s) {
+  console.log(s);
+  tailLines.push(s); if (tailLines.length > 40) tailLines.shift();
+  if (!tailDirty) { tailDirty = true; requestAnimationFrame(() => { tailDirty = false; logEl.textContent = tailLines.join('\n'); }); }
+}
 const q = new URLSearchParams(location.search);
 var Module = {
   canvas: document.getElementById('canvas'),
@@ -18,13 +25,61 @@ var Module = {
     for (const kv of (q.get('env') || '').split(',')) {
       const i = kv.indexOf('='); if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1);
     }
-    FS.mkdir('/game'); FS.mkdir('/save');
-    FS.createPreloadedFile('/game', 'default.xbe', 'game/default.xbe', true, false);
   }],
   onAbort: function (w) { say('ABORT: ' + w); },
 };
 window.addEventListener('error', e => say('page error: ' + e.message));
 window.addEventListener('unhandledrejection', e => say('rejection: ' + e.reason));
 </script>
-<script src="halo2.js"></script>
+<script>
+// ?import=1: copy the files listed in manifest.json (written by tools/webboot.sh
+// from the dev tree's game/ and save/ folders) into the origin's private file
+// system, skipping files already there with the same size. The program then
+// mounts them at /game and /save. ?import=only stops after the copy.
+async function importTree() {
+  const list = await (await fetch('manifest.json')).json();
+  const root = await navigator.storage.getDirectory();
+  let done = 0, bytes = 0, skipped = 0; const t0 = performance.now();
+  for (const [path, size] of list) {
+    const parts = path.split('/'); const name = parts.pop();
+    let dir = root; for (const d of parts) dir = await dir.getDirectoryHandle(d, {create: true});
+    const fh = await dir.getFileHandle(name, {create: true});
+    if ((await fh.getFile()).size === size) { skipped++; continue; }
+    const w = await fh.createWritable();
+    const r = await fetch(encodeURI(path));
+    if (!r.ok) { await w.abort(); say('import: ' + path + ' -> HTTP ' + r.status); continue; }
+    await r.body.pipeTo(w);
+    done++; bytes += size;
+    if (done % 20 === 0) say('import: ' + done + ' files, ' + (bytes / 1048576 | 0) + ' MB');
+  }
+  // empty directories of the save tree
+  for (const d of (await (await fetch('manifest_dirs.json')).json())) {
+    let dir = root; for (const part of d.split('/')) dir = await dir.getDirectoryHandle(part, {create: true});
+  }
+  say('IMPORT_DONE copied ' + done + ' files (' + (bytes / 1048576 | 0) + ' MB), ' + skipped + ' already there, '
+      + ((performance.now() - t0) / 1000 | 0) + ' s');
+}
+(async function () {
+  try {
+    if (q.get('import')) await importTree();
+    if (q.get('ls')) {   // what the private file system holds, seen from the page
+      const root = await navigator.storage.getDirectory();
+      for await (const [name, h] of root.entries()) {
+        let n = 0, bytes = 0, err = '';
+        try {
+          if (h.kind === 'directory') for await (const [cn, ch] of h.entries()) {
+            n++; if (ch.kind === 'file') bytes += (await ch.getFile()).size;
+          }
+        } catch (e) { err = ' ERROR ' + e.name; }
+        say('opfs /' + name + ' ' + h.kind + ' ' + n + ' entries, ' + (bytes / 1048576 | 0) + ' MB in files' + err);
+      }
+      const est = await navigator.storage.estimate();
+      say('opfs usage ' + (est.usage / 1048576 | 0) + ' MB of ' + (est.quota / 1048576 | 0));
+      if (q.get('ls') === 'only') return;
+    }
+    if (q.get('import') === 'only') return;
+    const s = document.createElement('script'); s.src = 'halo2.js'; document.body.appendChild(s);
+  } catch (e) { say('start failed: ' + (e && e.stack || e)); }
+})();
+</script>
 </body></html>

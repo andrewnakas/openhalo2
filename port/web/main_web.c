@@ -14,6 +14,12 @@
 
 #include "recomp_types.h"
 
+#include <emscripten.h>
+#include <emscripten/wasmfs.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <string.h>
+
 extern ptrdiff_t g_xbox_mem_offset;
 
 int       xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
@@ -33,8 +39,9 @@ typedef struct MCPXAPUState MCPXAPUState;
 extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 extern MCPXAPUState *g_apu_state;
 
-#define GAME_DIR  "/game"
-#define SAVE_DIR  "/save"
+#define OPFS_DIR  "/opfs"            /* the origin's private file system */
+#define GAME_DIR  OPFS_DIR "/game"
+#define SAVE_DIR  OPFS_DIR "/save"
 #define STACK_TOP 0x00F7FFF0u     /* as the boot log of the native build prints it */
 
 static void def(const char *name, const char *value)
@@ -61,6 +68,44 @@ int main(void)
     def("RECOMP_NO_TILED", "1");
 
     printf("=== Open Halo 2 (web) ===\n");
+
+    /* The disc files and the console's hard disk live in the origin's private
+     * file system (OPFS), put there once by the page (dev.html, import). The
+     * kernel layer's POSIX file code then reads and writes them as files: no
+     * copy in memory, and saves persist. */
+    {
+        backend_t opfs;
+        int g, v;
+        struct stat st;
+
+        printf("OPFS: creating backend\n");
+        opfs = wasmfs_create_opfs_backend();
+        printf("OPFS: backend %p\n", (void *)opfs);
+        g = wasmfs_create_directory(OPFS_DIR, 0777, opfs);   /* a backend directory is the OPFS root */
+        printf("OPFS: game dir %d\n", g);
+        v = stat(SAVE_DIR, &st);
+        printf("OPFS: %s %s, %s %s\n", GAME_DIR, g ? strerror(errno) : "mounted",
+               SAVE_DIR, v ? strerror(errno) : "mounted");
+        if (stat(GAME_DIR "/default.xbe", &st) != 0) {
+            fprintf(stderr, "no " GAME_DIR "/default.xbe in OPFS: open the page with ?import=1 first\n");
+            return 1;
+        }
+        if (getenv("RECOMP_WEB_FSCHECK")) {   /* the partition table as this side reads it */
+            unsigned char b[16] = {0};
+            FILE *pf = fopen(SAVE_DIR "/Partition0.img", "rb");
+            if (pf) {
+                size_t got;
+                fseek(pf, 0, SEEK_END);
+                printf("FSCHECK: Partition0.img size %ld\n", ftell(pf));
+                fseek(pf, 2048, SEEK_SET);
+                got = fread(b, 1, 16, pf);
+                printf("FSCHECK: @2048 got %u: %02X %02X %02X %02X '%.16s'\n", (unsigned)got, b[0], b[1], b[2], b[3], b);
+                fclose(pf);
+            } else {
+                printf("FSCHECK: cannot open Partition0.img: %s\n", strerror(errno));
+            }
+        }
+    }
     f = fopen(GAME_DIR "/default.xbe", "rb");
     if (!f) {
         fprintf(stderr, "no " GAME_DIR "/default.xbe\n");
