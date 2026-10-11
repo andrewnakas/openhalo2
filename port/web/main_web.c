@@ -41,8 +41,14 @@ extern MCPXAPUState *g_apu_state;
 
 #define OPFS_DIR  "/opfs"            /* the origin's private file system */
 #define GAME_DIR  OPFS_DIR "/game"
-#define SAVE_DIR  OPFS_DIR "/save"
+#define SAVE_DIR  save_dir()          /* /opfs/save, or H2_SAVE (a second tab's own disk) */
 #define STACK_TOP 0x00F7FFF0u     /* as the boot log of the native build prints it */
+
+static const char *save_dir(void)
+{
+    const char *e = getenv("H2_SAVE");
+    return e && *e ? e : OPFS_DIR "/save";
+}
 
 static void def(const char *name, const char *value)
 {
@@ -103,7 +109,10 @@ int main(void)
         }
         if (getenv("RECOMP_WEB_FSCHECK")) {   /* the partition table as this side reads it */
             unsigned char b[16] = {0};
-            FILE *pf = fopen(SAVE_DIR "/Partition0.img", "rb");
+            char p0[256];
+            FILE *pf;
+            snprintf(p0, sizeof p0, "%s/Partition0.img", SAVE_DIR);
+            pf = fopen(p0, "rb");
             if (pf) {
                 size_t got;
                 fseek(pf, 0, SEEK_END);

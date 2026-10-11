@@ -25,6 +25,14 @@ var Module = {
     for (const kv of (q.get('env') || '').split('~')) {
       const i = kv.indexOf('='); if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1);
     }
+    // ?save=<folder>: this tab's own hard disk in the private file system (two
+    // tabs cannot share one: its files are opened for exclusive access)
+    if (q.get('save')) ENV.H2_SAVE = '/opfs/' + q.get('save');
+    // system link: each tab is its own station, so its own Ethernet address
+    if (q.get('link') && !ENV.RECOMP_MAC) {
+      const b = crypto.getRandomValues(new Uint8Array(3));
+      ENV.RECOMP_MAC = '02:48:32:' + Array.from(b, x => x.toString(16).padStart(2, '0')).join(':');
+    }
   }],
   onAbort: function (w) { say('ABORT: ' + w); },
   onRuntimeInitialized: function () { Module.h2ready = true; Module.h2autoplay = !!q.get('autoplay'); },
@@ -93,6 +101,25 @@ async function importTree() {
       if (q.get('ls') === 'only') return;
     }
     if (q.get('import') === 'only' || q.get('import') === 'force') return;
+    if (q.get('clonesave')) {   // ?clonesave=<folder>: a second hard disk, from /save (folders, small files, and big files blank at their size)
+      const root = await navigator.storage.getDirectory();
+      let files = 0;
+      async function copy(from, to) {
+        for await (const [name, h] of from.entries()) {
+          if (h.kind === 'directory') await copy(h, await to.getDirectoryHandle(name, {create: true}));
+          else {
+            const f = await h.getFile();
+            const w = await (await to.getFileHandle(name, {create: true})).createWritable();
+            // a big file (a partition image, a map cache) is made at its size and left blank
+            if (f.size > 4 * 1048576) await w.truncate(f.size); else await w.write(await f.arrayBuffer());
+            await w.close(); files++;
+          }
+        }
+      }
+      await copy(await root.getDirectoryHandle('save'), await root.getDirectoryHandle(q.get('clonesave'), {create: true}));
+      say('CLONESAVE_DONE /' + q.get('clonesave') + ': ' + files + ' files');
+      if (q.get('clonesave_only')) return;
+    }
     // Frames from the WebGL2 backend come straight from its worker as
     // {nv2aFrame: ImageBitmap}; every worker the runtime starts gets a listener.
     // frames shown on the page, every 10 s
@@ -115,4 +142,5 @@ async function importTree() {
 </script>
 <script src="input.js"></script>
 <script src="audio.js"></script>
+<script src="net.js"></script>
 </body></html>

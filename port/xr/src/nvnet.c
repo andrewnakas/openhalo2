@@ -541,6 +541,72 @@ static int hub_recv(uint8_t *f, uint32_t max)
     return n > 0 ? n : 0;
 }
 
+#elif defined(__EMSCRIPTEN__)
+
+/* In the browser the frames cross to the page through two byte rings in the
+ * program's (shared) memory, the way sound and the pads do. A worker the page
+ * starts (port/web/net.js) waits on the transmit ring and carries frames to
+ * the other players, over a BroadcastChannel between tabs of one browser or a
+ * WebSocket to a relay, and writes what arrives into the receive ring.
+ *
+ * Layout at xbox_web_nic_buffer(): 8 uint32 (tx write, tx read, rx write,
+ * rx read, ring size in bytes, frames dropped by the page, 2 spare), then
+ * the transmit ring, then the receive ring. A record is a 2-byte length and
+ * the frame, at byte positions modulo the ring size; the write and read
+ * positions run free (unsigned wrap). One writer and one reader per ring. */
+#include <emscripten.h>
+#include <emscripten/threading.h>
+
+#define WEB_RING 65536u                 /* a power of two */
+static struct {
+    volatile uint32_t head[8];
+    uint8_t tx[WEB_RING];
+    uint8_t rx[WEB_RING];
+} s_web;
+
+EMSCRIPTEN_KEEPALIVE uint8_t *xbox_web_nic_buffer(void)
+{
+    s_web.head[4] = WEB_RING;
+    return (uint8_t *)&s_web;
+}
+
+static void hub_open(void)
+{
+    s_web.head[4] = WEB_RING;
+}
+
+static void hub_send(const uint8_t *f, uint32_t len)
+{
+    uint32_t w = __atomic_load_n(&s_web.head[0], __ATOMIC_SEQ_CST);
+    uint32_t r = __atomic_load_n(&s_web.head[1], __ATOMIC_SEQ_CST);
+    uint32_t i;
+
+    if (len > FRAME_MAX || WEB_RING - (w - r) < len + 2u)
+        return;                         /* the page is not draining: drop, as a full wire would */
+    s_web.tx[w & (WEB_RING - 1)] = (uint8_t)len;
+    s_web.tx[(w + 1) & (WEB_RING - 1)] = (uint8_t)(len >> 8);
+    for (i = 0; i < len; i++)
+        s_web.tx[(w + 2 + i) & (WEB_RING - 1)] = f[i];
+    __atomic_store_n(&s_web.head[0], w + 2 + len, __ATOMIC_SEQ_CST);
+    emscripten_futex_wake((void *)&s_web.head[0], 1);
+}
+
+static int hub_recv(uint8_t *f, uint32_t max)
+{
+    uint32_t w = __atomic_load_n(&s_web.head[2], __ATOMIC_SEQ_CST);
+    uint32_t r = __atomic_load_n(&s_web.head[3], __ATOMIC_SEQ_CST);
+    uint32_t len, i;
+
+    if (w == r)
+        return 0;
+    len = s_web.rx[r & (WEB_RING - 1)] | (uint32_t)s_web.rx[(r + 1) & (WEB_RING - 1)] << 8;
+    if (len <= max)
+        for (i = 0; i < len; i++)
+            f[i] = s_web.rx[(r + 2 + i) & (WEB_RING - 1)];
+    __atomic_store_n(&s_web.head[3], r + 2 + len, __ATOMIC_SEQ_CST);
+    return len <= max ? (int)len : 0;
+}
+
 #else   /* no transport on this host yet */
 
 static void hub_open(void) {}

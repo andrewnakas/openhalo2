@@ -132,8 +132,14 @@
     v.setInt16(18, clamp16(p.rx), true); v.setInt16(20, clamp16(p.ry), true);
   }
 
-  function frame() {
-    requestAnimationFrame(frame);
+  // Once a frame while the page is drawn; a page that is not (a tab behind
+  // another, a covered window) gets no animation frames, so a timer keeps the
+  // pads written there too: a second player's tab still has to answer.
+  let lastWrite = 0;
+  setInterval(() => { if (performance.now() - lastWrite > 100) frame(true); }, 33);
+  function frame(fromTimer) {
+    if (fromTimer !== true) requestAnimationFrame(frame);
+    lastWrite = performance.now();
     if (!base) {
       // the page sets Module.h2ready in onRuntimeInitialized: the export aborts if called earlier
       if (typeof Module === 'undefined' || !Module.h2ready || typeof HEAPU8 === 'undefined') return;
