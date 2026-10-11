@@ -27,6 +27,11 @@ int      xbox_OhciOwnsAddress(uint32_t xbox_va);
 uint32_t xbox_OhciRead(uint32_t xbox_va, int size);
 void     xbox_OhciWrite(uint32_t xbox_va, uint32_t val, int size);
 
+/* The network controller model (nvnet.c). */
+int      recomp_nic_owns(uint32_t va);
+uint32_t recomp_nic_read(uint32_t va, int size);
+void     recomp_nic_write(uint32_t va, uint32_t val, int size);
+
 typedef struct MCPXAPUState MCPXAPUState;
 extern MCPXAPUState *g_apu_state;
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
@@ -87,6 +92,8 @@ static void nic_trace(uint32_t va, uint32_t val, int size, int write)
 uint32_t recomp_mmio_read(uint32_t va, int size)
 {
     tick();
+    if (recomp_nic_owns(va))
+        return recomp_nic_read(va, size);
     if (xbox_Nv2aRegTrapOwns(va)) {
         s_direct[0]++;
         return xbox_Nv2aRegTrapRead(va, size);
@@ -111,6 +118,10 @@ uint32_t recomp_mmio_read(uint32_t va, int size)
 
 void recomp_mmio_write(uint32_t va, uint32_t val, int size)
 {
+    if (recomp_nic_owns(va)) {
+        recomp_nic_write(va, val, size);
+        return;
+    }
     if (xbox_Nv2aRegTrapOwns(va)) {
         s_direct[0]++;
         xbox_Nv2aRegTrapWrite(va, val, size);

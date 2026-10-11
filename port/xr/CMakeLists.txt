@@ -53,6 +53,7 @@ set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
     src/mmio_direct.c
+    src/nvnet.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c

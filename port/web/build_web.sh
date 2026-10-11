@@ -23,7 +23,7 @@ cc() { src=$1; obj=$2
   emcc -c $CF $dbg "$src" -o "$obj" > "${obj%.o}.log" 2>&1 && rm -f "${obj%.o}.log" || echo "FAIL $src"; }
 export -f cc; export CF
 if [ "$1" != "link-only" ]; then
-  { for f in $G/recomp/gen/*.c $G/recomp_manual.c $G/mmio_direct.c; do echo "$f $OUT/lift/$(basename ${f%.c}).o"; done
+  { for f in $G/recomp/gen/*.c $G/recomp_manual.c $G/mmio_direct.c $G/nvnet.c; do echo "$f $OUT/lift/$(basename ${f%.c}).o"; done
     for f in $(find $X/src -name '*.c' -not -path '*/d3d/*' -not -path '*smoke*' -not -name 'nv2a_pb_test.c'); do
       b=$(echo ${f#$X/src/} | tr '/' '_'); echo "$f $OUT/rt/${b%.c}.o"; done
     echo "$W/main_web.c $OUT/rt/main_web.o"; echo "$W/compat_web.c $OUT/rt/compat_web.o"; echo "$W/present_web.c $OUT/rt/present_web.o"

@@ -9124,7 +9124,7 @@ index 22762ee..a7e0ca6 100644
  LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
  PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
-index 641a94d..0f481d9 100644
+index 641a94d..c076ae9 100644
 --- a/src/usb/ohci.c
 +++ b/src/usb/ohci.c
 @@ -500,6 +500,14 @@ static uint32_t bus_resolve(uint32_t addr)
@@ -9150,7 +9150,55 @@ index 641a94d..0f481d9 100644
              /* A raised IRQL that never drops holds every interrupt off until
               * the forced-delivery timeout, which looks like a slow pad. Name
               * who is holding it. */
-@@ -896,7 +905,12 @@ static int ohci_call_isr(OhciController *hc)
+@@ -854,9 +863,28 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
+  * Returns what the routine returned: an ISR that does not claim the interrupt
+  * returns FALSE, and that is worth seeing rather than assuming.
+  */
++static int call_isr_for(uint32_t vector, int index);
++
+ static int ohci_call_isr(OhciController *hc)
+ {
+-    uint32_t kinterrupt = xbox_GetConnectedInterrupt(OHCI_VECTOR);
++    return call_isr_for(OHCI_VECTOR, hc->index);
++}
++
++/* Other device models (the network controller in the port) have no thread of
++ * their own that can run guest code: this one has the TIB, the worker stack
++ * and the dispatch lock. g_xbox_device_tick, when set, is called once per
++ * controller tick on this thread, and may call xbox_DeviceRaiseInterrupt to
++ * run the ISR connected to its own vector. */
++void (*g_xbox_device_tick)(void);
++
++int xbox_DeviceRaiseInterrupt(uint32_t vector)
++{
++    return call_isr_for(vector, 9);
++}
++
++static int call_isr_for(uint32_t vector, int index)
++{
++    uint32_t kinterrupt = xbox_GetConnectedInterrupt(vector);
+     uint32_t routine, context;
+     recomp_func_t fn;
+     uint8_t *mem;
+@@ -874,7 +902,7 @@ static int ohci_call_isr(OhciController *hc)
+     fn = recomp_lookup(routine);
+     if (!fn) {
+         fprintf(stderr, "  [OHCI%d] ISR 0x%08X has no translation\n",
+-                hc->index, routine);
++                index, routine);
+         fflush(stderr);
+         return -1;
+     }
+@@ -884,7 +912,7 @@ static int ohci_call_isr(OhciController *hc)
+      * is not starved by a controller that interrupts. */
+     slot = xbox_worker_stack_alloc();
+     if (slot < 0) {
+-        fprintf(stderr, "  [OHCI%d] no worker stack for the ISR\n", hc->index);
++        fprintf(stderr, "  [OHCI%d] no worker stack for the ISR\n", index);
+         fflush(stderr);
+         return -1;
+     }
+@@ -896,7 +924,12 @@ static int ohci_call_isr(OhciController *hc)
      g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
      g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
  
@@ -9163,7 +9211,16 @@ index 641a94d..0f481d9 100644
  
      xbox_worker_stack_free(slot);
      return (int)(g_eax & 1u);
-@@ -1314,13 +1328,14 @@ void xbox_OhciInit(void)
+@@ -1033,6 +1066,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
+ 
+         Sleep(OHCI_TICK_MS);
++        if (g_xbox_device_tick)
++            g_xbox_device_tick();
+         control = hc->reg[HcControl / 4];
+         enable  = hc->reg[HcInterruptEnable / 4];
+ 
+@@ -1314,13 +1349,14 @@ void xbox_OhciInit(void)
              XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
      fflush(stderr);
  
@@ -9180,7 +9237,7 @@ index 641a94d..0f481d9 100644
  }
  
  static OhciController *hc_for(uint32_t va)
-@@ -1340,6 +1355,20 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
+@@ -1340,6 +1376,20 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
      return hc_for(xbox_va) != NULL;
  }
  
@@ -9201,7 +9258,7 @@ index 641a94d..0f481d9 100644
  int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
  {
  #if defined(_WIN32)
-@@ -1351,7 +1380,7 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
+@@ -1351,7 +1401,7 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
      ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
                        ohci_read, ohci_write);
      if (!ok && hc->decode_fail++ < 20) {
