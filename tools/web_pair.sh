@@ -20,6 +20,22 @@ PY
   for x in a b; do echo "$x: $(grep -a 'frames a second' $2/console_$x.txt | tail -1 | cut -c7-60) | $(grep -a 'link: sent' $2/console_$x.txt | tail -1 | cut -c7-70)"; done
   exit 0
 fi
+if [ "$1" = "--walk" ]; then   # from the title: both to System Link, a hosts, b joins (about 80 s)
+  O=$2; W="bash $0"
+  both() { for x in a b; do $W --do $O "$x key $1 $2"; done; sleep $3; }
+  both Enter 800 9; both Space 400 9; both Space 400 12     # start, profile, main menu
+  both Space 400 10; both Space 400 14                      # System Link (the row the save remembers), player screen
+  $W --do $O "a key Space 400"; sleep 18                    # a: Create New Game
+  $W --do $O "b key ArrowDown 120"; sleep 3; $W --do $O "b key Space 400"; sleep 14
+  for x in a b; do echo "$x: $(grep -a 'link: sent' $O/console_$x.txt | tail -1 | cut -c7-70)"; done
+  exit 0
+fi
+if [ "$1" = "--state" ]; then  # frames shown and link counters, asked of the pages now (no picture, no GPU)
+  O=$2
+  for x in a b; do echo "$x eval 'STATE '+Module.h2frames+' frames, link '+JSON.stringify(window.h2link)" >> $O/cmd.txt; done; sleep 2
+  for x in a b; do echo "$x: $(grep -a 'STATE' $O/console_$x.txt | tail -1 | sed 's/.*-> //')"; done
+  exit 0
+fi
 O=${1:?dir}; mkdir -p $O
 cd /d/n64work/halo2-cleanroom
 curl -s -o /dev/null http://localhost:8092/index.html || { (python ports/wasm/serve.py /d/n64work/halo2/build/web/site_clean 8092 > /dev/null 2>&1 &); sleep 2; }

@@ -3309,10 +3309,10 @@ index 4ebdfb9..c89dbc2 100644
          memset(Value, 0, ValueLength);
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..9eb3b49
+index 0000000..7f1d7d2
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,3254 @@
+@@ -0,0 +1,3261 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -5668,6 +5668,13 @@ index 0000000..9eb3b49
 +        var handle = GL.registerContext(ctx, attrs);
 +        GL.makeContextCurrent(handle);
 +        Module.nv2aCanvas = c;
++        /* A lost context draws nothing and presents blank, transparent
++         * frames with no error anywhere: say so (seen with two pages of
++         * this program in one browser). */
++        c.addEventListener('webglcontextlost', function (e) {
++            err('nv2a gl: the browser took the WebGL context away (' + (e.statusMessage || 'no reason given') + '); frames are blank from here');
++        });
++        c.addEventListener('webglcontextrestored', function () { err('nv2a gl: WebGL context restored (state is not rebuilt)'); });
 +        return handle | (clamp << 30);
 +    } catch (e) {
 +        err('nv2a gl: ' + e);
