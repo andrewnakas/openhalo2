@@ -66,6 +66,7 @@ int main(void)
     def("RECOMP_USB", "1");
     def("RECOMP_NO_MIRRORS", "1");
     def("RECOMP_NO_TILED", "1");
+    def("RECOMP_QUIET_PROGRESS", "1");   /* no line per 200 draws: every print crosses to the page */
     {   /* Sound: on unless ?env=RECOMP_SOUND=0 (the same switches main.c sets). */
         const char *snd = getenv("RECOMP_SOUND");
         if (!snd || *snd != '0') {

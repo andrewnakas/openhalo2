@@ -2682,10 +2682,10 @@ index caf6390..d776633 100644
      }
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..ae99be4
+index 0000000..9eb3b49
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,2982 @@
+@@ -0,0 +1,3254 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -2890,6 +2890,241 @@ index 0000000..ae99be4
 +#undef X
 +#endif
 +
++/* ---- Shadow state -------------------------------------------------------
++ *
++ * A draw sets the same forty-odd pieces of GL state every time, and most of
++ * them have not changed since the draw before. On the desktop a redundant
++ * call is cheap; in a browser every one crosses from WebAssembly into
++ * JavaScript and through WebGL's validation, and state setting was 0.6 s of
++ * every 5 s in a level. Every state call in this file goes through the
++ * wrappers below (the #defines after them), which remember what is set and
++ * skip a call that would change nothing. Deleting a texture or a framebuffer
++ * forgets the bindings, because GL unbinds a deleted object behind our back
++ * and its name may be handed out again. RECOMP_GL_NOCACHE=1 turns the
++ * skipping off. */
++static struct {
++    int     off;                        /* RECOMP_GL_NOCACHE */
++    int     known;
++    GLuint  fbo_draw, fbo_read, prog;
++    GLenum  unit;
++    GLuint  tex2d[8], texcube[8], sampler[8];
++    int     blend, depth, scissor;      /* -1 unknown */
++    GLint   vp[4], sc[4];
++    int     cm[4], dmask;
++    GLenum  dfunc, bsrc, bdst, beq;
++    float   bcol[4];
++} sc;
++
++static void sc_forget(void)
++{
++    const char *e = getenv("RECOMP_GL_NOCACHE");
++    memset(&sc, 0, sizeof sc);
++    sc.off = e && *e && *e != '0';
++    sc.blend = sc.depth = sc.scissor = -1;
++    sc.cm[0] = sc.dmask = -1;
++    sc.vp[2] = sc.sc[2] = -1;
++    sc.unit = 0;
++    sc.fbo_draw = sc.fbo_read = sc.prog = 0xFFFFFFFFu;
++    memset(sc.tex2d, 0xFF, sizeof sc.tex2d);
++    memset(sc.texcube, 0xFF, sizeof sc.texcube);
++    memset(sc.sampler, 0xFF, sizeof sc.sampler);
++    sc.dfunc = sc.bsrc = sc.bdst = sc.beq = 0;
++    sc.bcol[0] = -1.0f;
++    sc.known = 1;
++}
++
++#define SC_READY() do { if (!sc.known) sc_forget(); } while (0)
++
++static void sc_BindFramebuffer(GLenum target, GLuint f)
++{
++    SC_READY();
++    if (!sc.off) {
++        if (target == GL_FRAMEBUFFER && sc.fbo_draw == f && sc.fbo_read == f) return;
++        if (target == GL_DRAW_FRAMEBUFFER && sc.fbo_draw == f) return;
++        if (target == GL_READ_FRAMEBUFFER && sc.fbo_read == f) return;
++    }
++    glBindFramebuffer(target, f);
++    if (target != GL_READ_FRAMEBUFFER) sc.fbo_draw = f;
++    if (target != GL_DRAW_FRAMEBUFFER) sc.fbo_read = f;
++}
++
++static void sc_UseProgram(GLuint prog)
++{
++    SC_READY();
++    if (!sc.off && sc.prog == prog) return;
++    glUseProgram(prog);
++    sc.prog = prog;
++}
++
++static void sc_ActiveTexture(GLenum unit)
++{
++    SC_READY();
++    if (!sc.off && sc.unit == unit) return;
++    glActiveTexture(unit);
++    sc.unit = unit;
++}
++
++static void sc_BindTexture(GLenum target, GLuint tex)
++{
++    unsigned u;
++    SC_READY();
++    if (!sc.unit) { glActiveTexture(GL_TEXTURE0); sc.unit = GL_TEXTURE0; }
++    u = (unsigned)(sc.unit - GL_TEXTURE0) & 7u;
++    if (target == GL_TEXTURE_2D) {
++        if (!sc.off && sc.tex2d[u] == tex) return;
++        sc.tex2d[u] = tex;
++    } else if (target == GL_TEXTURE_CUBE_MAP) {
++        if (!sc.off && sc.texcube[u] == tex) return;
++        sc.texcube[u] = tex;
++    }
++    glBindTexture(target, tex);
++}
++
++static void sc_BindSampler(GLuint unit, GLuint smp)
++{
++    SC_READY();
++    if (!sc.off && unit < 8 && sc.sampler[unit] == smp) return;
++    glBindSampler(unit, smp);
++    if (unit < 8) sc.sampler[unit] = smp;
++}
++
++static int *sc_cap(GLenum cap)
++{
++    return cap == GL_BLEND ? &sc.blend : cap == GL_DEPTH_TEST ? &sc.depth
++         : cap == GL_SCISSOR_TEST ? &sc.scissor : NULL;
++}
++
++static void sc_Enable(GLenum cap)
++{
++    int *c;
++    SC_READY();
++    c = sc_cap(cap);
++    if (!sc.off && c && *c == 1) return;
++    glEnable(cap);
++    if (c) *c = 1;
++}
++
++static void sc_Disable(GLenum cap)
++{
++    int *c;
++    SC_READY();
++    c = sc_cap(cap);
++    if (!sc.off && c && *c == 0) return;
++    glDisable(cap);
++    if (c) *c = 0;
++}
++
++static void sc_Viewport(GLint x, GLint y, GLsizei w, GLsizei h)
++{
++    SC_READY();
++    if (!sc.off && sc.vp[0] == x && sc.vp[1] == y && sc.vp[2] == w && sc.vp[3] == h) return;
++    glViewport(x, y, w, h);
++    sc.vp[0] = x; sc.vp[1] = y; sc.vp[2] = w; sc.vp[3] = h;
++}
++
++static void sc_Scissor(GLint x, GLint y, GLsizei w, GLsizei h)
++{
++    SC_READY();
++    if (!sc.off && sc.sc[0] == x && sc.sc[1] == y && sc.sc[2] == w && sc.sc[3] == h) return;
++    glScissor(x, y, w, h);
++    sc.sc[0] = x; sc.sc[1] = y; sc.sc[2] = w; sc.sc[3] = h;
++}
++
++static void sc_ColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a)
++{
++    SC_READY();
++    if (!sc.off && sc.cm[0] == (int)r && sc.cm[1] == (int)g && sc.cm[2] == (int)b && sc.cm[3] == (int)a) return;
++    glColorMask(r, g, b, a);
++    sc.cm[0] = r; sc.cm[1] = g; sc.cm[2] = b; sc.cm[3] = a;
++}
++
++static void sc_DepthMask(GLboolean m)
++{
++    SC_READY();
++    if (!sc.off && sc.dmask == (int)m) return;
++    glDepthMask(m);
++    sc.dmask = m;
++}
++
++static void sc_DepthFunc(GLenum f)
++{
++    SC_READY();
++    if (!sc.off && sc.dfunc == f) return;
++    glDepthFunc(f);
++    sc.dfunc = f;
++}
++
++static void sc_BlendFunc(GLenum a, GLenum b)
++{
++    SC_READY();
++    if (!sc.off && sc.bsrc == a && sc.bdst == b) return;
++    glBlendFunc(a, b);
++    sc.bsrc = a; sc.bdst = b;
++}
++
++static void sc_BlendEquation(GLenum e)
++{
++    SC_READY();
++    if (!sc.off && sc.beq == e) return;
++    glBlendEquation(e);
++    sc.beq = e;
++}
++
++static void sc_BlendColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
++{
++    SC_READY();
++    if (!sc.off && sc.bcol[0] == r && sc.bcol[1] == g && sc.bcol[2] == b && sc.bcol[3] == a) return;
++    glBlendColor(r, g, b, a);
++    sc.bcol[0] = r; sc.bcol[1] = g; sc.bcol[2] = b; sc.bcol[3] = a;
++}
++
++static void sc_DeleteTextures(GLsizei n, const GLuint *t)
++{
++    glDeleteTextures(n, t);
++    sc.known = 0;
++}
++
++static void sc_DeleteFramebuffers(GLsizei n, const GLuint *f)
++{
++    glDeleteFramebuffers(n, f);
++    sc.known = 0;
++}
++
++/* Only in the browser build. On Windows the game window's thread has its own
++ * context and calls GL from this file too; one shadow for two contexts would be
++ * wrong, and redundant calls cost little there. */
++#if NV2A_GLES
++#define glBindFramebuffer    sc_BindFramebuffer
++#define glUseProgram         sc_UseProgram
++#define glActiveTexture      sc_ActiveTexture
++#define glBindTexture        sc_BindTexture
++#define glBindSampler        sc_BindSampler
++#define glEnable             sc_Enable
++#define glDisable            sc_Disable
++#define glViewport           sc_Viewport
++#define glScissor            sc_Scissor
++#define glColorMask          sc_ColorMask
++#define glDepthMask          sc_DepthMask
++#define glDepthFunc          sc_DepthFunc
++#define glBlendFunc          sc_BlendFunc
++#define glBlendEquation      sc_BlendEquation
++#define glBlendColor         sc_BlendColor
++#define glDeleteTextures     sc_DeleteTextures
++#define glDeleteFramebuffers sc_DeleteFramebuffers
++#endif
++
++/* A uniform is sent only when its bytes differ from what this program was
++ * last given (uniform values belong to the program object and stay). */
++static int uni_changed(void *last, const void *now, size_t n)
++{
++#if NV2A_GLES
++    if (!sc.off && memcmp(last, now, n) == 0)
++        return 0;
++#endif
++    memcpy(last, now, n);
++    return 1;
++}
++
 +/* Swap red and blue in n pixels: guest order (B G R A in memory) to and from
 + * the RGBA a GLES transfer takes. A no-op on the desktop, which transfers
 + * BGRA itself. */
@@ -2945,6 +3180,12 @@ index 0000000..ae99be4
 +    GLint   u_scale, u_c0, u_c1, u_fc0, u_fc1, u_fogc, u_aref, u_zcut;
 +    GLint   u_stipon, u_stip, u_wdepth;
 +    GLint   u_tsc, u_tsz, u_taf;
++    struct {                            /* what the program was last given */
++        float scale[3], c0[32], c1[32], fc0[4], fc1[4], fogc[3], wdepth[2], zcut, tsc[16], taf[4];
++        int   aref, stipon, tsz[16];
++        unsigned stip[32];
++        int   init;
++    } last;
 +} GlProg;
 +
 +typedef struct {
@@ -4122,6 +4363,7 @@ index 0000000..ae99be4
 +    p->used = 1;
 +    p->key = *k;
 +    p->prog = 0;
++    p->last.init = 0;                   /* a new program object has no uniforms yet */
 +    s_stat.programs++;
 +    fs = compile(GL_FRAGMENT_SHADER, src);
 +    if (!fs)
@@ -5301,8 +5543,17 @@ index 0000000..ae99be4
 +
 +    /* Program, uniforms, textures. */
 +    glUseProgram(p->prog);
-+    glUniform3f(p->u_scale, 2.0f / (float)S->w, 2.0f / (float)S->h,
-+                st->zmax > 0.0f ? 1.0f / st->zmax : 1.0f);
++    if (!p->last.init) {                /* nothing sent yet: make every comparison fail once */
++        memset(&p->last, 0x7F, sizeof p->last);
++        p->last.init = 1;
++    }
++    {
++        float sc3[3];
++        sc3[0] = 2.0f / (float)S->w; sc3[1] = 2.0f / (float)S->h;
++        sc3[2] = st->zmax > 0.0f ? 1.0f / st->zmax : 1.0f;
++        if (uni_changed(p->last.scale, sc3, sizeof sc3))
++            glUniform3f(p->u_scale, sc3[0], sc3[1], sc3[2]);
++    }
 +    if (st->mode == NV2A_GL_MODE_RC) {
 +        uint32_t flags = st->rc.control >> 8;
 +        float c0[32], c1[32], fc[4];
@@ -5310,21 +5561,35 @@ index 0000000..ae99be4
 +            unpack_argb(st->rc.factor0[(flags & 0x010) ? i : 0], &c0[i * 4]);
 +            unpack_argb(st->rc.factor1[(flags & 0x100) ? i : 0], &c1[i * 4]);
 +        }
-+        glUniform4fv(p->u_c0, 8, c0);
-+        glUniform4fv(p->u_c1, 8, c1);
++        if (uni_changed(p->last.c0, c0, sizeof c0))
++            glUniform4fv(p->u_c0, 8, c0);
++        if (uni_changed(p->last.c1, c1, sizeof c1))
++            glUniform4fv(p->u_c1, 8, c1);
 +        unpack_argb(st->rc.final_c0, fc);
-+        glUniform4fv(p->u_fc0, 1, fc);
++        if (uni_changed(p->last.fc0, fc, sizeof fc))
++            glUniform4fv(p->u_fc0, 1, fc);
 +        unpack_argb(st->rc.final_c1, fc);
-+        glUniform4fv(p->u_fc1, 1, fc);
-+        glUniform3fv(p->u_fogc, 1, st->fog_color);
++        if (uni_changed(p->last.fc1, fc, sizeof fc))
++            glUniform4fv(p->u_fc1, 1, fc);
++        if (uni_changed(p->last.fogc, st->fog_color, sizeof p->last.fogc))
++            glUniform3fv(p->u_fogc, 1, st->fog_color);
 +    }
-+    glUniform1i(p->u_aref, (GLint)(st->alpha_ref & 0xFF));
-+    if (p->u_wdepth >= 0)
-+        glUniform2f(p->u_wdepth, st->zmax > 0.0f ? 1.0f / st->zmax : 1.0f, st->zbias);
++    {
++        int aref = (int)(st->alpha_ref & 0xFF);
++        if (uni_changed(&p->last.aref, &aref, sizeof aref))
++            glUniform1i(p->u_aref, aref);
++    }
++    if (p->u_wdepth >= 0) {
++        float wd[2];
++        wd[0] = st->zmax > 0.0f ? 1.0f / st->zmax : 1.0f; wd[1] = st->zbias;
++        if (uni_changed(p->last.wdepth, wd, sizeof wd))
++            glUniform2f(p->u_wdepth, wd[0], wd[1]);
++    }
 +    if (p->u_stipon >= 0) {
 +        int on = st->mode != NV2A_GL_MODE_2D && st->stipple_enable;
-+        glUniform1i(p->u_stipon, on);
-+        if (on && p->u_stip >= 0)
++        if (uni_changed(&p->last.stipon, &on, sizeof on))
++            glUniform1i(p->u_stipon, on);
++        if (on && p->u_stip >= 0 && uni_changed(p->last.stip, st->stipple, sizeof p->last.stip))
 +            glUniform1uiv(p->u_stip, 32, (const GLuint *)st->stipple);
 +    }
 +    /* Depth beyond the buffer's range. GL always clamps here (there is no
@@ -5332,9 +5597,13 @@ index 0000000..ae99be4
 +     * clamp on that is the whole story; with it off the software path's
 +     * unclamped depth simply fails a LESS/LEQUAL test against anything in
 +     * the buffer, so those fragments are dropped. */
-+    glUniform1f(p->u_zcut, depth && st->depth_test && !st->depth_clamp
-+                           && (st->depth_func == 0x201 || st->depth_func == 0x203)
-+                           ? 1.0f : 3.0e38f);
++    {
++        float zcut = depth && st->depth_test && !st->depth_clamp
++                     && (st->depth_func == 0x201 || st->depth_func == 0x203)
++                     ? 1.0f : 3.0e38f;
++        if (uni_changed(&p->last.zcut, &zcut, sizeof zcut))
++            glUniform1f(p->u_zcut, zcut);
++    }
 +    for (i = 0; i < 4; i++) {
 +        tsc[i * 4 + 0] = tb[i].sx; tsc[i * 4 + 1] = tb[i].sy;
 +        tsc[i * 4 + 2] = tb[i].mx; tsc[i * 4 + 3] = tb[i].my;
@@ -5350,9 +5619,12 @@ index 0000000..ae99be4
 +                                          [st->tex[i].addr_u == 1]
 +                                          [st->tex[i].addr_v == 1]);
 +    }
-+    glUniform4fv(p->u_tsc, 4, tsc);
-+    glUniform4iv(p->u_tsz, 4, tsz);
-+    glUniform1fv(p->u_taf, 4, taf);
++    if (uni_changed(p->last.tsc, tsc, sizeof p->last.tsc))
++        glUniform4fv(p->u_tsc, 4, tsc);
++    if (uni_changed(p->last.tsz, tsz, sizeof p->last.tsz))
++        glUniform4iv(p->u_tsz, 4, tsz);
++    if (uni_changed(p->last.taf, taf, sizeof p->last.taf))
++        glUniform1fv(p->u_taf, 4, taf);
 +
 +    pt_add(PT_STATE, t_part);
 +    t_part = now_us();
@@ -5824,7 +6096,7 @@ index 0000000..1c749f8
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..7f09a6f 100644
+index c65632c..f8ae2ed 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -37,6 +37,7 @@
@@ -6105,6 +6377,15 @@ index c65632c..7f09a6f 100644
                  p[x] = v;
          }
      }
+@@ -701,7 +850,7 @@ static void clear_surface(uint32_t param)
+     /* Progress markers, interleaved with everything else in the log. The
+      * summary says drawing stopped; only a marker next to the surrounding
+      * activity says what the title was doing when it stopped. */
+-    if ((s_gpu.clears % 100) == 0)
++    if ((s_gpu.clears % 100) == 0 && !getenv("RECOMP_QUIET_PROGRESS"))
+         fprintf(stderr, "  [GPU] clear #%u\n", s_gpu.clears);
+     /* Distinct clear colours actually used. "Cleared to black" and "the clear
+      * never ran" look identical in the framebuffer, and only one of them is a
 @@ -854,6 +1003,11 @@ static uint32_t linear_twin(uint32_t fmt)
  {
      switch (fmt) {
@@ -6755,18 +7036,20 @@ index c65632c..7f09a6f 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -2417,6 +3043,11 @@ static void draw_primitive(void)
+@@ -2417,7 +3043,12 @@ static void draw_primitive(void)
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
+-    if ((s_gpu.draws % 200) == 0)
 +    if (s_gpu.idx_count > s_gpu.idx_max) s_gpu.idx_max = s_gpu.idx_count;
 +    if (s_gpu.idx_count > 4096u) {
 +        s_gpu.idx_over4096++;
 +        s_gpu.idx_past4096 += s_gpu.idx_count - 4096u;
 +    }
-     if ((s_gpu.draws % 200) == 0)
++    if ((s_gpu.draws % 200) == 0 && !getenv("RECOMP_QUIET_PROGRESS"))
          fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
      s_gpu.verts += s_gpu.idx_count;
+ 
 @@ -2840,6 +3471,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
      case NV097_SET_TEXTURE_CONTROL1:
          t->pitch = param >> 16;          /* linear formats only */
@@ -8304,7 +8587,7 @@ index 8acb0af..5b533f5 100644
  /* Run the program from the start slot on one vertex. Inputs are the ten
   * attribute values as floats. Returns 0 if there is no program to run (no
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..7f86d16 100644
+index 72d5131..15554ef 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -152,6 +152,9 @@ static size_t xbox_TiledApertureSize(void)
@@ -8451,16 +8734,29 @@ index 72d5131..7f86d16 100644
                          if (getenv("RECOMP_PB_WRAP_TRACE")) {
                              static unsigned wraps;
                              if (wraps++ < 8)
-@@ -1032,7 +1120,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1020,7 +1108,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                  * in its device struct rather than assuming 0xFD800000, and
+                  * mirroring the wrong block leaves it spinning on a GET that
+                  * never moves. */
+-                if (s_nv2a_trace) {
++                if (s_nv2a_trace && !getenv("RECOMP_QUIET_PROGRESS")) {
+                     uint32_t g = *(volatile uint32_t *)
+                                  ((char *)regs + NV2A_USER_DMA_GET);
+                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
+@@ -1032,8 +1120,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          }
          if (s_nv2a_trace) {
              static uint32_t last_start = 0xFFFFFFFFu;
 -            uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
+-            if (start != last_start) {
 +            uint32_t start = xbox_Nv2aRegRead(0x600800);
-             if (start != last_start) {
++            if (start != last_start && getenv("RECOMP_QUIET_PROGRESS")) {
++                last_start = start;
++            } else if (start != last_start) {
                  last_start = start;
                  fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
-@@ -1057,6 +1145,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                 fflush(stderr);
+@@ -1057,6 +1147,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                 + g_memory_offset) = GetTickCount();
  
@@ -8468,7 +8764,7 @@ index 72d5131..7f86d16 100644
          Sleep(0);  /* yield; the waiter is spinning on another core */
      }
      return 0;
-@@ -1176,6 +1265,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+@@ -1176,6 +1267,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  /* SEH frame pointer bridge (see recomp_types.h for explanation) */
  RECOMP_TLS uint32_t g_seh_ebp = 0;
  RECOMP_TLS double g_fp_stack[8];
@@ -8481,7 +8777,7 @@ index 72d5131..7f86d16 100644
  RECOMP_TLS int g_fp_top = 0;
  
  /* Set once at startup. The generated code reads it at the ret of every
-@@ -1387,6 +1482,9 @@ static void watch_report(void)
+@@ -1387,6 +1484,9 @@ static void watch_report(void)
  
  static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
  {
@@ -8491,7 +8787,7 @@ index 72d5131..7f86d16 100644
      DWORD code = ep->ExceptionRecord->ExceptionCode;
      DWORD old;
  
-@@ -1414,6 +1512,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+@@ -1414,6 +1514,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
              return EXCEPTION_CONTINUE_EXECUTION;
          }
      }
@@ -8499,7 +8795,7 @@ index 72d5131..7f86d16 100644
      return EXCEPTION_CONTINUE_SEARCH;
  }
  
-@@ -1761,11 +1860,41 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -1761,11 +1862,41 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
       */
      {
          static const uintptr_t try_bases[] = {
@@ -8541,7 +8837,7 @@ index 72d5131..7f86d16 100644
              0,                      /* sentinel - let OS choose */
          };
  
-@@ -2548,7 +2677,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -2548,7 +2679,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          uint64_t tiled_lo = XBOX_TILED_BASE;
          uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
  
@@ -8557,7 +8853,7 @@ index 72d5131..7f86d16 100644
              uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                      (uintptr_t)(m + 1) * g_memory_size;
              uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
-@@ -2627,7 +2763,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -2627,7 +2765,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
           */
          if (tiled_size > XBOX_CONTIG_SIZE)
              tiled_size = XBOX_CONTIG_SIZE;
@@ -8566,7 +8862,7 @@ index 72d5131..7f86d16 100644
              ? MapViewOfFileEx(
                  g_contig_mapping,
                  FILE_MAP_ALL_ACCESS,
-@@ -3094,6 +3230,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+@@ -3094,6 +3232,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
      g_contig_block_count++;
  }
  
