@@ -58,7 +58,8 @@ async function importTree() {
     const parts = path.split('/'); const name = parts.pop();
     let dir = root; for (const d of parts) dir = await dir.getDirectoryHandle(d, {create: true});
     const fh = await dir.getFileHandle(name, {create: true});
-    if ((await fh.getFile()).size === size) { skipped++; continue; }
+    // maps are regenerated in place at the same size, so ?import=force copies everything again
+    if (q.get('import') !== 'force' && (await fh.getFile()).size === size) { skipped++; continue; }
     const w = await fh.createWritable();
     const r = await fetch(encodeURI(path));
     if (!r.ok) { await w.abort(); say('import: ' + path + ' -> HTTP ' + r.status); continue; }
@@ -91,7 +92,7 @@ async function importTree() {
       say('opfs usage ' + (est.usage / 1048576 | 0) + ' MB of ' + (est.quota / 1048576 | 0));
       if (q.get('ls') === 'only') return;
     }
-    if (q.get('import') === 'only') return;
+    if (q.get('import') === 'only' || q.get('import') === 'force') return;
     // Frames from the WebGL2 backend come straight from its worker as
     // {nv2aFrame: ImageBitmap}; every worker the runtime starts gets a listener.
     // frames shown on the page, every 10 s
