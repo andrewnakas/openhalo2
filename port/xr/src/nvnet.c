@@ -1,11 +1,10 @@
 /* The console's network controller (nForce Ethernet, registers at 0xFEF00000).
  *
- * Work in progress (P6, decision 73 in STATUS.md): a register model the
- * title's own XNet driver can bring up, to which an Ethernet frame transport
- * is attached (one relay room = one cable). Written from the driver's
- * observed accesses (RECOMP_NIC_TRACE=1) and public descriptions of the
- * hardware's register and descriptor layout; no code from any GPL driver or
- * emulator.
+ * P6, decisions 73-75 in STATUS.md: a register model the title's own XNet
+ * driver brings up, with an Ethernet frame transport attached (one room = one
+ * cable). Written from the driver's observed accesses (RECOMP_NIC_TRACE=1)
+ * and public descriptions of the hardware's register and descriptor layout;
+ * no code from any GPL driver or emulator.
  *
  * Registers modelled:
  *   +0x000 interrupt status (write one to clear)   +0x004 interrupt mask
@@ -21,17 +20,27 @@
  *
  * A ring entry is two words: the buffer's physical address, then length in
  * the low 16 bits and flags in the high 16. Transmit: bit 31 = ours to send,
- * length is stored minus one; sending clears bit 31. Receive: bit 31 = free
- * for us; a delivered frame clears it, sets bit 16 and stores the length.
+ * bit 16 = last piece of the frame, length stored minus one; sending clears
+ * bit 31. Receive: bit 31 = free for us, length = the buffer's size minus
+ * one; a delivered frame clears bit 31, sets bit 16 and stores its length.
  *
- * Frames go to and come from nic_frame_out / the transport's queue (see
- * nvnet_transport below: a stub that only counts and logs for now).
- * Interrupts are raised on the USB model's thread (g_xbox_device_tick),
- * which is the one runtime thread that can run guest code.
+ * Where a buffer is: the title gives "physical" addresses, which here can
+ * mean the contiguous window or ordinary memory at that address; the kernel
+ * layer remembers which the title last asked about for each page
+ * (xbox_PhysicalKind).
  *
- * RECOMP_NIC=0 leaves the registers as plain memory. RECOMP_NIC_TRACE=1
- * prints the first 600 register accesses; RECOMP_NIC_FRAMES=1 one line per
- * frame sent (first 200).
+ * Transport: Windows builds join a hub on the local machine (UDP on
+ * 127.0.0.1, ports 34900-34907, one per running copy; every frame goes to
+ * the other seven ports). Nothing leaves the machine. Other hosts (the
+ * browser) have no transport yet.
+ *
+ * The model ticks on the USB model's thread (g_xbox_device_tick), the one
+ * runtime thread that can run guest code, and raises its interrupt there.
+ *
+ * RECOMP_NIC=0: registers are plain memory (no network, as before).
+ * RECOMP_NIC_HUB=0: no transport (frames are only counted).
+ * RECOMP_NIC_TRACE=1: first 600 register accesses.
+ * RECOMP_NIC_FRAMES=1: one line per frame sent or received (first 300).
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -39,10 +48,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 extern ptrdiff_t g_xbox_mem_offset;
 extern void (*g_xbox_device_tick)(void);
 int      xbox_DeviceRaiseInterrupt(uint32_t vector);
 uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+int      xbox_PhysicalKind(uint32_t pa);
 
 #define NIC_BASE   0xFEF00000u
 #define NIC_SIZE   0x00000400u
@@ -71,7 +86,9 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 #define MII_WRITE    0x0400u
 
 #define DESC_OWNED   0x80000000u    /* transmit: valid; receive: available */
-#define DESC_DONE    0x00010000u    /* receive: descriptor holds a frame */
+#define DESC_LAST    0x00010000u    /* transmit: last piece; receive: holds a frame */
+
+#define FRAME_MAX    1600u
 
 static uint32_t s_reg[NIC_SIZE / 4];
 static uint16_t s_phy[32];
@@ -81,10 +98,13 @@ static volatile int s_kick;
 static uint32_t s_tx_next, s_rx_next;
 static uint8_t  s_tx_frame[2048];
 static uint32_t s_tx_have;
-#define DESC_LAST 0x00010000u       /* transmit: last piece of the frame */
-static unsigned long s_tx_frames, s_tx_bytes, s_irqs, s_irq_declined;
+static unsigned long s_tx_frames, s_tx_bytes, s_rx_frames, s_rx_bytes, s_rx_dropped;
+static unsigned long s_irqs, s_irq_declined, s_unknown_kind;
 
 static void nic_tick(void);
+static void hub_open(void);
+static void hub_send(const uint8_t *f, uint32_t len);
+static int  hub_recv(uint8_t *f, uint32_t max);
 
 static void nic_init(void)
 {
@@ -98,8 +118,10 @@ static void nic_init(void)
     s_phy[1] = 0x782D;
     s_phy[4] = 0x01E1;
     s_phy[5] = 0x45E1;
-    if (s_on)
+    if (s_on) {
+        hub_open();
         g_xbox_device_tick = nic_tick;
+    }
 }
 
 int recomp_nic_owns(uint32_t va)
@@ -109,39 +131,59 @@ int recomp_nic_owns(uint32_t va)
     return s_on && va >= NIC_BASE && va < NIC_BASE + NIC_SIZE;
 }
 
-/* Guest physical memory as the title's drivers address it. */
-static uint8_t *phys(uint32_t pa)
+/* ---- Guest memory ---------------------------------------------------------- */
+
+static uint8_t *window(uint32_t pa)
 {
     return (uint8_t *)((uintptr_t)(0x80000000u | (pa & 0x0FFFFFFFu)) + g_xbox_mem_offset);
 }
 
-static uint32_t rd32(uint32_t pa) { uint32_t v; memcpy(&v, phys(pa), 4); return v; }
-static void wr32(uint32_t pa, uint32_t v) { memcpy(phys(pa), &v, 4); }
+static uint32_t rd32(uint32_t pa) { uint32_t v; memcpy(&v, window(pa), 4); return v; }
+static void wr32(uint32_t pa, uint32_t v) { memcpy(window(pa), &v, 4); }
 
-/* ---- Transport (stub) ----------------------------------------------------
- * One function out, one queue in. For now a frame sent is counted and, with
- * RECOMP_NIC_FRAMES=1, described; nothing is received. */
-static void nic_frame_out(const uint8_t *f, uint32_t len)
+/* A packet buffer: by what the title last asked about that page, else (never
+ * asked) the contiguous window, which is what a physical address means. */
+static uint8_t *buffer(uint32_t pa)
+{
+    int kind = xbox_PhysicalKind(pa);
+    if (kind == 2)
+        return (uint8_t *)((uintptr_t)pa + g_xbox_mem_offset);
+    if (kind == 0)
+        s_unknown_kind++;
+    return window(pa);
+}
+
+/* ---- Frames ---------------------------------------------------------------- */
+
+static void describe(const char *dir, const uint8_t *f, uint32_t len)
+{
+    unsigned type;
+
+    if (!s_frames || s_tx_frames + s_rx_frames > 300 || len < 14)
+        return;
+    type = (unsigned)f[12] << 8 | f[13];
+    fprintf(stderr, "  [NIC] %s %4u B  %02X:%02X:%02X:%02X:%02X:%02X -> "
+                    "%02X:%02X:%02X:%02X:%02X:%02X  type %04X",
+            dir, len, f[6], f[7], f[8], f[9], f[10], f[11],
+            f[0], f[1], f[2], f[3], f[4], f[5], type);
+    if (type == 0x0800 && len >= 42 && f[23] == 17)
+        fprintf(stderr, "  UDP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
+                f[26], f[27], f[28], f[29], (unsigned)f[34] << 8 | f[35],
+                f[30], f[31], f[32], f[33], (unsigned)f[36] << 8 | f[37]);
+    else if (type == 0x0806)
+        fprintf(stderr, "  ARP");
+    fprintf(stderr, "\n");
+}
+
+static void frame_out(const uint8_t *f, uint32_t len)
 {
     s_tx_frames++;
     s_tx_bytes += len;
-    if (s_frames && s_tx_frames <= 200 && len >= 14) {
-        unsigned type = (unsigned)f[12] << 8 | f[13];
-        fprintf(stderr, "  [NIC] tx %4u B  %02X:%02X:%02X:%02X:%02X:%02X -> "
-                        "%02X:%02X:%02X:%02X:%02X:%02X  type %04X",
-                len, f[6], f[7], f[8], f[9], f[10], f[11],
-                f[0], f[1], f[2], f[3], f[4], f[5], type);
-        if (type == 0x0800 && len >= 42 && f[23] == 17)
-            fprintf(stderr, "  UDP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
-                    f[26], f[27], f[28], f[29], (unsigned)f[34] << 8 | f[35],
-                    f[30], f[31], f[32], f[33], (unsigned)f[36] << 8 | f[37]);
-        else if (type == 0x0806)
-            fprintf(stderr, "  ARP");
-        fprintf(stderr, "\n");
-    }
+    describe("tx", f, len);
+    hub_send(f, len);
 }
 
-/* ---- Rings ---------------------------------------------------------------- */
+/* ---- Rings ----------------------------------------------------------------- */
 
 static void tx_run(void)
 {
@@ -158,29 +200,15 @@ static void tx_run(void)
 
         if (!(fl & DESC_OWNED))
             break;
-        if (len <= 1600 && s_tx_have + len <= sizeof s_tx_frame) {
-            /* A buffer address is "physical". Memory from the contiguous
-             * allocator lives in the window at 0x80000000 + address; pool
-             * and static memory keeps its own address (the kernel layer's
-             * MmGetPhysicalAddress passes those through), so the same number
-             * can name either. A buffer the driver filled is not all zeroes
-             * at its start: take the candidate that is not. */
-            static const uint8_t zero[14];
-            const uint8_t *win = phys(buf);
-            const uint8_t *low = (const uint8_t *)((uintptr_t)buf + g_xbox_mem_offset);
-            const uint8_t *f = (buf < 0x04000000u && memcmp(win, zero, len < 14 ? len : 14) == 0)
-                               ? low : win;
-            if (s_frames && s_tx_frames < 4)
-                fprintf(stderr, "  [NIC] tx piece 0x%08X %u B flags %04X: %s\n", buf, len,
-                        fl >> 16, f == win ? "contiguous window" : "its own address");
-            memcpy(s_tx_frame + s_tx_have, f, len);
+        if (len <= FRAME_MAX && s_tx_have + len <= sizeof s_tx_frame) {
+            memcpy(s_tx_frame + s_tx_have, buffer(buf), len);
             s_tx_have += len;
         }
         /* A frame may be handed over in pieces (the title sends its headers
          * and its payload from different buffers); bit 16 marks the last. */
         if (fl & DESC_LAST) {
             if (s_tx_have >= 14)
-                nic_frame_out(s_tx_frame, s_tx_have);
+                frame_out(s_tx_frame, s_tx_have);
             s_tx_have = 0;
         }
         wr32(at + 4, fl & ~DESC_OWNED);
@@ -191,12 +219,45 @@ static void tx_run(void)
         s_reg[REG_IRQ_STATUS / 4] |= IRQ_TX_OK;
 }
 
+/* One received frame into the next free receive entry. 0 if there is none
+ * (the frame is dropped, as the hardware would). */
+static int rx_deliver(const uint8_t *f, uint32_t len)
+{
+    uint32_t ring = s_reg[REG_RX_RING / 4];
+    uint32_t count = ((s_reg[REG_RING_SIZES / 4] >> 16) & 0xFFFFu) + 1;
+    uint32_t at, buf, fl, room;
+
+    if (!ring || !(s_reg[0x094 / 4] & 1u))      /* receiver not started */
+        return 0;
+    at = ring + (s_rx_next % count) * 8;
+    buf = rd32(at);
+    fl = rd32(at + 4);
+    room = (fl & 0xFFFFu) + 1;
+    if (!(fl & DESC_OWNED) || len > room)
+        return 0;
+    memcpy(buffer(buf), f, len);
+    wr32(at + 4, DESC_LAST | (len & 0xFFFFu));
+    s_rx_next++;
+    s_rx_frames++;
+    s_rx_bytes += len;
+    describe("rx", f, len);
+    s_reg[REG_IRQ_STATUS / 4] |= IRQ_RX;
+    return 1;
+}
+
 /* On the USB model's thread, every few milliseconds. */
 static void nic_tick(void)
 {
+    static uint8_t in[2048];
+    int len, budget = 16;
+
     if (s_kick) {
         s_kick = 0;
         tx_run();
+    }
+    while (budget-- > 0 && (len = hub_recv(in, sizeof in)) > 0) {
+        if (len < 14 || (uint32_t)len > FRAME_MAX || !rx_deliver(in, (uint32_t)len))
+            s_rx_dropped++;
     }
     if ((s_reg[REG_IRQ_STATUS / 4] & s_reg[REG_IRQ_MASK / 4])
             && xbox_GetConnectedInterrupt(NIC_VECTOR)) {
@@ -204,16 +265,17 @@ static void nic_tick(void)
         s_irqs++;
         if (claimed <= 0)
             s_irq_declined++;
-        if (s_irqs <= 5 || (s_frames && s_irqs % 500 == 0))
-            fprintf(stderr, "  [NIC] interrupt %lu -> ISR %s (status %02X mask %02X); "
-                            "%lu frames, %lu B sent\n", s_irqs,
+        if (s_irqs <= 3 || s_irqs % 2000 == 0)
+            fprintf(stderr, "  [NIC] interrupt %lu -> ISR %s; sent %lu frames (%lu B), "
+                            "received %lu (%lu B), dropped %lu, declined %lu, "
+                            "buffers of unknown kind %lu\n", s_irqs,
                     claimed < 0 ? "not callable" : claimed ? "claimed it" : "declined it",
-                    s_reg[REG_IRQ_STATUS / 4] & 0xFFu, s_reg[REG_IRQ_MASK / 4] & 0xFFu,
-                    s_tx_frames, s_tx_bytes);
+                    s_tx_frames, s_tx_bytes, s_rx_frames, s_rx_bytes, s_rx_dropped,
+                    s_irq_declined, s_unknown_kind);
     }
 }
 
-/* ---- Registers ------------------------------------------------------------ */
+/* ---- Registers ------------------------------------------------------------- */
 
 static uint32_t reg_read(uint32_t off)
 {
@@ -248,6 +310,7 @@ static void reg_write(uint32_t off, uint32_t v)
     case REG_TX_RING:
         s_reg[off / 4] = v;
         s_tx_next = 0;
+        s_tx_have = 0;
         return;
     case REG_RX_RING:
         s_reg[off / 4] = v;
@@ -257,6 +320,7 @@ static void reg_write(uint32_t off, uint32_t v)
         s_reg[off / 4] = v;
         if (v & TXRX_RESET) {
             s_tx_next = s_rx_next = 0;
+            s_tx_have = 0;
             s_kick = 0;
         } else if (v & TXRX_KICK) {
             s_kick = 1;
@@ -316,3 +380,86 @@ void recomp_nic_write(uint32_t va, uint32_t val, int size)
             reg_write(off & ~3u, (old & ~mask) | ((val << shift) & mask));
     }
 }
+
+/* ---- Transport: a hub on the local machine --------------------------------- */
+
+#define HUB_PORT0 34900
+#define HUB_PORTS 8
+
+#if defined(_WIN32)
+
+static SOCKET s_sock = INVALID_SOCKET;
+static int s_my_port;
+
+static void hub_open(void)
+{
+    const char *e = getenv("RECOMP_NIC_HUB");
+    WSADATA wsa;
+    u_long nb = 1;
+    int i;
+
+    if (e && *e == '0')
+        return;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        return;
+    s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s_sock == INVALID_SOCKET)
+        return;
+    for (i = 0; i < HUB_PORTS; i++) {
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons((u_short)(HUB_PORT0 + i));
+        if (bind(s_sock, (struct sockaddr *)&a, sizeof a) == 0) {
+            s_my_port = HUB_PORT0 + i;
+            break;
+        }
+    }
+    if (!s_my_port) {
+        closesocket(s_sock);
+        s_sock = INVALID_SOCKET;
+        fprintf(stderr, "  [NIC] no free hub port (%d-%d): no transport\n",
+                HUB_PORT0, HUB_PORT0 + HUB_PORTS - 1);
+        return;
+    }
+    ioctlsocket(s_sock, FIONBIO, &nb);
+    fprintf(stderr, "  [NIC] local hub: this copy is station %d (UDP 127.0.0.1:%d)\n",
+            s_my_port - HUB_PORT0, s_my_port);
+}
+
+static void hub_send(const uint8_t *f, uint32_t len)
+{
+    int i;
+
+    if (s_sock == INVALID_SOCKET)
+        return;
+    for (i = 0; i < HUB_PORTS; i++) {
+        struct sockaddr_in a;
+        if (HUB_PORT0 + i == s_my_port)
+            continue;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons((u_short)(HUB_PORT0 + i));
+        sendto(s_sock, (const char *)f, (int)len, 0, (struct sockaddr *)&a, sizeof a);
+    }
+}
+
+static int hub_recv(uint8_t *f, uint32_t max)
+{
+    int n;
+
+    if (s_sock == INVALID_SOCKET)
+        return 0;
+    n = recv(s_sock, (char *)f, (int)max, 0);
+    return n > 0 ? n : 0;
+}
+
+#else   /* no transport on this host yet */
+
+static void hub_open(void) {}
+static void hub_send(const uint8_t *f, uint32_t len) { (void)f; (void)len; }
+static int  hub_recv(uint8_t *f, uint32_t max) { (void)f; (void)max; return 0; }
+
+#endif

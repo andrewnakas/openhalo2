@@ -2479,6 +2479,52 @@ index 1ad4fff..0af83a3 100644
          g_current_irql = (KIRQL)level;
          irql_publish();
      }
+diff --git a/src/kernel/kernel_memory.c b/src/kernel/kernel_memory.c
+index e49a219..d19585b 100644
+--- a/src/kernel/kernel_memory.c
++++ b/src/kernel/kernel_memory.c
+@@ -163,6 +163,9 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
+         VirtualFree(BaseAddress, 0, MEM_RELEASE);
+ }
+ 
++#define XBOX_PHYS_KIND_PAGES 32768u        /* 128 MB of 4 KB pages */
++extern unsigned char g_xbox_phys_kind[XBOX_PHYS_KIND_PAGES];
++
+ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
+ {
+     /*
+@@ -179,9 +182,28 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
+      * nothing naming this function.
+      */
+     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
+-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
+-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+-                     ? va - XBOX_CONTIG_BASE : va);
++    int window = va >= XBOX_CONTIG_BASE &&
++                 (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
++    uint32_t pa = window ? va - XBOX_CONTIG_BASE : va;
++
++    /* Remember which memory the caller meant: see xbox_PhysicalKind. */
++    if (pa < XBOX_PHYS_KIND_PAGES * 4096u)
++        g_xbox_phys_kind[pa >> 12] = (unsigned char)(window ? 1 : 2);
++    return (ULONG_PTR)pa;
++}
++
++/* A "physical" address a driver hands to a device can name two different
++ * memories here: the contiguous window's (0x80000000 + address) or ordinary
++ * memory at that very address, because the conversion above passes anything
++ * outside the window through unchanged. The number alone cannot say which.
++ * What can: the last conversion the title asked for on that page. 1 = the
++ * contiguous window, 2 = its own address, 0 = never asked. Device models that
++ * read or fill a driver's buffers (the network controller) go by this. */
++unsigned char g_xbox_phys_kind[XBOX_PHYS_KIND_PAGES];
++
++int xbox_PhysicalKind(uint32_t pa)
++{
++    return pa < XBOX_PHYS_KIND_PAGES * 4096u ? g_xbox_phys_kind[pa >> 12] : 0;
+ }
+ 
+ VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)
 diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
 index caf6390..d776633 100644
 --- a/src/kernel/kernel_path.c
@@ -2680,6 +2726,67 @@ index caf6390..d776633 100644
          XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
          return TRUE;
      }
+diff --git a/src/kernel/kernel_xbox.c b/src/kernel/kernel_xbox.c
+index 4ebdfb9..c89dbc2 100644
+--- a/src/kernel/kernel_xbox.c
++++ b/src/kernel/kernel_xbox.c
+@@ -11,6 +11,8 @@
+ 
+ #include "kernel.h"
+ #include <string.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ /* ============================================================================
+  * Exported Data Objects
+@@ -202,7 +204,46 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+         }
+         break;
+ 
+-    default:
++    case 0x101: {
++        /* The factory Ethernet address. With all zeroes the title's network
++         * stack sends from 00:00:00:00:00:00, and two instances on one cable
++         * would be the same station. RECOMP_MAC=xx:xx:xx:xx:xx:xx sets it;
++         * otherwise a locally administered address made from the process id
++         * and the clock, so each running copy differs. */
++        static unsigned char mac[6];
++        static int have;
++        if (!have) {
++            const char *e = getenv("RECOMP_MAC");
++            unsigned m[6];
++            if (e && sscanf(e, "%x:%x:%x:%x:%x:%x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
++                int k;
++                for (k = 0; k < 6; k++) mac[k] = (unsigned char)m[k];
++            } else {
++                unsigned long seed = (unsigned long)GetCurrentProcessId() * 2654435761u
++                                   ^ (unsigned long)GetTickCount();
++                mac[0] = 0x02; mac[1] = 0x48; mac[2] = 0x32;      /* local, "H2" */
++                mac[3] = (unsigned char)(seed >> 16);
++                mac[4] = (unsigned char)(seed >> 8);
++                mac[5] = (unsigned char)seed;
++            }
++            have = 1;
++            fprintf(stderr, "  [KERNEL] Ethernet address %02X:%02X:%02X:%02X:%02X:%02X\n",
++                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++        }
++        memset(Value, 0, ValueLength);
++        memcpy(Value, mac, ValueLength < 6 ? ValueLength : 6);
++        if (Type) *Type = 3;                /* REG_BINARY */
++        if (ResultLength) *ResultLength = 6;
++        break;
++    }
++
++    default: {
++        static unsigned said;
++        if (said++ < 12)
++            fprintf(stderr, "  [KERNEL] ExQueryNonVolatileSetting: index 0x%X not modelled "
++                            "(%lu bytes of zeroes)\n", (unsigned)ValueIndex,
++                    (unsigned long)ValueLength);
++    }
+         xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
+             "ExQueryNonVolatileSetting: unhandled index 0x%02X", ValueIndex);
+         memset(Value, 0, ValueLength);
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
 index 0000000..9eb3b49
