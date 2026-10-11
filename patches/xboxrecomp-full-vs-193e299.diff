@@ -3309,10 +3309,10 @@ index 4ebdfb9..c89dbc2 100644
          memset(Value, 0, ValueLength);
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..401b750
+index 0000000..ad928ff
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,3289 @@
+@@ -0,0 +1,3337 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -3477,7 +3477,7 @@ index 0000000..401b750
 +    X(void,   Uniform1uiv, (GLint, GLsizei, const GLuint *)) \
 +    X(void,   GenBuffers, (GLsizei, GLuint *)) \
 +    X(void,   BindBuffer, (GLenum, GLuint)) \
-+    X(void,   BufferData, (GLenum, ptrdiff_t, const void *, GLenum)) \
++    X(void,   BufferData, (GLenum, ptrdiff_t, const void *, GLenum))     X(void,   BufferSubData, (GLenum, ptrdiff_t, ptrdiff_t, const void *)) \
 +    X(void,   GenVertexArrays, (GLsizei, GLuint *)) \
 +    X(void,   BindVertexArray, (GLuint)) \
 +    X(void,   EnableVertexAttribArray, (GLuint)) \
@@ -3872,9 +3872,21 @@ index 0000000..401b750
 +    QueryPerformanceCounter(&c);
 +    return (double)c.QuadPart * 1e6 / (double)f.QuadPart;
 +}
++/* A draw reads the clock about ten times, and in the browser each read is a
++ * call out of the module (5% of the executor thread, profile of 2026-10-11).
++ * So only one draw in PT_EVERY is timed and its times count PT_EVERY-fold;
++ * the counts stay exact. Outside nv2a_gl_draw everything is timed. */
++#define PT_EVERY 16
++static int s_pt_live = 1;
++static double s_pt_scale = 1.0;
++static double pt_now(void)
++{
++    return s_pt_live ? now_us() : 0.0;
++}
 +static void pt_add(int k, double t0)
 +{
-+    s_pt[k].us += now_us() - t0;
++    if (s_pt_live)
++        s_pt[k].us += (now_us() - t0) * s_pt_scale;
 +    s_pt[k].n++;
 +}
 +
@@ -4069,7 +4081,7 @@ index 0000000..401b750
 +static void surf_upload(GlSurface *s)
 +{
 +    const uint8_t *src = guest(s->base);
-+    double t0 = now_us();
++    double t0 = pt_now();
 +
 +    s_ul_cause[s_ul_why]++;
 +    s_ul_why = 0;
@@ -4127,7 +4139,7 @@ index 0000000..401b750
 +
 +    if (!s->gpu_newer || s_verify)
 +        return;
-+    t0 = now_us();
++    t0 = pt_now();
 +    s_dl_cause[cause]++;
 +    /* Never write over bytes the CPU has changed since the two copies last
 +     * agreed. A surface the title freed keeps its entry here, and its memory
@@ -4207,7 +4219,7 @@ index 0000000..401b750
 +        return;
 +    s->checked_flip = s_flip;
 +    {
-+        double t0 = now_us();
++        double t0 = pt_now();
 +        int diff = hash_sampled(guest(s->base), surf_bytes(s)) != s->mem_hash;
 +        pt_add(PT_SCHK, t0);
 +        if (diff) {
@@ -4395,7 +4407,7 @@ index 0000000..401b750
 +    uint32_t stride = t->cube ? nv2a_exec_tex_face_stride(t) : 0;
 +    uint32_t *buf = scratch((size_t)w * h), probe;
 +    GLenum target = t->cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
-+    double t0 = now_us();
++    double t0 = pt_now();
 +
 +    e->supported = buf && nv2a_exec_sample_tex(t, 0, 0, 0, &probe);
 +    if (!e->supported)
@@ -4551,7 +4563,7 @@ index 0000000..401b750
 +    if (e->checked_flip != s_flip
 +        || (touched && (s_flip - e->changed_flip < 600
 +                        || s_flip - e->born_flip < 8))) {
-+        double t0 = now_us();
++        double t0 = pt_now();
 +        uint64_t h = hash_bytes(guest(t->offset), (size_t)bytes);
 +        if (t->color == 0x0B && t->palette && range_ok(t->palette, 1024))
 +            h ^= hash_bytes(guest(t->palette), 1024) * 3u;
@@ -6061,7 +6073,7 @@ index 0000000..401b750
 +    }
 +}
 +
-+void nv2a_gl_draw(const Nv2aGlState *st, uint32_t *zpass)
++static void gl_draw_inner(const Nv2aGlState *st, uint32_t *zpass)
 +{
 +    int n = s_nverts, i, stage, used[4] = {0, 0, 0, 0}, linear[4] = {0, 0, 0, 0};
 +    GlSurface *S;
@@ -6070,8 +6082,8 @@ index 0000000..401b750
 +    ProgKey key;
 +    GlProg *p;
 +    float tsc[16], taf[4];
-+    GLint tsz[16];
-+    double t_draw = now_us(), t_part;
++    GLint tsz[16], vfirst = 0;
++    double t_draw = pt_now(), t_part;
 +
 +    s_nverts = 0;
 +    if (zpass)
@@ -6160,7 +6172,7 @@ index 0000000..401b750
 +        probe_batch(st, n, tb, S);
 +    }
 +    pt_add(PT_RESOLVE, t_draw);
-+    t_part = now_us();
++    t_part = pt_now();
 +
 +    /* Target and per-fragment state. */
 +    glBindFramebuffer(GL_FRAMEBUFFER, fbo_for(S->tex, depth));
@@ -6289,31 +6301,58 @@ index 0000000..401b750
 +        glUniform1fv(p->u_taf, 4, taf);
 +
 +    pt_add(PT_STATE, t_part);
-+    t_part = now_us();
-+    glBufferData(GL_ARRAY_BUFFER, (ptrdiff_t)sizeof(Nv2aGlVertex) * n, s_q,
-+                 GL_STREAM_DRAW);
++    t_part = pt_now();
++    /* RECOMP_GL_VBO_STREAM=1: the vertices go into one large buffer, each
++     * draw after the one before, and the buffer is given fresh storage when
++     * it is full, instead of a new store per draw (4-8% of the executor's
++     * time in the browser). OFF by default and NOT measured: the one browser
++     * run with it on (2026-10-11) was stopped with the browser's GPU process
++     * at 13 GB; whether this caused that is not known. */
++    {
++        static int per_draw = -1;
++        static int cap, at;                         /* vertices */
++        if (per_draw < 0)
++            per_draw = getenv("RECOMP_GL_VBO_STREAM") == NULL;
++        if (per_draw) {
++            glBufferData(GL_ARRAY_BUFFER, (ptrdiff_t)sizeof(Nv2aGlVertex) * n, s_q,
++                         GL_STREAM_DRAW);
++            vfirst = 0;
++        } else {
++            if (at + n > cap) {
++                if (!cap)
++                    cap = 3 * GLQ_MAX_TRIS;         /* the most one draw can hold */
++                glBufferData(GL_ARRAY_BUFFER, (ptrdiff_t)sizeof(Nv2aGlVertex) * cap,
++                             NULL, GL_STREAM_DRAW);
++                at = 0;
++            }
++            glBufferSubData(GL_ARRAY_BUFFER, (ptrdiff_t)sizeof(Nv2aGlVertex) * at,
++                            (ptrdiff_t)sizeof(Nv2aGlVertex) * n, s_q);
++            vfirst = at;
++            at += n;
++        }
++    }
 +    pt_add(PT_VBO, t_part);
-+    t_part = now_us();
++    t_part = pt_now();
 +    if (st->zpass_enable && zpass) {
 +        GLuint r = 0;
-+        double tq = now_us();
++        double tq = pt_now();
 +#if NV2A_GLES
 +        /* A WebGL query result is not available until a later task, and the
 +         * title wants the count now. Reported as "something passed" (16
 +         * samples a triangle): a flare or corona that should be hidden
 +         * behind geometry is drawn. NOT what the console does. */
-+        glDrawArrays(GL_TRIANGLES, 0, n);
++        glDrawArrays(GL_TRIANGLES, vfirst, n);
 +        r = (GLuint)(n / 3) * 16u;
 +#else
 +        glBeginQuery(GL_SAMPLES_PASSED, s_query);
-+        glDrawArrays(GL_TRIANGLES, 0, n);
++        glDrawArrays(GL_TRIANGLES, vfirst, n);
 +        glEndQuery(GL_SAMPLES_PASSED);
 +        glGetQueryObjectuiv(s_query, GL_QUERY_RESULT, &r);
 +#endif
 +        pt_add(PT_QUERY, tq);
 +        *zpass = r;
 +    } else {
-+        glDrawArrays(GL_TRIANGLES, 0, n);
++        glDrawArrays(GL_TRIANGLES, vfirst, n);
 +    }
 +    pt_add(PT_CALL, t_part);
 +    S->gpu_newer = 1;
@@ -6321,6 +6360,15 @@ index 0000000..401b750
 +    s_stat.tris += (uint64_t)n / 3;
 +    pt_add(PT_DRAW, t_draw);
 +    gl_check("draw");
++}
++
++void nv2a_gl_draw(const Nv2aGlState *st, uint32_t *zpass)
++{
++    s_pt_live = (s_draw_seq % PT_EVERY) == 0;
++    s_pt_scale = (double)PT_EVERY;
++    gl_draw_inner(st, zpass);
++    s_pt_live = 1;
++    s_pt_scale = 1.0;
 +}
 +
 +void nv2a_gl_clear_color(const Nv2aGlState *st, uint32_t x, uint32_t y,
@@ -6392,7 +6440,7 @@ index 0000000..401b750
 +    s_flip++;
 +    probe_frame();
 +    {
-+        double t0 = now_us();
++        double t0 = pt_now();
 +        glFlush();
 +        pt_add(PT_FLIP, t0);
 +    }
@@ -6758,7 +6806,7 @@ index 0000000..1c749f8
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..f8ae2ed 100644
+index c65632c..7b60bd9 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -37,6 +37,7 @@
@@ -7646,7 +7694,7 @@ index c65632c..f8ae2ed 100644
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
      s_gpu.zpass_count += cnt.zpass;
-@@ -2180,9 +2777,35 @@ static void raster_batch_program(void)
+@@ -2180,9 +2777,82 @@ static void raster_batch_program(void)
  {
      uint32_t i, n = s_gpu.idx_count;
  
@@ -7665,6 +7713,53 @@ index c65632c..f8ae2ed 100644
 +            memset(stamp, 0, sizeof stamp);
 +            gen = 1;
 +        }
++        if (reuse && nv2a_vsh_batch_ok()) {
++            /* The distinct vertices in blocks (nv2a_vsh_run_batch), then the
++             * copies. Only the attributes the batch has are fetched; the
++             * others hold fetch_attr's default for an absent one. */
++            static float vin[NV2A_VSH_BATCH][NV2A_VSH_INPUTS][4];
++            Nv2aVshOutput *outp[NV2A_VSH_BATCH];
++            uint8_t act[NV2A_VSH_INPUTS];
++            uint32_t nact = 0, nb = 0, a, b, copies = 0;
++
++            for (a = 0; a < NV2A_VSH_INPUTS; a++) {
++                const VertexAttr *at = &s_gpu.attr[a];
++                if (at->size && at->stride && (s_gpu.inline_active || at->offset)) {
++                    act[nact++] = (uint8_t)a;
++                } else {
++                    for (b = 0; b < NV2A_VSH_BATCH; b++) {
++                        vin[b][a][0] = vin[b][a][1] = vin[b][a][2] = 0.0f;
++                        vin[b][a][3] = 1.0f;
++                    }
++                }
++            }
++            for (i = 0; i < n; i++) {
++                uint32_t ix = s_gpu.idx[i];
++                if (ix < 65536u) {
++                    if (stamp[ix] == gen) {
++                        copies++;
++                        continue;
++                    }
++                    stamp[ix] = gen;
++                    first[ix] = (uint16_t)i;
++                }
++                for (a = 0; a < nact; a++)
++                    fetch_attr(&s_gpu.attr[act[a]], ix, vin[nb][act[a]]);
++                outp[nb++] = &s_xf[i];
++                if (nb == NV2A_VSH_BATCH || i + 1 == n) {
++                    if (!nv2a_vsh_run_batch((const float (*)[NV2A_VSH_INPUTS][4])vin, outp, nb))
++                        return;                        /* no program loaded */
++                    nb = 0;
++                }
++            }
++            if (nb && !nv2a_vsh_run_batch((const float (*)[NV2A_VSH_INPUTS][4])vin, outp, nb))
++                return;
++            for (i = 0; copies && i < n; i++) {
++                uint32_t ix = s_gpu.idx[i];
++                if (ix < 65536u && first[ix] != (uint16_t)i)
++                    s_xf[i] = s_xf[first[ix]];
++            }
++        } else
 +        for (i = 0; i < n; i++) {
 +            uint32_t ix = s_gpu.idx[i];
 +            if (ix >= 65536u) {                        /* beyond the table */
@@ -7685,7 +7780,7 @@ index c65632c..f8ae2ed 100644
      s_gpu.batches_program++;
      s_gpu.verts_program += n;
      if (s_gpu.blend_enable) {
-@@ -2250,8 +2873,11 @@ static void raster_batch_program(void)
+@@ -2250,8 +2920,11 @@ static void raster_batch_program(void)
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -7698,7 +7793,7 @@ index c65632c..f8ae2ed 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -2417,7 +3043,12 @@ static void draw_primitive(void)
+@@ -2417,7 +3090,12 @@ static void draw_primitive(void)
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
@@ -7712,7 +7807,23 @@ index c65632c..f8ae2ed 100644
          fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
      s_gpu.verts += s_gpu.idx_count;
  
-@@ -2840,6 +3471,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2489,9 +3167,12 @@ static void draw_primitive(void)
+         }
+     }
+ 
+-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+-        static int shown;
+-        if (shown++ < 6) {
++    {
++        static int shown = -1;                 /* -1: environment not read yet */
++        if (shown < 0)
++            shown = getenv("RECOMP_PB_EXEC_VERBOSE") ? 0 : 6;
++        if (shown < 6) {
++            shown++;
+             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
+                             " off 0x%08X type %u size %u stride %u\n",
+                     s_gpu.prim, s_gpu.idx_count, s_gpu.attr[0].offset,
+@@ -2840,6 +3521,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
      case NV097_SET_TEXTURE_CONTROL1:
          t->pitch = param >> 16;          /* linear formats only */
          break;
@@ -7722,7 +7833,7 @@ index c65632c..f8ae2ed 100644
      case NV097_SET_TEXTURE_IMAGE_RECT:
          t->width  = param >> 16;
          t->height = param & 0xFFFF;
-@@ -2851,12 +3485,360 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2851,12 +3535,360 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          break;
      }
      tex_update_valid(t);
@@ -8083,7 +8194,7 @@ index c65632c..f8ae2ed 100644
      static int inited;
      if (!inited) {
          inited = 1;
-@@ -3004,8 +3986,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3004,8 +4036,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -8100,7 +8211,7 @@ index c65632c..f8ae2ed 100644
          break;
  
      case NV097_SET_BEGIN_END:
-@@ -3052,19 +4040,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3052,19 +4090,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  
          if (!s_gpu.prim)
              break;
@@ -8157,7 +8268,7 @@ index c65632c..f8ae2ed 100644
      case NV097_SET_FLIP_READ:
          if (s_ftrace == 2)
              fprintf(stderr, "[FTRACE] P_READ %u%c", param, 10);
-@@ -3099,6 +4119,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3099,6 +4169,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
@@ -8165,7 +8276,7 @@ index c65632c..f8ae2ed 100644
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -3119,6 +4140,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3119,6 +4190,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -8189,7 +8300,7 @@ index c65632c..f8ae2ed 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-@@ -3146,6 +4184,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3146,6 +4234,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -8198,7 +8309,7 @@ index c65632c..f8ae2ed 100644
  
          if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
              static unsigned n;
-@@ -3181,8 +4221,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3181,8 +4271,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
      case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
      case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
@@ -8230,7 +8341,7 @@ index c65632c..f8ae2ed 100644
          if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
              s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
              break;
-@@ -3449,6 +4512,20 @@ void nv2a_pb_exec_report(void)
+@@ -3449,6 +4562,20 @@ void nv2a_pb_exec_report(void)
      /* Drawn and skipped separately: "nothing appeared" and "every batch needed
       * a vertex program we do not run" look identical on screen, and only one
       * of them means the rasteriser is broken. */
@@ -8251,7 +8362,7 @@ index c65632c..f8ae2ed 100644
      fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
      fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
                      " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
-@@ -3462,6 +4539,26 @@ void nv2a_pb_exec_report(void)
+@@ -3462,6 +4589,26 @@ void nv2a_pb_exec_report(void)
      fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                      " %u triangles dropped behind the eye\n",
              s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
@@ -8731,7 +8842,7 @@ index 0000000..59f8da2
 +
 +#endif /* NV2A_REG_TRAP_H */
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
-index 7fae74c..17f61f2 100644
+index 7fae74c..0149f19 100644
 --- a/src/kernel/nv2a_vsh_interp.c
 +++ b/src/kernel/nv2a_vsh_interp.c
 @@ -39,6 +39,9 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
@@ -8774,7 +8885,7 @@ index 7fae74c..17f61f2 100644
  }
  
  /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
-@@ -305,12 +316,305 @@ static vec4 run_ilu(uint32_t op, vec4 c)
+@@ -305,12 +316,488 @@ static vec4 run_ilu(uint32_t op, vec4 c)
      return r;
  }
  
@@ -8961,6 +9072,189 @@ index 7fae74c..17f61f2 100644
 +    }
 +    return 0;
 +}
++/* ---- the same loop again, a block of vertices per instruction -------------
++ *
++ * vsh_run_sse decodes its way through the program once per vertex: for every
++ * instruction three source selections, a switch on the operation and a chain
++ * of write tests, all data dependent. That dispatch was half the executor
++ * thread in the browser (profile of 2026-10-11). Here the instruction loop is
++ * outside and the vertices inside, so each of those decisions is taken once
++ * per NV2A_VSH_BATCH vertices. Every vertex still sees exactly vsh_run_sse's
++ * operations in vsh_run_sse's order, so the outputs are bit-identical
++ * (RECOMP_VSH_BATCHCHECK=1 compares them). A program that writes constants
++ * makes one vertex depend on the one before it and is not run this way. */
++static __forceinline __m128 vsh_swz(__m128 x, __m128i shuf, __m128 sign)
++{
++    return _mm_xor_ps(_mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(x), shuf)), sign);
++}
++
++static __forceinline void vsh_read_batch(const VshDec *d, const VshVec *v, int k,
++                                         const float (*in)[NV2A_VSH_INPUTS][4],
++                                         __m128 (*temp)[NV2A_VSH_BATCH],
++                                         const int *a0, uint32_t n, __m128 *dst)
++{
++    const VshSrc *sr = &d->src[k];
++    const __m128i shuf = v->shuf[k];
++    const __m128 sign = v->sign[k];
++    uint32_t j;
++
++    if (sr->mux == 1) {
++        const __m128 *t = temp[sr->reg];
++        for (j = 0; j < n; j++)
++            dst[j] = vsh_swz(t[j], shuf, sign);
++    } else if (sr->mux == 2) {
++        for (j = 0; j < n; j++)
++            dst[j] = vsh_swz(_mm_loadu_ps(in[j][d->in_idx]), shuf, sign);
++    } else if (!d->rel) {
++        int ci = (int)d->cidx;
++        __m128 x;
++        if (ci >= NV2A_VSH_CONSTANTS)
++            ci = 0;
++        x = vsh_swz(_mm_loadu_ps(s_const[ci]), shuf, sign);
++        for (j = 0; j < n; j++)
++            dst[j] = x;
++    } else {
++        for (j = 0; j < n; j++) {
++            int ci = (int)d->cidx + a0[j];
++            if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
++                ci = 0;
++            dst[j] = vsh_swz(_mm_loadu_ps(s_const[ci]), shuf, sign);
++        }
++    }
++}
++
++static int vsh_run_sse_batch(const float (*in)[NV2A_VSH_INPUTS][4],
++                             Nv2aVshOutput *const *out, uint32_t n)
++{
++    __m128 temp[13][NV2A_VSH_BATCH], outregs[13][NV2A_VSH_BATCH];
++    __m128 A[NV2A_VSH_BATCH], B[NV2A_VSH_BATCH], C[NV2A_VSH_BATCH];
++    __m128 M[NV2A_VSH_BATCH], I[NV2A_VSH_BATCH];
++    int a0[NV2A_VSH_BATCH];
++    const __m128 zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f);
++    const __m128 w1 = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
++    uint32_t s, i, j;
++
++    for (i = 0; i < 13; i++) {
++        const __m128 o = (i == 3 || i == 4 || i >= 9) ? w1 : zero;
++        for (j = 0; j < n; j++) {
++            temp[i][j] = zero;
++            outregs[i][j] = o;
++        }
++    }
++    for (j = 0; j < n; j++) {
++        a0[j] = 0;
++        A[j] = B[j] = C[j] = M[j] = I[j] = zero;
++    }
++
++    for (s = 0; s < s_dec_n; s++) {
++        const VshDec *d = &s_dec[s];
++        const VshVec *v = &s_vec[s];
++        const uint32_t mac = d->mac, ilu = d->ilu;
++        float f[4], g[4];
++
++        /* An operand the instruction does not read is zero in vsh_run_sse. */
++        if (d->need & 1) vsh_read_batch(d, v, 0, in, temp, a0, n, A);
++        else for (j = 0; j < n; j++) A[j] = zero;
++        if (d->need & 2) vsh_read_batch(d, v, 1, in, temp, a0, n, B);
++        else for (j = 0; j < n; j++) B[j] = zero;
++        if (d->need & 4) vsh_read_batch(d, v, 2, in, temp, a0, n, C);
++        else for (j = 0; j < n; j++) C[j] = zero;
++
++        switch (mac) {
++        case 0: for (j = 0; j < n; j++) M[j] = zero; break;
++        case 2: for (j = 0; j < n; j++) M[j] = _mm_mul_ps(A[j], B[j]); break;
++        case 3: for (j = 0; j < n; j++) M[j] = _mm_add_ps(A[j], C[j]); break;
++        case 4: for (j = 0; j < n; j++)
++                    M[j] = _mm_add_ps(_mm_mul_ps(A[j], B[j]), C[j]);
++                break;
++        case 5: for (j = 0; j < n; j++) {
++                    _mm_storeu_ps(f, _mm_mul_ps(A[j], B[j]));
++                    M[j] = _mm_set1_ps(f[0] + f[1] + f[2]);
++                }
++                break;
++        case 6: for (j = 0; j < n; j++) {
++                    _mm_storeu_ps(f, _mm_mul_ps(A[j], B[j])); _mm_storeu_ps(g, B[j]);
++                    M[j] = _mm_set1_ps(f[0] + f[1] + f[2] + g[3]);
++                }
++                break;
++        case 7: for (j = 0; j < n; j++) {
++                    _mm_storeu_ps(f, _mm_mul_ps(A[j], B[j]));
++                    M[j] = _mm_set1_ps(f[0] + f[1] + f[2] + f[3]);
++                }
++                break;
++        case 8: for (j = 0; j < n; j++) {
++                    _mm_storeu_ps(f, A[j]); _mm_storeu_ps(g, B[j]);
++                    M[j] = _mm_set_ps(g[3], f[2], f[1] * g[1], 1.0f);
++                }
++                break;
++        case 9:  for (j = 0; j < n; j++)
++                     M[j] = vsh_blend(B[j], A[j], _mm_cmplt_ps(A[j], B[j]));
++                 break;
++        case 10: for (j = 0; j < n; j++)
++                     M[j] = vsh_blend(B[j], A[j], _mm_cmpge_ps(A[j], B[j]));
++                 break;
++        case 11: for (j = 0; j < n; j++)
++                     M[j] = _mm_and_ps(_mm_cmplt_ps(A[j], B[j]), one);
++                 break;
++        case 12: for (j = 0; j < n; j++)
++                     M[j] = _mm_and_ps(_mm_cmpge_ps(A[j], B[j]), one);
++                 break;
++        case 13: for (j = 0; j < n; j++) {
++                     _mm_storeu_ps(f, A[j]);
++                     a0[j] = (int)floorf(f[0] + 0.001f);
++                 }
++                 /* fall through: the result is A, as for mov */
++        default: for (j = 0; j < n; j++) M[j] = A[j]; break;
++        }
++        if (ilu) {
++            for (j = 0; j < n; j++) {
++                vec4 cv, rv;
++                _mm_storeu_ps(cv.v, C[j]);
++                rv = run_ilu(ilu, cv);
++                I[j] = _mm_loadu_ps(rv.v);
++            }
++        } else {
++            for (j = 0; j < n; j++) I[j] = zero;
++        }
++
++        if (mac && mac != 13 && d->mac_mask && d->tdst <= 12) {
++            __m128 *t = temp[d->tdst];
++            for (j = 0; j < n; j++)
++                t[j] = vsh_blend(t[j], M[j], v->mac_wr);
++        }
++        if (ilu && d->ilu_mask) {
++            uint32_t it = mac ? 1u : d->tdst;     /* see the scalar loop */
++            if (it <= 12) {
++                __m128 *t = temp[it];
++                for (j = 0; j < n; j++)
++                    t[j] = vsh_blend(t[j], I[j], v->ilu_wr);
++            }
++        }
++        if (d->omask && d->out_o) {               /* c[] writes: not in this path */
++            const __m128 *src = d->out_ilu ? I : M;
++            __m128 *t = d->oaddr == 0 ? temp[12]
++                      : d->oaddr < 13 ? outregs[d->oaddr] : NULL;
++            if (t)
++                for (j = 0; j < n; j++)
++                    t[j] = vsh_blend(t[j], src[j], v->out_wr);
++        }
++        if (d->final) {
++            for (j = 0; j < n; j++) {
++                Nv2aVshOutput *o = out[j];
++                _mm_storeu_ps(o->pos, temp[12][j]);
++                _mm_storeu_ps(o->d0, outregs[3][j]);
++                _mm_storeu_ps(o->d1, outregs[4][j]);
++                _mm_storeu_ps(o->fog, outregs[5][j]);
++                _mm_storeu_ps(o->tex[0], outregs[9][j]);
++                _mm_storeu_ps(o->tex[1], outregs[10][j]);
++                _mm_storeu_ps(o->tex[2], outregs[11][j]);
++                _mm_storeu_ps(o->tex[3], outregs[12][j]);
++            }
++            return 1;
++        }
++    }
++    return 0;
++}
 +static int s_vsh_mode = -1, s_vsh_chk_ok;
 +static Nv2aVshOutput s_vsh_chk;
 +#else
@@ -9081,7 +9375,7 @@ index 7fae74c..17f61f2 100644
      float outregs[13][4];
      int a0 = 0;
      uint32_t s;
-@@ -335,8 +639,23 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -335,8 +822,23 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
          }
      }
  
@@ -9106,7 +9400,7 @@ index 7fae74c..17f61f2 100644
      memset(outregs, 0, sizeof outregs);
      outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
      /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
-@@ -344,49 +663,72 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -344,49 +846,72 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
       * unwritten stage at infinity. */
      outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
  
@@ -9162,14 +9456,14 @@ index 7fae74c..17f61f2 100644
 +                 /* fall through: the result is A, as for mov */
 +        default: mres[0] = a[0]; mres[1] = a[1]; mres[2] = a[2]; mres[3] = a[3];
 +                 break;
-+        }
+         }
+-        if (ilu && ilu_mask) {
 +        if (ilu) {
 +            vec4 cv, rv;
 +            memcpy(cv.v, c, sizeof cv.v);
 +            rv = run_ilu(ilu, cv);
 +            memcpy(ires, rv.v, sizeof ires);
-         }
--        if (ilu && ilu_mask) {
++        }
 +
 +        if (mac && mac != 13 && d->mac_mask && d->tdst <= 12)
 +            write_mask4(temp[d->tdst], mres, d->mac_mask);
@@ -9213,7 +9507,7 @@ index 7fae74c..17f61f2 100644
              memcpy(out->d0, outregs[3], sizeof out->d0);
              memcpy(out->d1, outregs[4], sizeof out->d1);
              memcpy(out->fog, outregs[5], sizeof out->fog);
-@@ -394,6 +736,20 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -394,8 +919,73 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
              memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
              memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
              memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
@@ -9234,8 +9528,61 @@ index 7fae74c..17f61f2 100644
              return 1;
          }
      }
+     return 0;
+ }
++
++/* Whether nv2a_vsh_run_batch may be used for the batch about to be drawn. */
++int nv2a_vsh_batch_ok(void)
++{
++#if VSH_SSE
++    static int env = -1;
++    if (env < 0)
++        env = !getenv("RECOMP_VSH_DUMP") && !getenv("RECOMP_VSH_CHECK")
++              && !getenv("RECOMP_VSH_SCALAR") && !getenv("RECOMP_VSH_NOBATCH");
++    return env && !s_cxt_write;
++#else
++    return 0;
++#endif
++}
++
++/* The program on n (at most NV2A_VSH_BATCH) vertices at once. Returns what
++ * nv2a_vsh_run does: 1, or 0 when no program is loaded. */
++int nv2a_vsh_run_batch(const float (*in)[NV2A_VSH_INPUTS][4],
++                       Nv2aVshOutput *const *out, uint32_t n)
++{
++#if VSH_SSE
++    static int check = -1;
++    int r;
++
++    if (!s_dec_valid)
++        decode_program();
++    r = vsh_run_sse_batch(in, out, n);
++    if (check < 0)
++        check = getenv("RECOMP_VSH_BATCHCHECK") != NULL;
++    if (check && r) {
++        static unsigned long long seen, bad;
++        uint32_t j;
++        for (j = 0; j < n; j++) {
++            Nv2aVshOutput one;
++            seen++;
++            if (!vsh_run_sse(in[j], &one) || memcmp(&one, out[j], sizeof one)) {
++                if (bad++ < 10)
++                    fprintf(stderr, "  [VSH] BATCHCHECK: block and single outputs"
++                                    " differ (vertex %llu)%c", seen, 10);
++            }
++            if ((seen & (seen - 1)) == 0 && seen >= 4096)
++                fprintf(stderr, "  [VSH] BATCHCHECK: %llu vertices, %llu"
++                                " mismatches%c", seen, bad, 10);
++        }
++    }
++    return r;
++#else
++    (void)in; (void)out; (void)n;
++    return 0;
++#endif
++}
 diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
-index 8acb0af..5b533f5 100644
+index 8acb0af..8570caa 100644
 --- a/src/kernel/nv2a_vsh_interp.h
 +++ b/src/kernel/nv2a_vsh_interp.h
 @@ -43,6 +43,9 @@ void nv2a_vsh_set_start_slot(uint32_t slot);          /* _PROGRAM_START     */
@@ -9248,6 +9595,21 @@ index 8acb0af..5b533f5 100644
  
  /* Run the program from the start slot on one vertex. Inputs are the ten
   * attribute values as floats. Returns 0 if there is no program to run (no
+@@ -50,6 +53,14 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
+  * transform this batch" rather than drawing garbage. */
+ int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+ 
++/* The same program on a block of up to NV2A_VSH_BATCH vertices, with the same
++ * results (see nv2a_vsh_interp.c). nv2a_vsh_batch_ok says whether the batch
++ * about to be drawn may use it. */
++#define NV2A_VSH_BATCH      16
++int  nv2a_vsh_batch_ok(void);
++int  nv2a_vsh_run_batch(const float (*in)[NV2A_VSH_INPUTS][4],
++                        Nv2aVshOutput *const *out, uint32_t n);
++
+ /* Direct access, for the self-test. */
+ void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
+ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
 index 72d5131..15554ef 100644
 --- a/src/kernel/xbox_memory_layout.c

@@ -14,16 +14,21 @@ COMPACT=${COMPACT:-1}
 # compiler folds "base + 0xFD000000" into an access offset, which wasm adds without
 # wrap and traps on (the runtime has dozens of such expressions for the apertures).
 if [ "$COMPACT" = 1 ]; then CDEF="-DXBOX_WEB_COMPACT=1 -fwrapv-pointer"; MEM=2281701376; else CDEF=; MEM=4294901760; fi
-CF="$CDEF -O1 -pthread -msse2 -mssse3 -msimd128 -fdeclspec -sUSE_SDL=2 -I$G -I$G/recomp -I$G/recomp/gen -I$X/include -I$X/src -I$X/src/kernel -I$X/src/platform -Wno-everything -ferror-limit=5"
+# LOPT: optimisation of the lifted code (objects kept per level: lift = -O1, lift_O2 = -O2).
+# DEV=1: the debugging link (-O1 -g, assertions on, line numbers for tools/websym.sh);
+# default: the fast link (-O2, no assertions, function names kept for profiles).
+LOPT=${LOPT:--O2}; if [ "$LOPT" = "-O1" ]; then LD=lift; else LD=lift_${LOPT#-}; fi; mkdir -p $OUT/$LD
+if [ "$DEV" = 1 ]; then LINK="-O1 -g -sASSERTIONS=1"; else LINK="${LINKOPT:--O2} --profiling-funcs -sASSERTIONS=0 -sGL_ASSERTIONS=0"; fi
+CF="$CDEF -pthread -msse2 -mssse3 -msimd128 -fdeclspec -sUSE_SDL=2 -I$G -I$G/recomp -I$G/recomp/gen -I$X/include -I$X/src -I$X/src/kernel -I$X/src/platform -Wno-everything -ferror-limit=5"
 cc() { src=$1; obj=$2
   [ -e "$obj" ] && [ "$obj" -nt "$src" ] && return 0
   # the runtime: line numbers (tools/websym.sh) and full optimisation (the pixel
   # executor and the vertex program interpreter are the frame's cost); RTOPT=-O1 for a quick build
-  case "$obj" in */rt/*) dbg="-g ${RTOPT:--O3}";; *) dbg=;; esac
+  case "$obj" in */rt/*) dbg="-g ${RTOPT:--O3}";; *) dbg=$LOPT;; esac
   emcc -c $CF $dbg "$src" -o "$obj" > "${obj%.o}.log" 2>&1 && rm -f "${obj%.o}.log" || echo "FAIL $src"; }
-export -f cc; export CF
+export -f cc; export CF LOPT
 if [ "$1" != "link-only" ]; then
-  { for f in $G/recomp/gen/*.c $G/recomp_manual.c $G/mmio_direct.c $G/nvnet.c; do echo "$f $OUT/lift/$(basename ${f%.c}).o"; done
+  { for f in $G/recomp/gen/*.c $G/recomp_manual.c $G/mmio_direct.c $G/nvnet.c; do echo "$f $OUT/$LD/$(basename ${f%.c}).o"; done
     for f in $(find $X/src -name '*.c' -not -path '*/d3d/*' -not -path '*smoke*' -not -name 'nv2a_pb_test.c'); do
       b=$(echo ${f#$X/src/} | tr '/' '_'); echo "$f $OUT/rt/${b%.c}.o"; done
     echo "$W/main_web.c $OUT/rt/main_web.o"; echo "$W/compat_web.c $OUT/rt/compat_web.o"; echo "$W/present_web.c $OUT/rt/present_web.o"
@@ -33,11 +38,11 @@ fi
 # RAM (64 MB) lies under GLOBAL_BASE; program data, stacks and heap sit above it
 # and must stay under 2 GB, where the contiguous window and the device
 # apertures begin. See win32_compat.c and xbox_memory_layout.c (__EMSCRIPTEN__).
-emcc -O1 -pthread -sUSE_SDL=2 -sPROXY_TO_PTHREAD -sALLOW_MEMORY_GROWTH=0 \
+emcc $LINK -pthread -sUSE_SDL=2 -sPROXY_TO_PTHREAD -sALLOW_MEMORY_GROWTH=0 \
      -sGLOBAL_BASE=134217728 -sINITIAL_MEMORY=$MEM -sMAXIMUM_MEMORY=$MEM -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=4194304 \
      -sPTHREAD_POOL_SIZE=24 -sERROR_ON_UNDEFINED_SYMBOLS=1 -sEXIT_RUNTIME=0 -sWASMFS -sFORCE_FILESYSTEM=1 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
-     -sEXPORTED_RUNTIME_METHODS=ENV -sASSERTIONS=1 -g \
-     lift/*.o rt/*.o -o site/halo2.js > link.log 2>&1
+     -sEXPORTED_RUNTIME_METHODS=ENV \
+     $LD/*.o rt/*.o -o site/halo2.js > link.log 2>&1
 echo "LINK_EXIT=$? undefined=$(grep -c 'undefined symbol' link.log) duplicate=$(grep -c 'duplicate symbol' link.log)"
 grep -o 'undefined symbol: [A-Za-z0-9_@]*' link.log | sort | uniq -c | sort -rn | head -60
 grep 'duplicate symbol' link.log | head -10
