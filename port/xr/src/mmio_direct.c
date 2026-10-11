@@ -67,6 +67,23 @@ static void tick(void)
     }
 }
 
+/* The network controller (nForce, registers at 0xFEF00000) has no model yet:
+ * its registers are plain zeroed memory. RECOMP_NIC_TRACE=1 lists the first
+ * accesses the title's XNet driver makes, which is the specification for one. */
+static void nic_trace(uint32_t va, uint32_t val, int size, int write)
+{
+    static int on = -1;
+    static unsigned n;
+
+    if (on < 0)
+        on = getenv("RECOMP_NIC_TRACE") != NULL;
+    if (!on || va < 0xFEF00000u || va >= 0xFEF00400u || n >= 400)
+        return;
+    n++;
+    fprintf(stderr, "  [NIC] %s +0x%03X = 0x%0*X (%d)\n",
+            write ? "write" : "read ", va - 0xFEF00000u, size * 2, val, size);
+}
+
 uint32_t recomp_mmio_read(uint32_t va, int size)
 {
     tick();
@@ -85,9 +102,10 @@ uint32_t recomp_mmio_read(uint32_t va, int size)
     s_direct[3]++;
     {
         const volatile uint8_t *p = (const volatile uint8_t *)((uintptr_t)va + g_xbox_mem_offset);
-        if (size == 1) return *p;
-        if (size == 2) return *(const volatile uint16_t *)p;
-        return *(const volatile uint32_t *)p;
+        uint32_t v = size == 1 ? *p : size == 2 ? *(const volatile uint16_t *)p
+                                               : *(const volatile uint32_t *)p;
+        nic_trace(va, v, size, 0);
+        return v;
     }
 }
 
@@ -109,6 +127,7 @@ void recomp_mmio_write(uint32_t va, uint32_t val, int size)
         return;
     }
     s_direct[3]++;
+    nic_trace(va, val, size, 1);
     {
         volatile uint8_t *p = (volatile uint8_t *)((uintptr_t)va + g_xbox_mem_offset);
         if (size == 1) *p = (uint8_t)val;
