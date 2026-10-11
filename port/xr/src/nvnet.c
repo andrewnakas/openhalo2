@@ -114,11 +114,13 @@ static void nic_lock(void)   { while (InterlockedExchange(&s_lock, 1)) YieldProc
 static void nic_unlock(void) { InterlockedExchange(&s_lock, 0); }
 static double now_ms(void)
 {
-    static LARGE_INTEGER f, t0;
+    /* The performance counter is one clock for the whole machine, so two
+     * copies' frame logs line up; shown modulo 10000 s to stay readable. */
+    static LARGE_INTEGER f;
     LARGE_INTEGER t;
-    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t);
-    return (double)(t.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+    return (double)(t.QuadPart % (f.QuadPart * 10000)) * 1000.0 / (double)f.QuadPart;
 }
 #else
 static volatile int s_lock;
@@ -292,6 +294,25 @@ static void nic_tick(void)
 
     uint32_t pending;
 
+    /* How often this really runs (the thread sleeps 4 ms, then does the USB
+     * model's work): every frame received waits for the next turn. */
+    {
+        static double last, sum, worst;
+        static unsigned long n;
+        double t = now_ms();
+        if (last > 0.0) {
+            double d = t - last;
+            sum += d;
+            if (d > worst) worst = d;
+            if (++n % 2500 == 0) {
+                if (s_frames)
+                    fprintf(stderr, "  [NIC] device turn every %.1f ms on average, "
+                                    "longest %.1f ms (last 2500)\n", sum / 2500.0, worst);
+                sum = worst = 0.0;
+            }
+        }
+        last = t;
+    }
     nic_lock();
     if (s_kick) {
         s_kick = 0;
