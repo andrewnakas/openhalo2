@@ -1840,7 +1840,7 @@ index b9a02bc..69e4715 100644
  /* Total crossings of the DISPATCH boundary, and who is holding it up.
   * A depth that is non-zero while this stops moving is stuck, not busy. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..4acb4a9 100644
+index c65ba43..17aa881 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
@@ -1890,7 +1890,21 @@ index c65ba43..4acb4a9 100644
  }
  
  /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
-@@ -2251,6 +2265,8 @@ static int kernel_raise_interrupt(uint32_t vector)
+@@ -2166,6 +2180,13 @@ static void bridge_KeInsertQueueDpc(void)
+     BRIDGE_MEM8(dpc + 2) = 1;
+     g_dpc_tail = next;
+     LeaveCriticalSection(&g_dpc_lock);
++    /* A queued DPC runs as soon as the interrupt returns on the console.
++     * Here it runs on the timer thread: wake it now rather than at its next
++     * tick (up to 4 ms later, which a network round trip pays four times). */
++    {
++        void xbox_TimerThreadWake(void);
++        xbox_TimerThreadWake();
++    }
+     g_eax = 1;
+ }
+ 
+@@ -2251,6 +2272,8 @@ static int kernel_raise_interrupt(uint32_t vector)
  #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
  #define NV2A_VECTOR            3u
  
@@ -1899,7 +1913,7 @@ index c65ba43..4acb4a9 100644
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
-@@ -2262,16 +2278,34 @@ static void kernel_vblank_tick(void)
+@@ -2262,16 +2285,34 @@ static void kernel_vblank_tick(void)
      if (!enabled)
          return;
  
@@ -1940,7 +1954,7 @@ index c65ba43..4acb4a9 100644
  
      {
          static unsigned n;
-@@ -2284,6 +2318,68 @@ static void kernel_vblank_tick(void)
+@@ -2284,6 +2325,68 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -2009,7 +2023,7 @@ index c65ba43..4acb4a9 100644
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2566,12 +2662,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2566,12 +2669,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          g_fs_base = tib;
      }
  
@@ -2042,7 +2056,7 @@ index c65ba43..4acb4a9 100644
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -2619,6 +2734,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -2619,6 +2741,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      if (!g_timer_started) {
          InitializeCriticalSection(&g_timer_lock);
          g_timer_started = 1;
@@ -2050,7 +2064,7 @@ index c65ba43..4acb4a9 100644
          CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
      }
  
-@@ -3880,6 +3996,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3880,6 +4003,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
@@ -2067,7 +2081,7 @@ index c65ba43..4acb4a9 100644
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
-@@ -9391,24 +9517,45 @@ void guest_cpu_part(void)
+@@ -9391,24 +9524,45 @@ void guest_cpu_part(void)
      t_guest_thread = 0;
  }
  
@@ -2113,7 +2127,7 @@ index c65ba43..4acb4a9 100644
      }
      (void)held;
  }
-@@ -9473,6 +9620,28 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9473,6 +9627,28 @@ static void kernel_thunk_dispatch_body(void)
                      fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
                              (unsigned long long)g_ordinal_calls[best]);
                  }
@@ -10058,6 +10072,84 @@ index db71403..75ee96c 100644
              resynced += 1
  
          return resynced
+diff --git a/tools/disasm/functions.py b/tools/disasm/functions.py
+index 37542d8..16fcc4d 100644
+--- a/tools/disasm/functions.py
++++ b/tools/disasm/functions.py
+@@ -401,7 +401,7 @@ class FunctionDetector:
+                 code_ranges.add(addr)
+ 
+         call_targets = self.engine.get_call_targets()
+-        realigned = unaligned = 0
++        realigned = unaligned = mid_flow = 0
+         for target in call_targets:
+             section = self.image.get_section_at_va(target)
+             if not (section and section.executable):
+@@ -429,6 +429,17 @@ class FunctionDetector:
+                 # recursed into _mtinitlocknum until the stack overflowed.
+                 # Targets that already decoded are untouched -- pre-existing
+                 # behaviour.
++                # And one more: a target in the middle of an instruction that
++                # a stronger function start flows straight into is not a
++                # function, whatever its bytes probe as. Halo 2's XNET has a
++                # "call" in data that points 2 bytes into a `mov dword [ecx],
++                # imm32` of the routine that creates a security association;
++                # accepted, it cut that routine short, so the lifted C fell
++                # off its end without restoring esi/edi or popping its
++                # arguments, and every system-link join failed.
++                if self._mid_instruction_of_stronger_flow(target):
++                    mid_flow += 1
++                    continue
+                 if not self.engine.probes_as_function_body(target):
+                     unaligned += 1
+                     continue
+@@ -441,9 +452,44 @@ class FunctionDetector:
+                 config.CONFIDENCE_CALL_TARGET,
+                 "call_target"
+             )
+-        if realigned or unaligned:
++        if realigned or unaligned or mid_flow:
+             print(f"  Realigned {realigned} call targets the sweep stepped over"
+-                  f" ({unaligned} rejected: bytes do not decode as a function)")
++                  f" ({unaligned} rejected: bytes do not decode as a function;"
++                  f" {mid_flow} rejected: inside an instruction of a stronger"
++                  f" function's straight-line code)")
++
++    def _mid_instruction_of_stronger_flow(self, target: int) -> bool:
++        """True when `target` is strictly inside a decoded instruction and
++        that instruction is reached, with no unconditional transfer on the
++        way, from a function start at least as well founded as a prologue
++        (a seed, a known address, a prologue match)."""
++        insns = self.engine.instructions
++
++        def previous(addr: int):
++            """The decoded instruction that ends exactly at `addr`."""
++            for back in range(1, 16):
++                p = insns.get(addr - back)
++                if p is not None and p.address + p.size == addr:
++                    return p
++            return None
++
++        straddler = None
++        for back in range(1, 15):
++            p = insns.get(target - back)
++            if p is not None and p.address + p.size > target:
++                straddler = p
++                break
++        if straddler is None:
++            return False
++        cur = straddler
++        for _ in range(4096):
++            cand = self._candidates.get(cur.address)
++            if cand is not None and cand[0] >= config.CONFIDENCE_PROLOGUE:
++                return True
++            cur = previous(cur.address)
++            if cur is None or cur.is_terminator:
++                return False
++        return False
+ 
+     def _pass_indirect_call_slots(self) -> None:
+         """
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
 index e7ab880..cb5c5c8 100644
 --- a/tools/recomp/lifter.py

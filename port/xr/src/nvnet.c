@@ -103,6 +103,29 @@ static unsigned long s_irqs, s_irq_declined, s_unknown_kind;
 
 static void nic_tick(void);
 static void hub_open(void);
+
+/* The registers and rings are touched by the title's threads (register
+ * accesses, and a transmit at the kick) and by the device thread (receive,
+ * interrupts). One short lock covers them; it is never held across a call
+ * into the title. */
+#if defined(_WIN32)
+static volatile LONG s_lock;
+static void nic_lock(void)   { while (InterlockedExchange(&s_lock, 1)) YieldProcessor(); }
+static void nic_unlock(void) { InterlockedExchange(&s_lock, 0); }
+static double now_ms(void)
+{
+    static LARGE_INTEGER f, t0;
+    LARGE_INTEGER t;
+    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
+    QueryPerformanceCounter(&t);
+    return (double)(t.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+}
+#else
+static volatile int s_lock;
+static void nic_lock(void)   { while (__sync_lock_test_and_set(&s_lock, 1)) { } }
+static void nic_unlock(void) { __sync_lock_release(&s_lock); }
+static double now_ms(void) { return 0.0; }
+#endif
 static void hub_send(const uint8_t *f, uint32_t len);
 static int  hub_recv(uint8_t *f, uint32_t max);
 
@@ -171,9 +194,9 @@ static void describe(const char *dir, const uint8_t *f, uint32_t len)
     if (bcast ? said_bcast++ >= 300 : said_unicast++ >= 400)
         return;
     type = (unsigned)f[12] << 8 | f[13];
-    n = snprintf(line, sizeof line, "  [NIC] %s %4u B  %02X:%02X:%02X:%02X:%02X:%02X -> "
+    n = snprintf(line, sizeof line, "  [NIC] %s %4u B  t=%.1f  %02X:%02X:%02X:%02X:%02X:%02X -> "
                  "%02X:%02X:%02X:%02X:%02X:%02X  type %04X",
-                 dir, len, f[6], f[7], f[8], f[9], f[10], f[11],
+                 dir, len, now_ms(), f[6], f[7], f[8], f[9], f[10], f[11],
                  f[0], f[1], f[2], f[3], f[4], f[5], type);
     if (type == 0x0800 && len >= 42 && f[23] == 17) {
         n += snprintf(line + n, sizeof line - (size_t)n, "  UDP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
@@ -267,6 +290,9 @@ static void nic_tick(void)
     static uint8_t in[2048];
     int len, budget = 16;
 
+    uint32_t pending;
+
+    nic_lock();
     if (s_kick) {
         s_kick = 0;
         tx_run();
@@ -275,8 +301,9 @@ static void nic_tick(void)
         if (len < 14 || (uint32_t)len > FRAME_MAX || !rx_deliver(in, (uint32_t)len))
             s_rx_dropped++;
     }
-    if ((s_reg[REG_IRQ_STATUS / 4] & s_reg[REG_IRQ_MASK / 4])
-            && xbox_GetConnectedInterrupt(NIC_VECTOR)) {
+    pending = s_reg[REG_IRQ_STATUS / 4] & s_reg[REG_IRQ_MASK / 4];
+    nic_unlock();
+    if (pending && xbox_GetConnectedInterrupt(NIC_VECTOR)) {
         int claimed = xbox_DeviceRaiseInterrupt(NIC_VECTOR);
         s_irqs++;
         if (claimed <= 0)
@@ -339,7 +366,7 @@ static void reg_write(uint32_t off, uint32_t v)
             s_tx_have = 0;
             s_kick = 0;
         } else if (v & TXRX_KICK) {
-            s_kick = 1;
+            tx_run();
         }
         return;
     case REG_MII_CONTROL: {
@@ -372,7 +399,11 @@ static void trace(const char *what, uint32_t off, uint32_t val, int size)
 uint32_t recomp_nic_read(uint32_t va, int size)
 {
     uint32_t off = va - NIC_BASE, shift = (off & 3u) * 8;
-    uint32_t v = reg_read(off & ~3u) >> shift;
+    uint32_t v;
+
+    nic_lock();
+    v = reg_read(off & ~3u) >> shift;
+    nic_unlock();
 
     if (size == 1) v &= 0xFFu;
     else if (size == 2) v &= 0xFFFFu;
@@ -385,6 +416,7 @@ void recomp_nic_write(uint32_t va, uint32_t val, int size)
     uint32_t off = va - NIC_BASE, shift = (off & 3u) * 8;
 
     trace("write", off, val, size);
+    nic_lock();
     if (size >= 4) {
         reg_write(off & ~3u, val);
     } else {
@@ -395,6 +427,7 @@ void recomp_nic_write(uint32_t va, uint32_t val, int size)
         else
             reg_write(off & ~3u, (old & ~mask) | ((val << shift) & mask));
     }
+    nic_unlock();
 }
 
 /* ---- Transport: a hub on the local machine --------------------------------- */
