@@ -6,7 +6,15 @@
 OUT=/d/n64work/halo2/build/web; mkdir -p $OUT/lift $OUT/rt $OUT/site; cd $OUT
 source /d/n64work/emsdk/emsdk_env.sh >/dev/null 2>&1
 G=/d/n64work/openhalo2/port/xr/src; X=/d/n64work/halo2/third_party/xboxrecomp; W=/d/n64work/openhalo2/port/web
-CF="-O1 -pthread -msse2 -mssse3 -msimd128 -fdeclspec -sUSE_SDL=2 -I$G -I$G/recomp -I$G/recomp/gen -I$X/include -I$X/src -I$X/src/kernel -I$X/src/platform -Wno-everything -ferror-limit=5"
+# COMPACT=1 (default): the 2.28 GB memory layout (-DXBOX_WEB_COMPACT). COMPACT=0: the
+# 4 GB no-wrap layout. Changing it needs rt/*.o rebuilt (the script does that).
+COMPACT=${COMPACT:-1}
+[ "$(cat $OUT/.compact 2>/dev/null)" != "$COMPACT" ] && { rm -f $OUT/rt/*.o; echo $COMPACT > $OUT/.compact; }
+# -fwrapv-pointer: pointer + constant must wrap like the integers do. Without it the
+# compiler folds "base + 0xFD000000" into an access offset, which wasm adds without
+# wrap and traps on (the runtime has dozens of such expressions for the apertures).
+if [ "$COMPACT" = 1 ]; then CDEF="-DXBOX_WEB_COMPACT=1 -fwrapv-pointer"; MEM=2281701376; else CDEF=; MEM=4294901760; fi
+CF="$CDEF -O1 -pthread -msse2 -mssse3 -msimd128 -fdeclspec -sUSE_SDL=2 -I$G -I$G/recomp -I$G/recomp/gen -I$X/include -I$X/src -I$X/src/kernel -I$X/src/platform -Wno-everything -ferror-limit=5"
 cc() { src=$1; obj=$2
   [ -e "$obj" ] && [ "$obj" -nt "$src" ] && return 0
   case "$obj" in */rt/*) dbg=-g;; *) dbg=;; esac     # line numbers for the runtime (tools/websym.sh)
@@ -24,7 +32,7 @@ fi
 # and must stay under 2 GB, where the contiguous window and the device
 # apertures begin. See win32_compat.c and xbox_memory_layout.c (__EMSCRIPTEN__).
 emcc -O1 -pthread -sUSE_SDL=2 -sPROXY_TO_PTHREAD -sALLOW_MEMORY_GROWTH=0 \
-     -sGLOBAL_BASE=134217728 -sINITIAL_MEMORY=4294901760 -sMAXIMUM_MEMORY=4294901760 -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=4194304 \
+     -sGLOBAL_BASE=134217728 -sINITIAL_MEMORY=$MEM -sMAXIMUM_MEMORY=$MEM -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=4194304 \
      -sPTHREAD_POOL_SIZE=24 -sERROR_ON_UNDEFINED_SYMBOLS=1 -sEXIT_RUNTIME=0 -sWASMFS -sFORCE_FILESYSTEM=1 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
      -sEXPORTED_RUNTIME_METHODS=ENV -sASSERTIONS=1 -g \
      lift/*.o rt/*.o -o site/halo2.js > link.log 2>&1

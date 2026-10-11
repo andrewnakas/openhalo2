@@ -5824,7 +5824,7 @@ index 0000000..1c749f8
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..c6a35d7 100644
+index c65632c..7f09a6f 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -37,6 +37,7 @@
@@ -6777,7 +6777,7 @@ index c65632c..c6a35d7 100644
      case NV097_SET_TEXTURE_IMAGE_RECT:
          t->width  = param >> 16;
          t->height = param & 0xFFFF;
-@@ -2851,12 +3485,359 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2851,12 +3485,360 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          break;
      }
      tex_update_valid(t);
@@ -6814,7 +6814,8 @@ index c65632c..c6a35d7 100644
 +
 +static void nv2a_latch_write(uint32_t zclear, uint32_t cclear)
 +{
-+    uint8_t *m = (uint8_t *)(uintptr_t)xbox_GetMemoryOffset();
++    /* Integer arithmetic: the sum may wrap (see XBOX_WEB_COMPACT). */
++    uintptr_t m = (uintptr_t)xbox_GetMemoryOffset();
 +    *(volatile uint32_t *)(m + 0xFD401A88u) = zclear;
 +    *(volatile uint32_t *)(m + 0xFD40186Cu) = cclear;
 +}
@@ -7137,7 +7138,7 @@ index c65632c..c6a35d7 100644
      static int inited;
      if (!inited) {
          inited = 1;
-@@ -3004,8 +3985,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3004,8 +3986,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -7154,7 +7155,7 @@ index c65632c..c6a35d7 100644
          break;
  
      case NV097_SET_BEGIN_END:
-@@ -3052,19 +4039,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3052,19 +4040,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  
          if (!s_gpu.prim)
              break;
@@ -7211,7 +7212,7 @@ index c65632c..c6a35d7 100644
      case NV097_SET_FLIP_READ:
          if (s_ftrace == 2)
              fprintf(stderr, "[FTRACE] P_READ %u%c", param, 10);
-@@ -3099,6 +4118,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3099,6 +4119,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
@@ -7219,7 +7220,7 @@ index c65632c..c6a35d7 100644
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -3119,6 +4139,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3119,6 +4140,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -7243,7 +7244,7 @@ index c65632c..c6a35d7 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-@@ -3146,6 +4183,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3146,6 +4184,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -7252,7 +7253,7 @@ index c65632c..c6a35d7 100644
  
          if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
              static unsigned n;
-@@ -3181,8 +4220,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3181,8 +4221,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
      case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
      case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
@@ -7284,7 +7285,7 @@ index c65632c..c6a35d7 100644
          if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
              s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
              break;
-@@ -3449,6 +4511,20 @@ void nv2a_pb_exec_report(void)
+@@ -3449,6 +4512,20 @@ void nv2a_pb_exec_report(void)
      /* Drawn and skipped separately: "nothing appeared" and "every batch needed
       * a vertex program we do not run" look identical on screen, and only one
       * of them means the rasteriser is broken. */
@@ -7305,7 +7306,7 @@ index c65632c..c6a35d7 100644
      fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
      fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
                      " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
-@@ -3462,6 +4538,26 @@ void nv2a_pb_exec_report(void)
+@@ -3462,6 +4539,26 @@ void nv2a_pb_exec_report(void)
      fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                      " %u triangles dropped behind the eye\n",
              s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
@@ -8298,7 +8299,7 @@ index 8acb0af..5b533f5 100644
  /* Run the program from the start slot on one vertex. Inputs are the ten
   * attribute values as floats. Returns 0 if there is no program to run (no
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..8dd6b89 100644
+index 72d5131..7f86d16 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -152,6 +152,9 @@ static size_t xbox_TiledApertureSize(void)
@@ -8493,7 +8494,7 @@ index 72d5131..8dd6b89 100644
      return EXCEPTION_CONTINUE_SEARCH;
  }
  
-@@ -1761,11 +1860,31 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -1761,11 +1860,41 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
       */
      {
          static const uintptr_t try_bases[] = {
@@ -8505,6 +8506,16 @@ index 72d5131..8dd6b89 100644
 +             * 0x1000, contiguous 0x80001000, NV2A 0xFD001000, MCPX
 +             * 0xFE801000, flash 0xFF001000. Not 0: a null base means
 +             * "not mapped" throughout this file. */
++#if defined(XBOX_WEB_COMPACT)
++            /* The compact layout (2.28 GB instead of 4): guest 0 at 64 MB, so
++             * RAM is 0x04000000, the contiguous window 0x84000000, and the
++             * high apertures WRAP to 0x01000000 (NV2A), 0x02800000 (MCPX) and
++             * 0x03000000 (flash). Host code must then form an aperture
++             * address in integer arithmetic (uintptr_t, which wraps), never
++             * as pointer + constant (which the compiler folds into an access
++             * offset that traps instead of wrapping). */
++            0x04000000,
++#endif
 +            0x00001000,
 +#elif UINTPTR_MAX == 0xFFFFFFFFu
 +            /* 32-bit host: guest addresses wrap modulo 4 GB, so the offset
@@ -8525,7 +8536,7 @@ index 72d5131..8dd6b89 100644
              0,                      /* sentinel - let OS choose */
          };
  
-@@ -2548,7 +2667,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -2548,7 +2677,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          uint64_t tiled_lo = XBOX_TILED_BASE;
          uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
  
@@ -8541,7 +8552,7 @@ index 72d5131..8dd6b89 100644
              uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                      (uintptr_t)(m + 1) * g_memory_size;
              uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
-@@ -2627,7 +2753,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -2627,7 +2763,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
           */
          if (tiled_size > XBOX_CONTIG_SIZE)
              tiled_size = XBOX_CONTIG_SIZE;
@@ -8550,7 +8561,7 @@ index 72d5131..8dd6b89 100644
              ? MapViewOfFileEx(
                  g_contig_mapping,
                  FILE_MAP_ALL_ACCESS,
-@@ -3094,6 +3220,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+@@ -3094,6 +3230,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
      g_contig_block_count++;
  }
  
@@ -8659,10 +8670,10 @@ index c0dd9e0..a1c5b7c 100644
 +#endif /* x64 Windows */
  #endif /* MMIO_DECODE_H */
 diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
-index 93288d5..4ff3392 100644
+index 93288d5..b3a7e21 100644
 --- a/src/platform/win32_compat.c
 +++ b/src/platform/win32_compat.c
-@@ -1124,8 +1124,30 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
+@@ -1124,8 +1124,34 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
  void view_register(void *addr, size_t len);
  size_t view_take(const void *addr);
  
@@ -8674,7 +8685,11 @@ index 93288d5..4ff3392 100644
 + * granted as it stands. The memory is zero at start; a decommit zeroes it
 + * again so that a later commit finds what Windows would give. */
 +#define EM_GUEST_LOW_END  0x08000000u
++#if defined(XBOX_WEB_COMPACT)
++#define EM_GUEST_HIGH     0x84000000u
++#else
 +#define EM_GUEST_HIGH     0x80000000u
++#endif
 +static int em_guest_addr(const void *p)
 +{
 +    uintptr_t a = (uintptr_t)p;
@@ -8693,7 +8708,7 @@ index 93288d5..4ff3392 100644
      int prot  = prot_from_page(protect);
      int flags = MAP_PRIVATE | MAP_ANONYMOUS;
  
-@@ -1171,6 +1193,13 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
+@@ -1171,6 +1197,13 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
  
  BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
  {
@@ -8707,7 +8722,7 @@ index 93288d5..4ff3392 100644
      if (freeType & MEM_RELEASE) {
          /* Win32 MEM_RELEASE passes size 0 and frees the whole allocation, so
           * the length comes from the registry VirtualAlloc filled in. Returning
-@@ -1190,6 +1219,10 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
+@@ -1190,6 +1223,10 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
  BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
  {
      if (oldProtect) *oldProtect = PAGE_READWRITE;
@@ -8718,7 +8733,7 @@ index 93288d5..4ff3392 100644
      return mprotect(address, size, prot_from_page(newProtect)) == 0;
  }
  
-@@ -1250,9 +1283,22 @@ DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
+@@ -1250,9 +1287,22 @@ DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
  
  BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
  {
@@ -8742,7 +8757,7 @@ index 93288d5..4ff3392 100644
      return TRUE;
  }
  
-@@ -1613,9 +1659,22 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
+@@ -1613,9 +1663,22 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                            DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
  {
      (void)file; (void)sa; (void)protect;
@@ -8766,7 +8781,7 @@ index 93288d5..4ff3392 100644
      int fd = anon_map_fd(name);
      if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
      if (ftruncate(fd, (off_t)size) != 0) {
-@@ -1641,6 +1700,13 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
+@@ -1641,6 +1704,13 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
                         SIZE_T count, LPVOID baseAddr)
  {
      w32_object *o = (w32_object *)mapping;
@@ -8780,7 +8795,7 @@ index 93288d5..4ff3392 100644
      if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
  
      off_t  off = ((off_t)offHigh << 32) | offLow;
-@@ -1691,6 +1757,10 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
+@@ -1691,6 +1761,10 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
  
  BOOL UnmapViewOfFile(LPCVOID baseAddr)
  {
