@@ -2142,6 +2142,462 @@ index c65ba43..4acb4a9 100644
              }
              fflush(stderr);
              last_summary_tick = now;
+diff --git a/src/kernel/kernel_crypto.c b/src/kernel/kernel_crypto.c
+index f8a502c..1937d07 100644
+--- a/src/kernel/kernel_crypto.c
++++ b/src/kernel/kernel_crypto.c
+@@ -17,6 +17,9 @@
+  */
+ 
+ #include "kernel.h"
++#include "kernel_des.h"
++#include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ /* SHA-1 / RC4 / HMAC below are portable software implementations, so the
+@@ -351,56 +354,85 @@ BOOLEAN __stdcall xbox_XcVerifyPKCS1Signature(PVOID Hash, PVOID PublicKey, PVOID
+     return TRUE;
+ }
+ 
++/* Seen once per entry point, so a run's log says which of these a title
++ * actually reaches (RECOMP_CRYPTO_TRACE=1). */
++static void crypto_seen(int which, const char *name)
++{
++    static int on = -1;
++    static unsigned char said[8];
++    if (on < 0)
++        on = getenv("RECOMP_CRYPTO_TRACE") != NULL;
++    if (on && !said[which]) {
++        said[which] = 1;
++        fprintf(stderr, "  [CRYPTO] first call of %s\n", name);
++    }
++}
++
++/* Lengths are in 32-bit words; the numbers are little-endian word arrays. */
+ ULONG __stdcall xbox_XcModExp(PULONG Result, PULONG Base, PULONG Exponent, PULONG Modulus, ULONG ModulusLength)
+ {
+-    (void)Result;
+-    (void)Base;
+-    (void)Exponent;
+-    (void)Modulus;
+-    (void)ModulusLength;
+-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_CRYPTO, "XcModExp: stubbed");
+-    return 0;
++    crypto_seen(0, "XcModExp");
++    if (!Result || !Base || !Exponent || !Modulus)
++        return 0;
++    if (getenv("RECOMP_CRYPTO_TRACE")) {
++        static unsigned n;
++        if (n++ < 8)
++            fprintf(stderr, "  [CRYPTO] XcModExp length %lu  base %08lX.. exp %08lX.. mod %08lX..%08lX\n",
++                    (unsigned long)ModulusLength, (unsigned long)Base[0], (unsigned long)Exponent[0],
++                    (unsigned long)Modulus[0],
++                    (unsigned long)(ModulusLength && ModulusLength <= 256 ? Modulus[ModulusLength - 1] : 0));
++    }
++    return (ULONG)kmod_exp((uint32_t *)Result, (const uint32_t *)Base,
++                           (const uint32_t *)Exponent, (const uint32_t *)Modulus,
++                           ModulusLength);
+ }
+ 
+ /* ============================================================================
+  * DES / Block Cipher Operations
+  *
+- * Used for EEPROM and hard drive key derivation. Not needed for PC.
++ * CipherSelect 0 is DES (8-byte key, 128-byte table), 1 is triple DES
++ * (24-byte key, 384-byte table). Operation 1 encrypts, 0 decrypts. The
++ * implementation is kernel_des.h.
+  * ============================================================================ */
+ 
+ VOID __stdcall xbox_XcDESKeyParity(PUCHAR Key, ULONG KeyLength)
+ {
+-    (void)Key;
+-    (void)KeyLength;
++    crypto_seen(1, "XcDESKeyParity");
++    if (Key)
++        kdes_key_parity(Key, KeyLength);
+ }
+ 
+ VOID __stdcall xbox_XcKeyTable(ULONG CipherSelect, PVOID KeyTable, const UCHAR* Key)
+ {
+-    (void)CipherSelect;
+-    (void)KeyTable;
+-    (void)Key;
++    crypto_seen(2, "XcKeyTable");
++    if (!KeyTable || !Key)
++        return;
++    if (CipherSelect)
++        kdes3_schedule((uint8_t *)KeyTable, Key);
++    else
++        kdes_schedule((uint8_t *)KeyTable, Key);
+ }
+ 
+ VOID __stdcall xbox_XcBlockCrypt(ULONG CipherSelect, PVOID Output, PVOID Input, PVOID KeyTable, ULONG Operation)
+ {
+-    (void)CipherSelect;
+-    (void)Output;
+-    (void)Input;
+-    (void)KeyTable;
+-    (void)Operation;
++    uint8_t out[8];
++    crypto_seen(3, "XcBlockCrypt");
++    if (!Output || !Input || !KeyTable)
++        return;
++    kdes_any_block(CipherSelect != 0, (const uint8_t *)KeyTable, (const uint8_t *)Input,
++                   out, Operation != 0);
++    memcpy(Output, out, 8);
+ }
+ 
+ VOID __stdcall xbox_XcBlockCryptCBC(
+     ULONG CipherSelect, ULONG OutputLength, PVOID Output, PVOID Input,
+     PVOID KeyTable, ULONG Operation, PVOID FeedbackVector)
+ {
+-    (void)CipherSelect;
+-    (void)OutputLength;
+-    (void)Output;
+-    (void)Input;
+-    (void)KeyTable;
+-    (void)Operation;
+-    (void)FeedbackVector;
++    crypto_seen(4, "XcBlockCryptCBC");
++    if (!Output || !Input || !KeyTable || !FeedbackVector)
++        return;
++    kdes_cbc(CipherSelect != 0, (const uint8_t *)KeyTable, (const uint8_t *)Input,
++             (uint8_t *)Output, OutputLength, Operation != 0, (uint8_t *)FeedbackVector);
+ }
+ 
+ VOID __stdcall xbox_XcCryptService(ULONG Operation, PVOID Param)
+diff --git a/src/kernel/kernel_des.h b/src/kernel/kernel_des.h
+new file mode 100644
+index 0000000..96b4a62
+--- /dev/null
++++ b/src/kernel/kernel_des.h
+@@ -0,0 +1,325 @@
++/*
++ * kernel_des.h - DES, triple DES and modular exponentiation for the Xc*
++ * kernel exports.
++ *
++ * Written from the published algorithm (FIPS 46-3) and schoolbook
++ * arithmetic; included by kernel_crypto.c only. A title's own network stack
++ * uses these for its LAN key exchange (XcModExp for the Diffie-Hellman step,
++ * XcKeyTable/XcBlockCryptCBC for the packets), so two running copies only
++ * agree on a session when these compute the real functions.
++ *
++ * Key schedule layout (ours; the title treats the table as opaque and
++ * allocates 128 bytes for DES, 384 for triple DES): 16 rounds of 8 bytes,
++ * each byte the 6 key bits fed to one S-box.
++ */
++#ifndef KERNEL_DES_H
++#define KERNEL_DES_H
++
++#include <stdint.h>
++#include <string.h>
++
++#define KDES_TABLE_BYTES  128
++#define KDES3_TABLE_BYTES 384
++
++static const uint8_t kdes_ip[64] = {
++    58,50,42,34,26,18,10,2, 60,52,44,36,28,20,12,4,
++    62,54,46,38,30,22,14,6, 64,56,48,40,32,24,16,8,
++    57,49,41,33,25,17, 9,1, 59,51,43,35,27,19,11,3,
++    61,53,45,37,29,21,13,5, 63,55,47,39,31,23,15,7
++};
++static const uint8_t kdes_fp[64] = {
++    40,8,48,16,56,24,64,32, 39,7,47,15,55,23,63,31,
++    38,6,46,14,54,22,62,30, 37,5,45,13,53,21,61,29,
++    36,4,44,12,52,20,60,28, 35,3,43,11,51,19,59,27,
++    34,2,42,10,50,18,58,26, 33,1,41, 9,49,17,57,25
++};
++static const uint8_t kdes_e[48] = {
++    32, 1, 2, 3, 4, 5,  4, 5, 6, 7, 8, 9,
++     8, 9,10,11,12,13, 12,13,14,15,16,17,
++    16,17,18,19,20,21, 20,21,22,23,24,25,
++    24,25,26,27,28,29, 28,29,30,31,32, 1
++};
++static const uint8_t kdes_p[32] = {
++    16, 7,20,21, 29,12,28,17,  1,15,23,26,  5,18,31,10,
++     2, 8,24,14, 32,27, 3, 9, 19,13,30, 6, 22,11, 4,25
++};
++static const uint8_t kdes_pc1[56] = {
++    57,49,41,33,25,17, 9,  1,58,50,42,34,26,18,
++    10, 2,59,51,43,35,27, 19,11, 3,60,52,44,36,
++    63,55,47,39,31,23,15,  7,62,54,46,38,30,22,
++    14, 6,61,53,45,37,29, 21,13, 5,28,20,12, 4
++};
++static const uint8_t kdes_pc2[48] = {
++    14,17,11,24, 1, 5,  3,28,15, 6,21,10,
++    23,19,12, 4,26, 8, 16, 7,27,20,13, 2,
++    41,52,31,37,47,55, 30,40,51,45,33,48,
++    44,49,39,56,34,53, 46,42,50,36,29,32
++};
++static const uint8_t kdes_shifts[16] = { 1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1 };
++static const uint8_t kdes_sbox[8][64] = {
++    { 14, 4,13, 1, 2,15,11, 8, 3,10, 6,12, 5, 9, 0, 7,
++       0,15, 7, 4,14, 2,13, 1,10, 6,12,11, 9, 5, 3, 8,
++       4, 1,14, 8,13, 6, 2,11,15,12, 9, 7, 3,10, 5, 0,
++      15,12, 8, 2, 4, 9, 1, 7, 5,11, 3,14,10, 0, 6,13 },
++    { 15, 1, 8,14, 6,11, 3, 4, 9, 7, 2,13,12, 0, 5,10,
++       3,13, 4, 7,15, 2, 8,14,12, 0, 1,10, 6, 9,11, 5,
++       0,14, 7,11,10, 4,13, 1, 5, 8,12, 6, 9, 3, 2,15,
++      13, 8,10, 1, 3,15, 4, 2,11, 6, 7,12, 0, 5,14, 9 },
++    { 10, 0, 9,14, 6, 3,15, 5, 1,13,12, 7,11, 4, 2, 8,
++      13, 7, 0, 9, 3, 4, 6,10, 2, 8, 5,14,12,11,15, 1,
++      13, 6, 4, 9, 8,15, 3, 0,11, 1, 2,12, 5,10,14, 7,
++       1,10,13, 0, 6, 9, 8, 7, 4,15,14, 3,11, 5, 2,12 },
++    {  7,13,14, 3, 0, 6, 9,10, 1, 2, 8, 5,11,12, 4,15,
++      13, 8,11, 5, 6,15, 0, 3, 4, 7, 2,12, 1,10,14, 9,
++      10, 6, 9, 0,12,11, 7,13,15, 1, 3,14, 5, 2, 8, 4,
++       3,15, 0, 6,10, 1,13, 8, 9, 4, 5,11,12, 7, 2,14 },
++    {  2,12, 4, 1, 7,10,11, 6, 8, 5, 3,15,13, 0,14, 9,
++      14,11, 2,12, 4, 7,13, 1, 5, 0,15,10, 3, 9, 8, 6,
++       4, 2, 1,11,10,13, 7, 8,15, 9,12, 5, 6, 3, 0,14,
++      11, 8,12, 7, 1,14, 2,13, 6,15, 0, 9,10, 4, 5, 3 },
++    { 12, 1,10,15, 9, 2, 6, 8, 0,13, 3, 4,14, 7, 5,11,
++      10,15, 4, 2, 7,12, 9, 5, 6, 1,13,14, 0,11, 3, 8,
++       9,14,15, 5, 2, 8,12, 3, 7, 0, 4,10, 1,13,11, 6,
++       4, 3, 2,12, 9, 5,15,10,11,14, 1, 7, 6, 0, 8,13 },
++    {  4,11, 2,14,15, 0, 8,13, 3,12, 9, 7, 5,10, 6, 1,
++      13, 0,11, 7, 4, 9, 1,10,14, 3, 5,12, 2,15, 8, 6,
++       1, 4,11,13,12, 3, 7,14,10,15, 6, 8, 0, 5, 9, 2,
++       6,11,13, 8, 1, 4,10, 7, 9, 5, 0,15,14, 2, 3,12 },
++    { 13, 2, 8, 4, 6,15,11, 1,10, 9, 3,14, 5, 0,12, 7,
++       1,15,13, 8,10, 3, 7, 4,12, 5, 6,11, 0,14, 9, 2,
++       7,11, 4, 1, 9,12,14, 2, 0, 6,10,13,15, 3, 5, 8,
++       2, 1,14, 7, 4,10, 8,13,15,12, 9, 0, 3, 5, 6,11 }
++};
++
++/* Bit n (1 = most significant of byte 0) of a byte string. */
++static int kdes_bit(const uint8_t *b, int n)
++{
++    n--;
++    return (b[n >> 3] >> (7 - (n & 7))) & 1;
++}
++
++static void kdes_key_parity(uint8_t *key, uint32_t len)
++{
++    uint32_t i;
++    for (i = 0; i < len; i++) {
++        uint8_t v = (uint8_t)(key[i] & 0xFE), p = v;
++        p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
++        key[i] = (uint8_t)(v | ((p & 1) ^ 1));
++    }
++}
++
++static void kdes_schedule(uint8_t table[KDES_TABLE_BYTES], const uint8_t key[8])
++{
++    uint8_t cd[56];
++    int r, i, k;
++
++    for (i = 0; i < 56; i++)
++        cd[i] = (uint8_t)kdes_bit(key, kdes_pc1[i]);
++    for (r = 0; r < 16; r++) {
++        for (k = 0; k < kdes_shifts[r]; k++) {
++            uint8_t c0 = cd[0], d0 = cd[28];
++            memmove(cd, cd + 1, 27);       cd[27] = c0;
++            memmove(cd + 28, cd + 29, 27); cd[55] = d0;
++        }
++        for (i = 0; i < 8; i++) {
++            uint8_t v = 0;
++            for (k = 0; k < 6; k++)
++                v = (uint8_t)((v << 1) | cd[kdes_pc2[i * 6 + k] - 1]);
++            table[r * 8 + i] = v;
++        }
++    }
++}
++
++static void kdes_block(const uint8_t table[KDES_TABLE_BYTES], const uint8_t in[8],
++                       uint8_t out[8], int encrypt)
++{
++    uint8_t lr[64], t[32], pre[64];
++    int r, i, k;
++
++    for (i = 0; i < 64; i++)
++        lr[i] = (uint8_t)kdes_bit(in, kdes_ip[i]);
++    for (r = 0; r < 16; r++) {
++        const uint8_t *sub = table + (encrypt ? r : 15 - r) * 8;
++        uint8_t *L = lr, *R = lr + 32;
++        for (i = 0; i < 8; i++) {
++            uint8_t v = 0, s;
++            for (k = 0; k < 6; k++)
++                v = (uint8_t)((v << 1) | R[kdes_e[i * 6 + k] - 1]);
++            v ^= sub[i];
++            s = kdes_sbox[i][(((v >> 5) & 1) << 5) | ((v & 1) << 4) | ((v >> 1) & 0xF)];
++            for (k = 0; k < 4; k++)
++                t[i * 4 + k] = (uint8_t)((s >> (3 - k)) & 1);
++        }
++        for (i = 0; i < 32; i++) {
++            uint8_t f = t[kdes_p[i] - 1];
++            uint8_t nr = (uint8_t)(L[i] ^ f);
++            L[i] = R[i];
++            R[i] = nr;
++        }
++    }
++    /* The halves are swapped once more before the final permutation. */
++    memcpy(pre, lr + 32, 32);
++    memcpy(pre + 32, lr, 32);
++    memset(out, 0, 8);
++    for (i = 0; i < 64; i++)
++        if (pre[kdes_fp[i] - 1])
++            out[i >> 3] |= (uint8_t)(0x80 >> (i & 7));
++}
++
++static void kdes3_schedule(uint8_t table[KDES3_TABLE_BYTES], const uint8_t key[24])
++{
++    kdes_schedule(table, key);
++    kdes_schedule(table + KDES_TABLE_BYTES, key + 8);
++    kdes_schedule(table + 2 * KDES_TABLE_BYTES, key + 16);
++}
++
++static void kdes3_block(const uint8_t table[KDES3_TABLE_BYTES], const uint8_t in[8],
++                        uint8_t out[8], int encrypt)
++{
++    uint8_t a[8], b[8];
++
++    if (encrypt) {
++        kdes_block(table, in, a, 1);
++        kdes_block(table + KDES_TABLE_BYTES, a, b, 0);
++        kdes_block(table + 2 * KDES_TABLE_BYTES, b, out, 1);
++    } else {
++        kdes_block(table + 2 * KDES_TABLE_BYTES, in, a, 0);
++        kdes_block(table + KDES_TABLE_BYTES, a, b, 1);
++        kdes_block(table, b, out, 0);
++    }
++}
++
++/* cipher: 0 = DES, 1 = triple DES. */
++static void kdes_any_block(int cipher, const uint8_t *table, const uint8_t in[8],
++                           uint8_t out[8], int encrypt)
++{
++    if (cipher)
++        kdes3_block(table, in, out, encrypt);
++    else
++        kdes_block(table, in, out, encrypt);
++}
++
++static void kdes_cbc(int cipher, const uint8_t *table, const uint8_t *in, uint8_t *out,
++                     uint32_t len, int encrypt, uint8_t iv[8])
++{
++    uint8_t x[8], c[8];
++    uint32_t o;
++    int i;
++
++    for (o = 0; o + 8 <= len; o += 8) {
++        if (encrypt) {
++            for (i = 0; i < 8; i++) x[i] = (uint8_t)(in[o + i] ^ iv[i]);
++            kdes_any_block(cipher, table, x, c, 1);
++            memcpy(out + o, c, 8);
++            memcpy(iv, c, 8);
++        } else {
++            memcpy(c, in + o, 8);
++            kdes_any_block(cipher, table, c, x, 0);
++            for (i = 0; i < 8; i++) out[o + i] = (uint8_t)(x[i] ^ iv[i]);
++            memcpy(iv, c, 8);
++        }
++    }
++}
++
++/* ---- modular exponentiation on little-endian arrays of 32-bit words ---- */
++
++#define KMOD_MAX_WORDS 256
++
++static int kmod_cmp(const uint32_t *a, const uint32_t *b, uint32_t n)
++{
++    while (n--) {
++        if (a[n] != b[n])
++            return a[n] > b[n] ? 1 : -1;
++    }
++    return 0;
++}
++
++static void kmod_sub(uint32_t *a, const uint32_t *b, uint32_t n)
++{
++    uint64_t borrow = 0;
++    uint32_t i;
++    for (i = 0; i < n; i++) {
++        uint64_t d = (uint64_t)a[i] - b[i] - borrow;
++        a[i] = (uint32_t)d;
++        borrow = (d >> 32) & 1;
++    }
++}
++
++/* r = 2r + bit, reduced; r < m on entry and on return. */
++static void kmod_double(uint32_t *r, int bit, const uint32_t *m, uint32_t n)
++{
++    uint32_t carry = (uint32_t)bit, i;
++    for (i = 0; i < n; i++) {
++        uint32_t top = r[i] >> 31;
++        r[i] = (r[i] << 1) | carry;
++        carry = top;
++    }
++    if (carry || kmod_cmp(r, m, n) >= 0)
++        kmod_sub(r, m, n);
++}
++
++static void kmod_add(uint32_t *r, const uint32_t *a, const uint32_t *m, uint32_t n)
++{
++    uint64_t carry = 0;
++    uint32_t i;
++    for (i = 0; i < n; i++) {
++        uint64_t s = (uint64_t)r[i] + a[i] + carry;
++        r[i] = (uint32_t)s;
++        carry = s >> 32;
++    }
++    if (carry || kmod_cmp(r, m, n) >= 0)
++        kmod_sub(r, m, n);
++}
++
++/* r = a * b mod m; a, b < m; r may not alias a or b. */
++static void kmod_mul(uint32_t *r, const uint32_t *a, const uint32_t *b,
++                     const uint32_t *m, uint32_t n)
++{
++    int i;
++    memset(r, 0, n * sizeof(uint32_t));
++    for (i = (int)n * 32 - 1; i >= 0; i--) {
++        kmod_double(r, 0, m, n);
++        if ((b[i >> 5] >> (i & 31)) & 1)
++            kmod_add(r, a, m, n);
++    }
++}
++
++/* result = base ^ exponent mod modulus; all of n words. Returns 1, or 0 for
++ * a length or modulus it cannot work with. result may alias the inputs. */
++static int kmod_exp(uint32_t *result, const uint32_t *base, const uint32_t *exponent,
++                    const uint32_t *modulus, uint32_t n)
++{
++    static const uint32_t zero[KMOD_MAX_WORDS] = {0};
++    uint32_t b[KMOD_MAX_WORDS], acc[KMOD_MAX_WORDS], t[KMOD_MAX_WORDS];
++    uint32_t e[KMOD_MAX_WORDS], m[KMOD_MAX_WORDS];
++    int i, top;
++
++    if (n == 0 || n > KMOD_MAX_WORDS || kmod_cmp(modulus, zero, n) == 0)
++        return 0;
++    memcpy(e, exponent, n * sizeof(uint32_t));
++    memcpy(m, modulus, n * sizeof(uint32_t));
++
++    /* base mod m, a bit at a time. */
++    memset(b, 0, n * sizeof(uint32_t));
++    for (i = (int)n * 32 - 1; i >= 0; i--)
++        kmod_double(b, (int)((base[i >> 5] >> (i & 31)) & 1), m, n);
++
++    memset(acc, 0, n * sizeof(uint32_t));
++    acc[0] = 1;
++    if (kmod_cmp(acc, m, n) >= 0)
++        acc[0] = 0;                               /* modulus 1 */
++    for (top = (int)n * 32 - 1; top >= 0; top--)
++        if ((e[top >> 5] >> (top & 31)) & 1)
++            break;
++    for (i = top; i >= 0; i--) {
++        kmod_mul(t, acc, acc, m, n);
++        if ((e[i >> 5] >> (i & 31)) & 1)
++            kmod_mul(acc, t, b, m, n);
++        else
++            memcpy(acc, t, n * sizeof(uint32_t));
++    }
++    memcpy(result, acc, n * sizeof(uint32_t));
++    return 1;
++}
++
++#endif /* KERNEL_DES_H */
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
 index 42135e0..7b420a1 100644
 --- a/src/kernel/kernel_file.c

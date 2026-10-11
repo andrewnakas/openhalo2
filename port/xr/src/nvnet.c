@@ -40,7 +40,7 @@
  * RECOMP_NIC=0: registers are plain memory (no network, as before).
  * RECOMP_NIC_HUB=0: no transport (frames are only counted).
  * RECOMP_NIC_TRACE=1: first 600 register accesses.
- * RECOMP_NIC_FRAMES=1: one line per frame sent or received (first 300).
+ * RECOMP_NIC_FRAMES=1: one line per frame sent or received; 2 adds the UDP payload.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -111,7 +111,7 @@ static void nic_init(void)
     const char *e = getenv("RECOMP_NIC");
     s_on = !(e && *e == '0');
     s_trace = getenv("RECOMP_NIC_TRACE") != NULL;
-    s_frames = getenv("RECOMP_NIC_FRAMES") != NULL;
+    s_frames = getenv("RECOMP_NIC_FRAMES") ? atoi(getenv("RECOMP_NIC_FRAMES")) : 0;
     /* A plain 10/100 PHY: link up, auto-negotiation complete, partner able
      * to do 100 Mbit full duplex. */
     s_phy[0] = 0x3100;
@@ -157,22 +157,38 @@ static uint8_t *buffer(uint32_t pa)
 
 static void describe(const char *dir, const uint8_t *f, uint32_t len)
 {
-    unsigned type;
+    static unsigned said_bcast, said_unicast;
+    unsigned type, bcast;
+    char line[1024];
+    int n;
 
-    if (!s_frames || s_tx_frames + s_rx_frames > 300 || len < 14)
+    if (!s_frames || len < 14)
+        return;
+    /* Broadcasts repeat for ever (the first 300 are listed); frames to one
+     * station are the conversation, and get a longer allowance. The line is
+     * built whole, so another thread's output cannot land inside it. */
+    bcast = (f[0] & f[1] & f[2] & f[3] & f[4] & f[5]) == 0xFF;
+    if (bcast ? said_bcast++ >= 300 : said_unicast++ >= 400)
         return;
     type = (unsigned)f[12] << 8 | f[13];
-    fprintf(stderr, "  [NIC] %s %4u B  %02X:%02X:%02X:%02X:%02X:%02X -> "
-                    "%02X:%02X:%02X:%02X:%02X:%02X  type %04X",
-            dir, len, f[6], f[7], f[8], f[9], f[10], f[11],
-            f[0], f[1], f[2], f[3], f[4], f[5], type);
-    if (type == 0x0800 && len >= 42 && f[23] == 17)
-        fprintf(stderr, "  UDP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
-                f[26], f[27], f[28], f[29], (unsigned)f[34] << 8 | f[35],
-                f[30], f[31], f[32], f[33], (unsigned)f[36] << 8 | f[37]);
-    else if (type == 0x0806)
-        fprintf(stderr, "  ARP");
-    fprintf(stderr, "\n");
+    n = snprintf(line, sizeof line, "  [NIC] %s %4u B  %02X:%02X:%02X:%02X:%02X:%02X -> "
+                 "%02X:%02X:%02X:%02X:%02X:%02X  type %04X",
+                 dir, len, f[6], f[7], f[8], f[9], f[10], f[11],
+                 f[0], f[1], f[2], f[3], f[4], f[5], type);
+    if (type == 0x0800 && len >= 42 && f[23] == 17) {
+        n += snprintf(line + n, sizeof line - (size_t)n, "  UDP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
+                      f[26], f[27], f[28], f[29], (unsigned)f[34] << 8 | f[35],
+                      f[30], f[31], f[32], f[33], (unsigned)f[36] << 8 | f[37]);
+        /* RECOMP_NIC_FRAMES=2: the UDP payload too (first 160 bytes). */
+        if (s_frames > 1 && (!bcast || said_bcast < 6)) {
+            uint32_t k;
+            n += snprintf(line + n, sizeof line - (size_t)n, "  |");
+            for (k = 42; k < len && k < 42 + 160; k++)
+                n += snprintf(line + n, sizeof line - (size_t)n, " %02X", f[k]);
+        }
+    } else if (type == 0x0806)
+        n += snprintf(line + n, sizeof line - (size_t)n, "  ARP");
+    fprintf(stderr, "%s\n", line);
 }
 
 static void frame_out(const uint8_t *f, uint32_t len)
