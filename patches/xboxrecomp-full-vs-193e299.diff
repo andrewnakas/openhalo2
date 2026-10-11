@@ -1840,7 +1840,7 @@ index b9a02bc..69e4715 100644
  /* Total crossings of the DISPATCH boundary, and who is holding it up.
   * A depth that is non-zero while this stops moving is stuck, not busy. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..17aa881 100644
+index c65ba43..314b14d 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
@@ -1890,7 +1890,20 @@ index c65ba43..17aa881 100644
  }
  
  /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
-@@ -2166,6 +2180,13 @@ static void bridge_KeInsertQueueDpc(void)
+@@ -2105,7 +2119,7 @@ static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
+  * DPC ordering beyond "after the ISR".
+  */
+ #define XBOX_MAX_PENDING_DPC 64
+-typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
++typedef struct { uint32_t dpc, arg1, arg2; long long queued_at; } PendingDpc;
+ static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
+ static volatile LONG g_dpc_head, g_dpc_tail;
+ 
+@@ -2163,9 +2177,17 @@ static void bridge_KeInsertQueueDpc(void)
+     g_dpc_queue[tail].dpc  = dpc;
+     g_dpc_queue[tail].arg1 = arg1;
+     g_dpc_queue[tail].arg2 = arg2;
++    { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_dpc_queue[tail].queued_at = q.QuadPart; }
      BRIDGE_MEM8(dpc + 2) = 1;
      g_dpc_tail = next;
      LeaveCriticalSection(&g_dpc_lock);
@@ -1904,7 +1917,7 @@ index c65ba43..17aa881 100644
      g_eax = 1;
  }
  
-@@ -2251,6 +2272,8 @@ static int kernel_raise_interrupt(uint32_t vector)
+@@ -2251,6 +2273,8 @@ static int kernel_raise_interrupt(uint32_t vector)
  #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
  #define NV2A_VECTOR            3u
  
@@ -1913,7 +1926,7 @@ index c65ba43..17aa881 100644
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
-@@ -2262,16 +2285,34 @@ static void kernel_vblank_tick(void)
+@@ -2262,16 +2286,34 @@ static void kernel_vblank_tick(void)
      if (!enabled)
          return;
  
@@ -1954,7 +1967,7 @@ index c65ba43..17aa881 100644
  
      {
          static unsigned n;
-@@ -2284,6 +2325,68 @@ static void kernel_vblank_tick(void)
+@@ -2284,6 +2326,68 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -2023,7 +2036,44 @@ index c65ba43..17aa881 100644
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2566,12 +2669,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2302,8 +2406,35 @@ static void kernel_drain_dpcs(void)
+         if (d.dpc)
+             BRIDGE_MEM8(d.dpc + 2) = 0;
+         LeaveCriticalSection(&g_dpc_lock);
+-        if (d.dpc)
++        if (d.dpc) {
++            /* RECOMP_DPC_TRACE: how long queued routines wait and run. */
++            static int trace = -1;
++            static LARGE_INTEGER freq;
++            static double wait_sum, wait_max, run_max;
++            static unsigned n;
++            LARGE_INTEGER t0, t1;
++            if (trace < 0) {
++                trace = getenv("RECOMP_DPC_TRACE") != NULL;
++                QueryPerformanceFrequency(&freq);
++            }
++            if (trace)
++                QueryPerformanceCounter(&t0);
+             kernel_run_dpc(d.dpc, d.arg1, d.arg2);
++            if (trace) {
++                double w, r;
++                QueryPerformanceCounter(&t1);
++                w = (double)(t0.QuadPart - d.queued_at) * 1000.0 / (double)freq.QuadPart;
++                r = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
++                wait_sum += w;
++                if (w > wait_max) wait_max = w;
++                if (r > run_max) run_max = r;
++                if (++n % 500 == 0) {
++                    fprintf(stderr, "  [DPC] last 500: waited %.2f ms on average, %.1f ms at most; "
++                                    "longest routine %.1f ms\n", wait_sum / 500.0, wait_max, run_max);
++                    wait_sum = wait_max = run_max = 0.0;
++                }
++            }
++        }
+     }
+ }
+ 
+@@ -2566,12 +2697,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          g_fs_base = tib;
      }
  
@@ -2056,7 +2106,7 @@ index c65ba43..17aa881 100644
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -2619,6 +2741,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -2619,6 +2769,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      if (!g_timer_started) {
          InitializeCriticalSection(&g_timer_lock);
          g_timer_started = 1;
@@ -2064,7 +2114,7 @@ index c65ba43..17aa881 100644
          CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
      }
  
-@@ -3880,6 +4003,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3880,6 +4031,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
@@ -2081,7 +2131,7 @@ index c65ba43..17aa881 100644
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
-@@ -9391,24 +9524,45 @@ void guest_cpu_part(void)
+@@ -9391,24 +9552,45 @@ void guest_cpu_part(void)
      t_guest_thread = 0;
  }
  
@@ -2127,7 +2177,7 @@ index c65ba43..17aa881 100644
      }
      (void)held;
  }
-@@ -9473,6 +9627,28 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9473,6 +9655,28 @@ static void kernel_thunk_dispatch_body(void)
                      fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
                              (unsigned long long)g_ordinal_calls[best]);
                  }

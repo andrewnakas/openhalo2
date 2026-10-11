@@ -494,6 +494,11 @@ static void hub_open(void)
         return;
     }
     ioctlsocket(s_sock, FIONBIO, &nb);
+    {   /* SIO_UDP_CONNRESET off: see hub_recv */
+        BOOL report = FALSE;
+        DWORD got = 0;
+        WSAIoctl(s_sock, _WSAIOW(IOC_VENDOR, 12), &report, sizeof report, NULL, 0, &got, NULL, NULL);
+    }
     fprintf(stderr, "  [NIC] local hub: this copy is station %d (UDP 127.0.0.1:%d)\n",
             s_my_port - HUB_PORT0, s_my_port);
 }
@@ -522,7 +527,17 @@ static int hub_recv(uint8_t *f, uint32_t max)
 
     if (s_sock == INVALID_SOCKET)
         return 0;
-    n = recv(s_sock, (char *)f, (int)max, 0);
+    /* Every frame goes to all eight hub ports, and Windows reports each send
+     * to a port nobody has open as a "connection reset" on a later recv. One
+     * such report used to end the device thread's receive turn, so a copy
+     * that had just sent took six turns (about 30 ms) to reach the frames
+     * waiting behind them. The reports are switched off in hub_open; any
+     * that still arrive are skipped here. */
+    for (;;) {
+        n = recv(s_sock, (char *)f, (int)max, 0);
+        if (n >= 0 || WSAGetLastError() != WSAECONNRESET)
+            break;
+    }
     return n > 0 ? n : 0;
 }
 

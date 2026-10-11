@@ -24,10 +24,11 @@ EOF
   exit 0
 fi
 O=${1:?outdir}; WD=${2:-900}
-cp /d/n64work/halo2/build/xr/halo2_recomp.exe /d/n64work/halo2/build/xr_b/halo2_recomp.exe
+XA=${XA:-/d/n64work/halo2/build/xr}; XB=${XB:-/d/n64work/halo2/build/xr_b}   # CLEAN: XA=.../xr_clean XB=.../xr_clean_b
+for d in "$XA" "$XB"; do [ "$d" = /d/n64work/halo2/build/xr ] || cp /d/n64work/halo2/build/xr/halo2_recomp.exe "$d/halo2_recomp.exe"; done
 for x in a b; do
   D=$O/$x; mkdir -p $D; rm -f $D/dumpflag $D/fb*.bmp; : > $D/pad.txt
-  [ $x = a ] && X=/d/n64work/halo2/build/xr || X=/d/n64work/halo2/build/xr_b
+  [ $x = a ] && X=$XA || X=$XB
   ( cd $X && env "${@:3}" RECOMP_WATCHDOG_SECS=$WD RECOMP_PB_REPORT_MS=5000 \
       RECOMP_PAD_LIVE=$D/pad.txt RECOMP_FB_DUMP_FLIPS=$D/dumpflag RECOMP_FB_DUMP=$D/fb \
       RECOMP_NIC_FRAMES=${NICF:-1} RECOMP_APU_MUTE=1 RECOMP_CRYPTO_TRACE=1 \
