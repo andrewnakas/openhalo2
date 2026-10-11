@@ -17,7 +17,9 @@ if [ "$COMPACT" = 1 ]; then CDEF="-DXBOX_WEB_COMPACT=1 -fwrapv-pointer"; MEM=228
 CF="$CDEF -O1 -pthread -msse2 -mssse3 -msimd128 -fdeclspec -sUSE_SDL=2 -I$G -I$G/recomp -I$G/recomp/gen -I$X/include -I$X/src -I$X/src/kernel -I$X/src/platform -Wno-everything -ferror-limit=5"
 cc() { src=$1; obj=$2
   [ -e "$obj" ] && [ "$obj" -nt "$src" ] && return 0
-  case "$obj" in */rt/*) dbg=-g;; *) dbg=;; esac     # line numbers for the runtime (tools/websym.sh)
+  # the runtime: line numbers (tools/websym.sh) and full optimisation (the pixel
+  # executor and the vertex program interpreter are the frame's cost); RTOPT=-O1 for a quick build
+  case "$obj" in */rt/*) dbg="-g ${RTOPT:--O3}";; *) dbg=;; esac
   emcc -c $CF $dbg "$src" -o "$obj" > "${obj%.o}.log" 2>&1 && rm -f "${obj%.o}.log" || echo "FAIL $src"; }
 export -f cc; export CF
 if [ "$1" != "link-only" ]; then

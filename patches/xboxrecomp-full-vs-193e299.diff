@@ -7786,7 +7786,7 @@ index 0000000..59f8da2
 +
 +#endif /* NV2A_REG_TRAP_H */
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
-index 7fae74c..b99b54b 100644
+index 7fae74c..17f61f2 100644
 --- a/src/kernel/nv2a_vsh_interp.c
 +++ b/src/kernel/nv2a_vsh_interp.c
 @@ -39,6 +39,9 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
@@ -7829,7 +7829,7 @@ index 7fae74c..b99b54b 100644
  }
  
  /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
-@@ -305,12 +316,300 @@ static vec4 run_ilu(uint32_t op, vec4 c)
+@@ -305,12 +316,305 @@ static vec4 run_ilu(uint32_t op, vec4 c)
      return r;
  }
  
@@ -7856,9 +7856,14 @@ index 7fae74c..b99b54b 100644
 + * is a blend. Every arithmetic step is the scalar loop's own, in the same
 + * order (dot products are summed left to right, no fused multiply-add), so
 + * the results are bit-identical. ILU ops and ARL stay scalar. */
-+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
++/* Also WebAssembly: Emscripten maps these intrinsics onto wasm SIMD (-msse2
++ * -mssse3 -msimd128). The scalar loop there costs most of a frame. */
++#if (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))) || (defined(__EMSCRIPTEN__) && defined(__SSSE3__))
 +#define VSH_SSE 1
 +#include <tmmintrin.h>
++#if !defined(_MSC_VER) && !defined(__forceinline)
++#define __forceinline inline __attribute__((always_inline))
++#endif
 +
 +typedef struct {
 +    __m128i shuf[3];
@@ -8131,7 +8136,7 @@ index 7fae74c..b99b54b 100644
      float outregs[13][4];
      int a0 = 0;
      uint32_t s;
-@@ -335,8 +634,23 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -335,8 +639,23 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
          }
      }
  
@@ -8156,7 +8161,7 @@ index 7fae74c..b99b54b 100644
      memset(outregs, 0, sizeof outregs);
      outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
      /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
-@@ -344,49 +658,72 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -344,49 +663,72 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
       * unwritten stage at infinity. */
      outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
  
@@ -8263,7 +8268,7 @@ index 7fae74c..b99b54b 100644
              memcpy(out->d0, outregs[3], sizeof out->d0);
              memcpy(out->d1, outregs[4], sizeof out->d1);
              memcpy(out->fog, outregs[5], sizeof out->fog);
-@@ -394,6 +731,20 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -394,6 +736,20 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
              memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
              memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
              memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
