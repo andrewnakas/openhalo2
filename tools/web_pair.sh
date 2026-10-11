@@ -41,4 +41,4 @@ cd /d/n64work/halo2-cleanroom
 curl -s -o /dev/null http://localhost:8092/index.html || { (python ports/wasm/serve.py /d/n64work/halo2/build/web/site_clean 8092 > /dev/null 2>&1 &); sleep 2; }
 python ports/wasm/cdp_pair.py $O --url-a "http://localhost:8092/index.html?link=bc${QA}" \
   --url-b "http://localhost:8092/index.html?link=bc&save=save_b${QB}" \
-  --profile D:/n64work/halo2/build/web/chrome_profile --max ${2:-1700} > $O/driver.log 2>&1
+  --profile D:/n64work/halo2/build/web/chrome_profile --max ${2:-1700} ${WEBGL:+--webgl} > $O/driver.log 2>&1   # WEBGL=1: software GL
