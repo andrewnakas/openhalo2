@@ -29,6 +29,16 @@ S=${STEP:-7}
 echo "start:${SHOLD:-1500}" >> "$OUT/pad.txt"; sleep $S; mark profile
 grep -a -q 'PAD: live "' "$OUT/out.log" || { echo "pad press not consumed" | tee -a "$OUT/marks.txt"; exit 1; }
 for n in profile nosignin campaign newcampaign level difficulty; do
+  # the main menu reopens on the item last used (System Link after link tests): go to the top
+  # (the list wraps). The lit row is read past the end of the text (x 405-435), where only
+  # the highlight bar is; rows at y = 287 + 28n.
+  if [ $n = campaign ]; then
+    for i in 1 2 3 4 5 6; do
+      bash /d/n64work/openhalo2/tools/shot.sh "$OUT" row > /dev/null
+      r=$(python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');v=[sum(im.crop((405,y-5,435,y+5)).getdata()) for y in (287,315,343,371,399)];print(v.index(max(v)))" "$OUT/row.png")
+      [ "$r" = 0 ] && break; echo "up:150" >> "$OUT/pad.txt"; sleep 2
+    done; mark before_campaign
+  fi
   echo "a:${AHOLD:-300}" >> "$OUT/pad.txt"; sleep $S; mark "after_$n"
 done
 sleep ${LOADWAIT:-75}
