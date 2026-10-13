@@ -58,33 +58,58 @@ window.addEventListener('unhandledrejection', e => say('rejection: ' + e.reason)
 // from the dev tree's game/ and save/ folders) into the origin's private file
 // system, skipping files already there with the same size. The program then
 // mounts them at /game and /save. ?import=only stops after the copy.
-async function importTree() {
-  const list = await (await fetch('manifest.json')).json();
+// A packed site (tools/web_pack.py) has manifest.json as {v:2, files, dirs}: a file
+// entry is [path, size, pieces, blank]. pieces: URLs fetched in order and joined
+// (a host's file size limit; they may lie in a sibling folder of the same origin);
+// blank: made at its size and left empty (hard disk images the title formats).
+// Such a site imports on every load, without ?import.
+async function importTree(man) {
+  const packed = !Array.isArray(man);
+  const list = packed ? man.files : man;
   const root = await navigator.storage.getDirectory();
-  let done = 0, bytes = 0, skipped = 0; const t0 = performance.now();
-  for (const [path, size] of list) {
+  let done = 0, bytes = 0, skipped = 0, failed = 0; const t0 = performance.now();
+  const total = list.reduce((a, f) => a + (f[3] ? 0 : f[1]), 0);
+  for (const [path, size, pieces, blank] of list) {
     const parts = path.split('/'); const name = parts.pop();
     let dir = root; for (const d of parts) dir = await dir.getDirectoryHandle(d, {create: true});
     const fh = await dir.getFileHandle(name, {create: true});
     // maps are regenerated in place at the same size, so ?import=force copies everything again
     if (q.get('import') !== 'force' && (await fh.getFile()).size === size) { skipped++; continue; }
-    const w = await fh.createWritable();
-    const r = await fetch(encodeURI(path));
-    if (!r.ok) { await w.abort(); say('import: ' + path + ' -> HTTP ' + r.status); continue; }
-    await r.body.pipeTo(w);
-    done++; bytes += size;
-    if (done % 20 === 0) say('import: ' + done + ' files, ' + (bytes / 1048576 | 0) + ' MB');
+    const w = await fh.createWritable();   // nothing is kept unless close() is reached
+    if (blank) { await w.truncate(size); await w.close(); continue; }
+    let ok = true;
+    for (const url of (pieces || [encodeURI(path)])) {
+      const r = await fetch(url);
+      if (!r.ok) { say('import: ' + url + ' -> HTTP ' + r.status); ok = false; break; }
+      await r.body.pipeTo(w, {preventClose: true});
+      bytes += +r.headers.get('content-length') || 0;
+      if (packed) say('download: ' + (bytes / 1048576 | 0) + ' of ' + (total / 1048576 | 0) + ' MB (' + path + ')');
+    }
+    if (!ok) { await w.abort(); failed++; continue; }
+    await w.close();
+    done++;
+    if (!packed && done % 20 === 0) say('import: ' + done + ' files, ' + (bytes / 1048576 | 0) + ' MB');
   }
   // empty directories of the save tree
-  for (const d of (await (await fetch('manifest_dirs.json')).json())) {
+  for (const d of (packed ? man.dirs : await (await fetch('manifest_dirs.json')).json())) {
     let dir = root; for (const part of d.split('/')) dir = await dir.getDirectoryHandle(part, {create: true});
   }
   say('IMPORT_DONE copied ' + done + ' files (' + (bytes / 1048576 | 0) + ' MB), ' + skipped + ' already there, '
-      + ((performance.now() - t0) / 1000 | 0) + ' s');
+      + failed + ' failed, ' + ((performance.now() - t0) / 1000 | 0) + ' s');
+  if (failed) throw new Error('some game files could not be downloaded; reload the page to try again');
 }
 (async function () {
   try {
-    if (q.get('import')) await importTree();
+    // A static host (GitHub Pages) cannot send the isolation headers threads need:
+    // coi-sw.js adds them, and the page reloads once under it.
+    const coiTries = +(sessionStorage.getItem('coiReloaded') || 0);
+    if (!window.crossOriginIsolated && 'serviceWorker' in navigator && coiTries < 3) {
+      const reg = await navigator.serviceWorker.register('coi-sw.js').catch(() => null);
+      if (reg) { await navigator.serviceWorker.ready; sessionStorage.setItem('coiReloaded', String(coiTries + 1)); location.reload(); return; }
+    }
+    let man = null;
+    try { man = await (await fetch('manifest.json')).json(); } catch (e) {}
+    if (man && (q.get('import') || !Array.isArray(man))) await importTree(man);
     if (q.get('ls')) {   // what the private file system holds, seen from the page
       const root = await navigator.storage.getDirectory();
       for await (const [name, h] of root.entries()) {
