@@ -322,6 +322,25 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
             (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
         print_guest_context((void *)CTX_IP(ep->ContextRecord));
+        /* The raw guest stack: ebp lives in the lifted function's locals, so
+         * the frame (and its arguments) is only reachable through esp. */
+        {
+            const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+            int i;
+            if (g_esp >= 0x1000u && g_esp < 0x04000000u - 0x200u) {
+                fprintf(stderr, "  guest stack words from esp=0x%08X:\n", g_esp);
+                for (i = 0; i < 128; i += 8)
+                    fprintf(stderr, "    +%03X %08X %08X %08X %08X %08X %08X %08X %08X\n", i * 4,
+                            *(const uint32_t *)(m + g_esp + i * 4),
+                            *(const uint32_t *)(m + g_esp + i * 4 + 4),
+                            *(const uint32_t *)(m + g_esp + i * 4 + 8),
+                            *(const uint32_t *)(m + g_esp + i * 4 + 12),
+                            *(const uint32_t *)(m + g_esp + i * 4 + 16),
+                            *(const uint32_t *)(m + g_esp + i * 4 + 20),
+                            *(const uint32_t *)(m + g_esp + i * 4 + 24),
+                            *(const uint32_t *)(m + g_esp + i * 4 + 28));
+            }
+        }
 
         /*
          * TODO: Add game-specific diagnostics here. Examples:
