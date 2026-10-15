@@ -581,6 +581,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         xbox_path_init(YOUR_GAME_DIR, "save");
         /* D3D fence handler (CMiniport software interrupt) in this XBE. */
         { extern void xbox_SetD3DSoftwareInterruptRoutine(unsigned int); xbox_SetD3DSoftwareInterruptRoutine(0x003FF240u); }
+        /* Title data patches (recomp_manual.c): attract movie off when absent. */
+        { extern void h2_title_patches(const char *game_dir); h2_title_patches(YOUR_GAME_DIR); }
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */

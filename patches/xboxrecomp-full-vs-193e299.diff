@@ -10148,7 +10148,7 @@ index 22762ee..a7e0ca6 100644
  LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
  PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
-index 641a94d..c076ae9 100644
+index 641a94d..e402af4 100644
 --- a/src/usb/ohci.c
 +++ b/src/usb/ohci.c
 @@ -500,6 +500,14 @@ static uint32_t bus_resolve(uint32_t addr)
@@ -10235,7 +10235,7 @@ index 641a94d..c076ae9 100644
  
      xbox_worker_stack_free(slot);
      return (int)(g_eax & 1u);
-@@ -1033,6 +1066,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+@@ -1033,14 +1066,23 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          uint32_t pass_done = 0;     /* this pass's done queue, newest first */
  
          Sleep(OHCI_TICK_MS);
@@ -10244,7 +10244,24 @@ index 641a94d..c076ae9 100644
          control = hc->reg[HcControl / 4];
          enable  = hc->reg[HcInterruptEnable / 4];
  
-@@ -1314,13 +1349,14 @@ void xbox_OhciInit(void)
+         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
+          * the driver has not started yet is not a test of anything. */
+         if ((control & 0xC0u) != 0x80u) {
+-            if (++waited > 1500)              /* 30 s and it never started */
+-                break;
++            /* Keep waiting however long the title takes. This used to give up
++             * after 30 s, and a boot that reaches XAPI's USB start later than
++             * that (a blank hard disk being formatted, a loaded machine: 16-22 s
++             * is the usual figure in the browser) then ran with no controller
++             * for the whole session. */
++            if (++waited == 1500) {
++                fprintf(stderr, "  [OHCI0] driver not started after 30 s; still waiting\n");
++                fflush(stderr);
++            }
+             continue;
+         }
+         if (!(enable & INTR_MIE))
+@@ -1314,13 +1356,14 @@ void xbox_OhciInit(void)
              XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
      fflush(stderr);
  
@@ -10261,7 +10278,7 @@ index 641a94d..c076ae9 100644
  }
  
  static OhciController *hc_for(uint32_t va)
-@@ -1340,6 +1376,20 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
+@@ -1340,6 +1383,20 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
      return hc_for(xbox_va) != NULL;
  }
  
@@ -10282,7 +10299,7 @@ index 641a94d..c076ae9 100644
  int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
  {
  #if defined(_WIN32)
-@@ -1351,7 +1401,7 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
+@@ -1351,7 +1408,7 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
      ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
                        ohci_read, ohci_write);
      if (!ok && hc->decode_fail++ < 20) {

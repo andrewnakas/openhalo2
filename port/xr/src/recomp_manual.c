@@ -197,3 +197,38 @@ void recomp_unimpl(const char *text, uint32_t va)
     }
     if (stop) abort();
 }
+
+/* ── Title data patches applied at boot ────────────────────── */
+
+/*
+ * Called once after the memory layout is up and before the entry point,
+ * with the host folder that holds the disc files.
+ *
+ * Attract movie: after 75 s idle on the main menu the title plays
+ * d:\bink\attract_60.bik (retail 0x223A21) without checking that the file
+ * is there. The clean-room tree carries no Bink movies, so the menu went
+ * black and retried every 80 s. When the file is missing, the idle delay
+ * (dword at 0x4701BC, 75000 ms in the XBE) is set to its maximum, which is
+ * the same as never idle long enough. RECOMP_ATTRACT=1 leaves it alone.
+ */
+void h2_title_patches(const char *game_dir)
+{
+    char path[512];
+    FILE *f;
+    const char *keep = getenv("RECOMP_ATTRACT");
+
+    snprintf(path, sizeof path, "%s/bink/attract_60.bik", game_dir);
+    f = fopen(path, "rb");
+    if (f) {
+        fclose(f);
+        return;
+    }
+    if (keep && *keep && *keep != '0')
+        return;
+    if (*(volatile uint32_t *)((uintptr_t)0x4701BCu + g_xbox_mem_offset) != 75000u) {
+        fprintf(stderr, "[BOOT] attract delay word is not 75000: left alone\n");
+        return;
+    }
+    *(volatile uint32_t *)((uintptr_t)0x4701BCu + g_xbox_mem_offset) = 0xFFFFFFFFu;
+    fprintf(stderr, "[BOOT] no %s: attract movie off\n", path);
+}

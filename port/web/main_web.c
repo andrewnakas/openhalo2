@@ -156,6 +156,7 @@ int main(void)
     xbox_Nv2aRegTrapInit();
     xbox_path_init(GAME_DIR, SAVE_DIR);
     xbox_SetD3DSoftwareInterruptRoutine(0x003FF240u);
+    { extern void h2_title_patches(const char *game_dir); h2_title_patches(GAME_DIR); }
     xbox_kernel_bridge_init();
 
     g_esp = STACK_TOP;
