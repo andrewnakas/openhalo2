@@ -10709,7 +10709,7 @@ index 08bae4b..922e860 100644
  int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
  void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
-index 8e9325e..6fc89a1 100644
+index 8e9325e..3c7e4a1 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
 @@ -225,7 +225,9 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
@@ -10722,7 +10722,56 @@ index 8e9325e..6fc89a1 100644
  #define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)__sync_fetch_and_add((volatile uint32_t *)(p), (uint32_t)(v)))
  #define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
  #endif
-@@ -1431,6 +1433,54 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
+@@ -427,6 +429,48 @@ void recomp_trace_esp(const char *name, const char *tag);
+ #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
+ #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+ 
++/* x87 80-bit extended reals (`fld/fstp xword ptr`), to and from the double
++ * the FPU stack model holds: 64-bit significand with an explicit integer
++ * bit, then sign and a 15-bit exponent biased by 16383. They were lifted as
++ * a 4-byte float load and a dropped store; MSVC's CRT rounds every
++ * transcendental result through `fstp xword [ebp-0x9e]; fld xword [...]`
++ * (_ctrandisp's exit), so sinh/cosh/pow... returned garbage and leaked a
++ * stack slot -- DirectSound's filter maths among them. Precision beyond a
++ * double's 53 bits is dropped, as the rest of the stack model does. */
++static inline double recomp_ld80(uint32_t addr) {
++    uint64_t m = (uint64_t)MEM32(addr) | ((uint64_t)MEM32(addr + 4) << 32);
++    uint32_t se = (uint32_t)(*(volatile uint16_t *)XBOX_PTR(addr + 8));
++    int neg = (se & 0x8000u) != 0, e = (int)(se & 0x7FFFu);
++    double v;
++    if (e == 0x7FFF)
++        v = (m << 1) ? NAN : INFINITY;
++    else if (e == 0 && m == 0)
++        v = 0.0;
++    else
++        v = ldexp((double)m, (e ? e : 1) - 16383 - 63);
++    return neg ? -v : v;
++}
++
++static inline void recomp_st80(uint32_t addr, double v) {
++    uint64_t m;
++    uint32_t se = signbit(v) ? 0x8000u : 0u;
++    if (v != v) {
++        m = 0xC000000000000000ull; se |= 0x7FFFu;
++    } else if (isinf(v)) {
++        m = 0x8000000000000000ull; se |= 0x7FFFu;
++    } else if (v == 0.0) {
++        m = 0;
++    } else {
++        int ex;
++        double f = frexp(fabs(v), &ex);         /* [0.5, 1) * 2^ex */
++        m = (uint64_t)ldexp(f, 64);             /* integer bit at 63 */
++        se |= (uint32_t)(ex - 1 + 16383) & 0x7FFFu;
++    }
++    MEM32(addr) = (uint32_t)m;
++    MEM32(addr + 4) = (uint32_t)(m >> 32);
++    *(volatile uint16_t *)XBOX_PTR(addr + 8) = (uint16_t)se;
++}
++
+ /* ================================================================
+  * SSE / XMM register state
+  *
+@@ -1431,6 +1475,54 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
   * state, and with RECOMP_UNIMPL_TRAP=1 it stops at the first one. The lifter
   * keeps the comment beside the call so `grep TODO:` over a gen tree still
   * enumerates every site whether or not it is ever reached. */
@@ -10947,7 +10996,7 @@ index 37542d8..16fcc4d 100644
      def _pass_indirect_call_slots(self) -> None:
          """
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index e7ab880..cb5c5c8 100644
+index e7ab880..849d891 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
 @@ -127,6 +127,11 @@ def _fmt_reg(name, size=4):
@@ -11096,6 +11145,26 @@ index e7ab880..cb5c5c8 100644
          if m == "cvtss2sd":
              if nops >= 2:
                  return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
+@@ -3491,6 +3571,9 @@ class Lifter:
+                         return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld float */"]
+                     elif ops[0].mem_size == 8:
+                         return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
++                    elif ops[0].mem_size == 10 or "xword" in insn.op_str:
++                        # 80-bit extended (see recomp_ld80); was read as a float.
++                        return [f"fp_push(recomp_ld80({_fmt_mem(ops[0])})); /* fld xword */"]
+                     return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld */"]
+                 if ops[0].type == "reg":
+                     # fld st(i) pushes a COPY of st(i). Was a no-op comment,
+@@ -3518,6 +3601,9 @@ class Lifter:
+                     return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{do_pop} /* {m} */"]
+                 elif ops[0].mem_size == 8:
+                     return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{do_pop} /* {m} */"]
++                elif ops[0].mem_size == 10 or "xword" in insn.op_str:
++                    # 80-bit extended (see recomp_st80); was dropped, pop and all.
++                    return [f"recomp_st80({_fmt_mem(ops[0])}, fp_top());{do_pop} /* {m} xword */"]
+             # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
+             # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
+             # is the common idiom for "pop the value fptan/fsincos just pushed";
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
 index 3cd9250..b5a5098 100644
 --- a/tools/recomp/translator.py
