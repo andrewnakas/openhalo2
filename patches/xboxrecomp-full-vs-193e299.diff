@@ -1,8 +1,35 @@
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index 258048c..1be8db8 100644
+index 258048c..746f1a0 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
-@@ -119,6 +119,8 @@ extern uint32_t xbox_AllocThreadTib(void);
+@@ -76,8 +76,25 @@ extern uint32_t xbox_ContiguousAllocatedBytes(void);
+ uint8_t *mcpx_apu_phys(uint64_t addr)
+ {
+     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+-    if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
++    if (a >= g_xbox_image_lo && a < g_xbox_image_hi) {
++        /* RECOMP_APU_PHYS_LOG: which image-range addresses the APU uses, and
++         * whether the contiguous arena also covers them (ambiguous). */
++        static int on = -1, said;
++        static uint32_t pages[64];
++        if (on < 0) on = getenv("RECOMP_APU_PHYS_LOG") != NULL;
++        if (on && said < 64) {
++            uint32_t pg = a & ~0xFFFu;
++            int i;
++            for (i = 0; i < said && pages[i] != pg; i++) ;
++            if (i == said) {
++                pages[said++] = pg;
++                fprintf(stderr, "[APUPHYS] image-range page %08X (contig hwm %08X)%s\n",
++                        pg, xbox_ContiguousAllocatedBytes(),
++                        a < xbox_ContiguousAllocatedBytes() ? " AMBIGUOUS" : "");
++            }
++        }
+         return g_apu_ram_ptr + a;
++    }
+     if (a < xbox_ContiguousAllocatedBytes())
+         return g_apu_ram_ptr + 0x80000000u + a;
+     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+@@ -119,6 +136,8 @@ extern uint32_t xbox_AllocThreadTib(void);
  extern int xbox_IrqlBlocksInterrupts(void);
  extern int xbox_IrqlEnterInterrupt(int level);
  extern void xbox_IrqlLeaveInterrupt(int saved);
@@ -11,7 +38,7 @@ index 258048c..1be8db8 100644
  #if defined(_MSC_VER)
  #  define APU_TLS __declspec(thread)
  #else
-@@ -171,7 +173,9 @@ static void apu_deliver_irq(MCPXAPUState *d)
+@@ -171,7 +190,9 @@ static void apu_deliver_irq(MCPXAPUState *d)
      g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
      g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
      g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
@@ -21,7 +48,7 @@ index 258048c..1be8db8 100644
      xbox_worker_stack_free(slot);
      qemu_mutex_lock(&d->lock);
  
-@@ -232,6 +236,14 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
+@@ -232,6 +253,14 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
          break;
      case NV_PAPU_FECTL:
      case NV_PAPU_SECTL:
@@ -36,7 +63,7 @@ index 258048c..1be8db8 100644
          qatomic_set(&d->regs[addr], (uint32_t)val);
          /* Starting the APU has to start the frame thread.
           *
-@@ -312,6 +324,27 @@ typedef struct {
+@@ -312,6 +341,27 @@ typedef struct {
  
  static WaveOutState g_waveout = { 0 };
  
@@ -64,7 +91,7 @@ index 258048c..1be8db8 100644
  void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
  {
      (void)errp;
-@@ -319,162 +352,245 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
+@@ -319,162 +369,245 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
      d->monitor.queued_bytes_low = 1024;
      d->monitor.queued_bytes_high = 3072;
  
@@ -432,7 +459,7 @@ index 258048c..1be8db8 100644
  static void throttle(MCPXAPUState *d)
  {
      if (d->ep_frame_div % 8) {
-@@ -483,8 +599,15 @@ static void throttle(MCPXAPUState *d)
+@@ -483,8 +616,15 @@ static void throttle(MCPXAPUState *d)
  
      int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
  
@@ -449,7 +476,7 @@ index 258048c..1be8db8 100644
          d->next_frame_time_us = now_us;
      }
  
-@@ -492,7 +615,11 @@ static void throttle(MCPXAPUState *d)
+@@ -492,7 +632,11 @@ static void throttle(MCPXAPUState *d)
          now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
          int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
          if (remaining_ms > 0) {
@@ -462,7 +489,7 @@ index 258048c..1be8db8 100644
          } else {
              break;
          }
-@@ -570,6 +697,73 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -570,6 +714,73 @@ static void *mcpx_apu_frame_thread(void *arg)
          int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                  NV_PAPU_SECTL_XCNTMODE);
          uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -536,7 +563,7 @@ index 258048c..1be8db8 100644
          bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                            !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                            !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
-@@ -578,7 +772,13 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -578,7 +789,13 @@ static void *mcpx_apu_frame_thread(void *arg)
              /* Full pipeline: VP voices → DSP → monitor → waveOut */
              se_frame(d);
          } else {
@@ -10827,10 +10854,70 @@ index 8e9325e..3c7e4a1 100644
  #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
  
 diff --git a/tools/conformance/xbe_run.py b/tools/conformance/xbe_run.py
-index 7ecb09d..2e1292c 100644
+index 7ecb09d..967a851 100644
 --- a/tools/conformance/xbe_run.py
 +++ b/tools/conformance/xbe_run.py
-@@ -284,6 +284,11 @@ RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
+@@ -98,7 +98,12 @@ def _inspect(insns, start, end, sections):
+             return False, []
+         if m == "call":
+             if not text.startswith("0x"):
+-                return False, []          # indirect: target unknown
++                # indirect: target unknown. CONF_ALLOW_ICALL=1 lets it through
++                # for a harness that resolves targets at run time itself.
++                import os
++                if os.environ.get("CONF_ALLOW_ICALL") == "1":
++                    continue
++                return False, []
+             try:
+                 calls.append(int(text, 16))
+             except ValueError:
+@@ -149,7 +154,7 @@ def _decode_at(data, sections, cs, va):
+     return Func(va, end, data[off:off + (end - va)], bool(plain), calls, ok)
+ 
+ 
+-def scan(data, sections, cs):
++def scan(data, sections, cs, extra=None):
+     """Every function we can decode, reached from a prologue or from a call.
+ 
+     Seeding only from `push ebp; mov ebp, esp` finds the framed functions and
+@@ -171,6 +176,9 @@ def scan(data, sections, cs):
+             seeds.append(sec.va + pos)
+             pos += 1
+ 
++    # Known function starts (CONF_ONLY): FPO functions have no prologue and
++    # may be reached by no direct call either -- Havok's are mostly virtual.
++    seeds.extend(sorted(extra or ()))
+     funcs, todo, seen = {}, list(seeds), set(seeds)
+     while todo:
+         va = todo.pop()
+@@ -207,12 +215,23 @@ def admissible(funcs):
+ 
+ def find_candidates(data, sections, limit, cs):
+     """(entries to call, every function to lift, entry -> its call closure)."""
+-    funcs = scan(data, sections, cs)
++    import os
++    only = os.environ.get("CONF_ONLY")         # file of hex VAs: test just these
++    seeds = None
++    if only:
++        with open(only) as fh:
++            seeds = {int(t, 16) for t in fh.read().split() if t.strip()}
++    funcs = scan(data, sections, cs, extra=seeds)
+     ok = admissible(funcs)
+     # Only a plain-`ret` function can be called from C: a stdcall callee cleans
+     # argument bytes we would have to guess. Callees may be either -- the
+-    # lifter handles `ret imm16` itself.
+-    entries = sorted(va for va in ok if funcs[va].plain_ret)[:limit]
++    # lifter handles `ret imm16` itself. CONF_ANY_RET=1 takes `ret N` entries
++    # too: the harness puts esp back itself after the native call, and the
++    # lifted side runs on its own stack, so the cleanup count never matters.
++    any_ret = os.environ.get("CONF_ANY_RET") == "1"
++    entries = sorted(va for va in ok
++                     if (any_ret or funcs[va].plain_ret)
++                     and (seeds is None or va in seeds))[:limit]
+ 
+     closure = {}
+     for va in entries:
+@@ -284,6 +303,11 @@ RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
  RECOMP_TLS uint32_t g_seh_ebp, g_ebp;
  RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
  RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS int g_fp_cmp; RECOMP_TLS uint16_t g_fp_cc = 0x4000;
@@ -10842,6 +10929,122 @@ index 7ecb09d..2e1292c 100644
  RECOMP_TLS RecompXmm g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7;
  volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
  volatile uint64_t g_icall_count;
+@@ -299,7 +323,7 @@ static unsigned char g_stack[256 * 1024];
+ /* Memory a function may be handed a pointer into. Both sides see the identical
+    bytes, and it is restored before each run so one side cannot observe what
+    the other wrote. */
+-#define SCRATCH_SIZE 0x1000
++#define SCRATCH_SIZE 0x4000
+ static unsigned char g_scratch[SCRATCH_SIZE];
+ static unsigned char g_scratch_seed[SCRATCH_SIZE];
+ static unsigned char g_scratch_native[SCRATCH_SIZE];
+@@ -397,6 +421,8 @@ static uint32_t g_nat_eax, g_nat_edx;
+ static void *g_fn;
+ static const uint32_t *g_args_p;
+ static double g_fp_arg;
++static uint32_t g_this;          /* ecx: a C++ method's this, in scratch */
++static double g_nat_st0;
+ static unsigned short g_cw = 0x027F;
+ 
+ /* The title's code runs below a wide gap in this thread's own stack. A
+@@ -452,7 +478,7 @@ static void call_native(void *fn, const uint32_t *args) {
+         fldcw word ptr g_cw
+         fld  qword ptr g_fp_arg
+         xor  eax, eax
+-        xor  ecx, ecx
++        mov  ecx, g_this
+         xor  edx, edx
+         xor  ebx, ebx
+         xor  esi, esi
+@@ -461,6 +487,7 @@ static void call_native(void *fn, const uint32_t *args) {
+         mov  esp, g_saved_sp
+         mov  g_nat_eax, eax
+         mov  g_nat_edx, edx
++        fstp qword ptr g_nat_st0
+         popad
+     }
+ }
+@@ -562,11 +589,13 @@ def harness_source(xbe_path, sections, lifted, entries):
+     out.append('''
+ static void run_one(uint32_t va, const uint32_t *raw, int vec, int *shown) {
+     uint32_t nat_eax, nat_edx, args[4];
++    double nat_st0, lif_st0;
+     unsigned char *sp = g_stack + sizeof(g_stack) - 8192;
+     int i, wrote;
+     recomp_func_t lifted = lookup_lifted(va);
+ 
+     for (i = 0; i < 4; i++) args[i] = real_arg(raw[i]);
++    g_this = real_arg(SCRATCH_MARK + 0x2000u);
+ 
+     reset_memory();
+     memset(g_stack, 0xCD, sizeof g_stack);
+@@ -574,7 +603,7 @@ static void run_one(uint32_t va, const uint32_t *raw, int vec, int *shown) {
+     __try { call_native((void *)(uintptr_t)va, args); }
+     __except (EXCEPTION_EXECUTE_HANDLER) { g_faulted = 1; }
+     if (g_faulted) return;          /* not callable with these arguments */
+-    nat_eax = g_nat_eax; nat_edx = g_nat_edx;
++    nat_eax = g_nat_eax; nat_edx = g_nat_edx; nat_st0 = g_nat_st0;
+     memcpy(g_scratch_native, g_scratch, SCRATCH_SIZE);
+ 
+     reset_memory();
+@@ -583,7 +612,8 @@ static void run_one(uint32_t va, const uint32_t *raw, int vec, int *shown) {
+     memset(g_fp_stack, 0, sizeof g_fp_stack);
+     /* one value on the x87 stack, matching the native side's fld */
+     g_fp_top = 7; g_fp_stack[7] = g_fp_arg;
+-    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
++    g_eax = g_edx = g_ebx = g_esi = g_edi = 0;
++    g_ecx = g_this;
+     g_seh_ebp = g_ebp = 0;
+     for (i = 3; i >= 0; i--) { sp -= 4; memcpy(sp, &args[i], 4); }
+     { uint32_t ret = 0xDEADBEEFu; sp -= 4; memcpy(sp, &ret, 4); }
+@@ -598,6 +628,18 @@ static void run_one(uint32_t va, const uint32_t *raw, int vec, int *shown) {
+         return;
+     }
+     wrote = memcmp(g_scratch_native, g_scratch, SCRATCH_SIZE);
++    /* st(0): the x87 return value. The model holds doubles where the x87
++       holds 64-bit significands at PC 53, so equal within rounding. NaN on
++       both sides (an emptied stack reads as the indefinite) counts as equal. */
++    lif_st0 = g_fp_stack[g_fp_top & 7];
++    {
++        int fpbad = 0;
++        if (nat_st0 == nat_st0 || lif_st0 == lif_st0) {
++            double d = fabs(nat_st0 - lif_st0), m = fabs(nat_st0);
++            fpbad = !(d <= 1e-6 * (m > 1.0 ? m : 1.0));
++        }
++        if (fpbad) wrote |= 0x100;
++    }
+     if (nat_eax == g_eax && nat_edx == g_edx && !wrote) return;
+     if (!(*shown)++)
+         printf("FAIL sub_%08X@NL@", va);
+@@ -606,7 +648,9 @@ static void run_one(uint32_t va, const uint32_t *raw, int vec, int *shown) {
+                "         native eax=%08X edx=%08X   lifted eax=%08X edx=%08X@NL@",
+                vec, raw[0], raw[1], raw[2], raw[3],
+                nat_eax, nat_edx, g_eax, g_edx);
+-        if (wrote) {
++        if (wrote & 0x100)
++            printf("         st0 native %.9g lifted %.9g@NL@", nat_st0, lif_st0);
++        if (wrote & 0xFF) {
+             for (i = 0; i < SCRATCH_SIZE; i++)
+                 if (g_scratch_native[i] != g_scratch[i]) {
+                     printf("         scratch+%X: native %02X, lifted %02X@NL@",
+@@ -645,8 +689,15 @@ int main(int argc, char **argv) {
+     if (!map_image(path)) return 2;
+     /* Deterministic, and not all zero: a function that reads it should see
+        something a bug could get wrong. */
+-    for (i = 0; i < SCRATCH_SIZE; i++)
+-        g_scratch_seed[i] = (unsigned char)(i * 7 + 1);
++    /* Mostly floats in [-2.5, 2.5] (Havok and the like read vectors and
++       matrices out of it), with a few small integers among them. */
++    for (i = 0; i < SCRATCH_SIZE / 4; i++) {
++        float f = (float)(((i * 37) % 41) - 20) * 0.125f;
++        uint32_t w;
++        memcpy(&w, &f, 4);
++        if (i % 16 == 3) w = (uint32_t)(i % 5);
++        memcpy(g_scratch_seed + i * 4, &w, 4);
++    }
+     { unsigned short cw = 0x027F; __asm { fldcw cw } }
+     for (i = 0; i < (int)(sizeof g_funcs / sizeof g_funcs[0]); i++) {
+         shown = 0;
 diff --git a/tools/disasm/engine.py b/tools/disasm/engine.py
 index db71403..75ee96c 100644
 --- a/tools/disasm/engine.py
