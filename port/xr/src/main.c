@@ -356,11 +356,21 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
         /* Print native stack return addresses for debugging */
         {
+            /* The image is loaded wherever ASLR puts it: print offsets from
+             * its base (RVAs, as halo2_recomp.map lists them, less 0x1000
+             * for .text there), not absolute addresses. */
+            uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+            uintptr_t end = base + 0x08000000u;
             uintptr_t *sp = (uintptr_t *)CTX_SP(ep->ContextRecord);
-            fprintf(stderr, "  Native stack (first 8 return addrs):\n");
-            for (int i = 0; i < 64 && sp[i]; i++) {
-                if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
-                    fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
+            uintptr_t ip = (uintptr_t)CTX_IP(ep->ContextRecord);
+            int shown = 0;
+            fprintf(stderr, "  Native: image base 0x%llX, fault RVA 0x%llX\n",
+                    (unsigned long long)base, (unsigned long long)(ip - base));
+            fprintf(stderr, "  Native stack (return RVAs):\n");
+            for (int i = 0; i < 512 && shown < 16; i++) {
+                if (sp[i] > base + 0x1000u && sp[i] < end) {
+                    fprintf(stderr, "    [%d] RVA 0x%llX\n", i, (unsigned long long)(sp[i] - base));
+                    shown++;
                 }
             }
         }
