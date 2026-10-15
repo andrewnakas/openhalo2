@@ -7,7 +7,7 @@
   wintool.py key <name> [hold ms]     press and release a key in the focused
                                       window (SendInput, scan codes); names:
                                       a-z 0-9 enter esc space tab back up down
-                                      left right ctrl shift f1 f2 f11 altenter
+                                      left right ctrl shift f1 f2 f9-f12 altenter
   wintool.py click                    left click in the middle of the client area
   wintool.py mouse <dx> <dy> <ms>     move the mouse by (dx, dy) counts spread
                                       over ms milliseconds (relative moves)
@@ -96,7 +96,7 @@ def mouse_event(flags, dx=0, dy=0):
 
 VK = {'enter': 0x0D, 'esc': 0x1B, 'space': 0x20, 'tab': 0x09, 'back': 0x08,
       'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27, 'ctrl': 0x11,
-      'shift': 0x10, 'f1': 0x70, 'f2': 0x71, 'f11': 0x7A}
+      'shift': 0x10, 'f1': 0x70, 'f2': 0x71, 'f11': 0x7A, 'f9': 0x78, 'f10': 0x79, 'f12': 0x7B}
 EXT = {'up', 'down', 'left', 'right'}
 
 
