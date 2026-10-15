@@ -322,6 +322,26 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
             (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
         print_guest_context((void *)CTX_IP(ep->ContextRecord));
+        /* What each register points at, when that is guest RAM: a corrupted
+         * object shows what overwrote it (floats, pixels, a pointer table). */
+        {
+            const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+            const char *nm[6] = { "eax", "ebx", "ecx", "edx", "esi", "edi" };
+            uint32_t rv[6];
+            int r, i;
+            rv[0] = g_eax; rv[1] = g_ebx; rv[2] = g_ecx; rv[3] = g_edx; rv[4] = g_esi; rv[5] = g_edi;
+            for (r = 0; r < 6; r++) {
+                uint32_t a = rv[r] & ~3u;
+                if (!((a >= 0x10000u && a < 0x04000000u - 0x100u)
+                      || (a >= 0x80000000u && a < 0x84000000u - 0x100u)))
+                    continue;           /* RAM, or the contiguous window */
+                fprintf(stderr, "  [%s] 0x%08X:", nm[r], a);
+                for (i = 0; i < 32; i++)
+                    fprintf(stderr, "%s%08X", (i % 8) ? " " : "\n    ",
+                            *(const uint32_t *)(m + a + i * 4));
+                fputc('\n', stderr);
+            }
+        }
         /* The raw guest stack: ebp lives in the lifted function's locals, so
          * the frame (and its arguments) is only reachable through esp. */
         {
