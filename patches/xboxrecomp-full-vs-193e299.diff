@@ -3309,10 +3309,10 @@ index 4ebdfb9..c89dbc2 100644
          memset(Value, 0, ValueLength);
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..ad928ff
+index 0000000..8103423
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,3337 @@
+@@ -0,0 +1,3427 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -5185,6 +5185,8 @@ index 0000000..ad928ff
 +
 +static volatile LONG s_win_redraw;
 +
++static volatile LONG s_win_f12;                 /* F12 pressed: save the next frame */
++
 +static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 +{
 +    switch (m) {
@@ -5205,6 +5207,11 @@ index 0000000..ad928ff
 +        }
 +        if (w == VK_F1) {
 +            win_release_mouse();
++            return 0;
++        }
++        if (w == VK_F12) {                      /* playtest screenshot, see win_draw */
++            if (!(l & (1L << 30)))
++                InterlockedExchange(&s_win_f12, 1);
 +            return 0;
 +        }
 +        if (w == VK_F4 && m == WM_SYSKEYDOWN)
@@ -5286,6 +5293,100 @@ index 0000000..ad928ff
 +    return DefWindowProcA(h, m, w, l);
 +}
 +
++/* The back buffer (client size) as a 24-bit BMP. */
++static void win_save_bmp(const char *path, int cw, int ch)
++{
++    uint32_t row = ((uint32_t)cw * 3u + 3u) & ~3u;
++    uint32_t img = row * (uint32_t)ch, total = 54u + img;
++    uint8_t hdr[54], *px = (uint8_t *)malloc(img);
++    FILE *f = px ? fopen(path, "wb") : NULL;
++    if (f) {
++        memset(hdr, 0, sizeof hdr);
++        hdr[0] = 'B'; hdr[1] = 'M';
++        memcpy(hdr + 2, &total, 4);
++        hdr[10] = 54; hdr[14] = 40;
++        memcpy(hdr + 18, &cw, 4);
++        memcpy(hdr + 22, &ch, 4);
++        hdr[26] = 1; hdr[28] = 24;
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++        glReadBuffer(GL_BACK);
++        glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++        glReadPixels(0, 0, cw, ch, 0x80E0 /* GL_BGR */, GL_UNSIGNED_BYTE, px);
++        fwrite(hdr, 1, sizeof hdr, f);
++        fwrite(px, 1, img, f);
++        fclose(f);
++        fprintf(stderr, "[WIN] wrote %s (%dx%d) at flip %u\n", path, cw, ch, s_flip);
++    }
++    free(px);
++}
++
++/* Playtest aid: the shown frame shrunk to 32x24 twice a second; a picture
++ * that stays black (mean luma under 3 of 255) for more than half a second is
++ * logged as "[BLACK] start", with the time and flip, and "[BLACK] end" with
++ * how long it lasted, so a report of "the screen went black" can be found
++ * in halo2_recomp.log. A tiny blit and read, not a full download. */
++static void win_black_watch(GLuint fbo, int idx)
++{
++    static GLuint bfbo, btex;
++    static unsigned calls;
++    static int black_checks;
++    static double black_since;
++    uint8_t px[32 * 24 * 4];
++    double now, sum = 0.0;
++    int i;
++
++    if (++calls % 15)
++        return;
++    if (!bfbo) {
++        glGenTextures(1, &btex);
++        glBindTexture(GL_TEXTURE_2D, btex);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 32, 24, 0, GL_RGBA,
++                     GL_UNSIGNED_BYTE, NULL);
++        glGenFramebuffers(1, &bfbo);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, bfbo);
++        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                               GL_TEXTURE_2D, btex, 0);
++    }
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
++    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                           GL_TEXTURE_2D, s_win.tex[idx], 0);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, bfbo);
++    glBlitFramebuffer(0, 0, s_win.tw[idx], s_win.th[idx], 0, 0, 32, 24,
++                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, bfbo);
++    glPixelStorei(GL_PACK_ALIGNMENT, 4);
++    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++    glReadPixels(0, 0, 32, 24, GL_RGBA, GL_UNSIGNED_BYTE, px);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++    for (i = 0; i < 32 * 24; i++)
++        sum += 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
++    sum /= 32 * 24;
++    now = now_us() / 1e6;
++    {
++        static int trace = -1;
++        if (trace < 0)
++            trace = getenv("RECOMP_BLACK_TRACE") != NULL;
++        if (trace)
++            fprintf(stderr, "[BLACK] check flip %u mean %.1f\n", s_flip, sum);
++    }
++    if (sum < 3.0) {
++        if (black_checks++ == 0)
++            black_since = now;
++        if (black_checks == 2) {
++            SYSTEMTIME t;
++            GetLocalTime(&t);
++            fprintf(stderr, "[BLACK] start %02d:%02d:%02d flip %u (mean luma %.1f)\n",
++                    t.wHour, t.wMinute, t.wSecond, s_flip, sum);
++        }
++    } else {
++        if (black_checks >= 2)
++            fprintf(stderr, "[BLACK] end flip %u after %.1f s (mean luma now %.1f)\n",
++                    s_flip, now - black_since, sum);
++        black_checks = 0;
++    }
++}
++
 +/* The largest 4:3 rectangle in the client area, into the back buffer. Guest
 + * row 0 is texture row 0, and GL's window origin is the bottom left, so the
 + * destination runs top to bottom. */
@@ -5315,11 +5416,15 @@ index 0000000..ad928ff
 +                          x0, y0 + dh, x0 + dw, y0,
 +                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
 +    }
++    if (idx >= 0 && s_win.tex[idx])
++        win_black_watch(fbo, idx);
 +    /* RECOMP_WINDOW_SHOT=<file>: while <file>.req exists, write what is
 +     * about to be swapped (the back buffer, client size) to <file> as a BMP
-+     * and remove the request. */
++     * and remove the request. F12 writes halo2_shot_NNN.bmp beside the
++     * program (the working directory) and logs the flip. */
 +    {
 +        static const char *shot = (const char *)-1;
++        static int shots;
 +        if (shot == (const char *)-1)
 +            shot = getenv("RECOMP_WINDOW_SHOT");
 +        if (shot) {
@@ -5328,33 +5433,18 @@ index 0000000..ad928ff
 +            snprintf(req, sizeof req, "%s.req", shot);
 +            f = fopen(req, "rb");
 +            if (f) {
-+                uint32_t row = ((uint32_t)cw * 3u + 3u) & ~3u;
-+                uint32_t img = row * (uint32_t)ch, total = 54u + img;
-+                uint8_t hdr[54], *px = (uint8_t *)malloc(img);
 +                fclose(f);
 +                remove(req);
-+                f = px ? fopen(shot, "wb") : NULL;
-+                if (f) {
-+                    memset(hdr, 0, sizeof hdr);
-+                    hdr[0] = 'B'; hdr[1] = 'M';
-+                    memcpy(hdr + 2, &total, 4);
-+                    hdr[10] = 54; hdr[14] = 40;
-+                    memcpy(hdr + 18, &cw, 4);
-+                    memcpy(hdr + 22, &ch, 4);
-+                    hdr[26] = 1; hdr[28] = 24;
-+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-+                    glReadBuffer(GL_BACK);
-+                    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-+                    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-+                    glReadPixels(0, 0, cw, ch, 0x80E0 /* GL_BGR */,
-+                                 GL_UNSIGNED_BYTE, px);
-+                    fwrite(hdr, 1, sizeof hdr, f);
-+                    fwrite(px, 1, img, f);
-+                    fclose(f);
-+                    fprintf(stderr, "[WIN] wrote %s (%dx%d)\n", shot, cw, ch);
-+                }
-+                free(px);
++                win_save_bmp(shot, cw, ch);
 +            }
++        }
++        if (InterlockedExchange(&s_win_f12, 0)) {
++            char name[64];
++            SYSTEMTIME t;
++            GetLocalTime(&t);
++            snprintf(name, sizeof name, "halo2_shot_%03d.bmp", ++shots);
++            fprintf(stderr, "[SHOT] F12 at %02d:%02d:%02d\n", t.wHour, t.wMinute, t.wSecond);
++            win_save_bmp(name, cw, ch);
 +        }
 +    }
 +    SwapBuffers(s_win.hdc);

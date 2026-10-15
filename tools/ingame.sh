@@ -6,6 +6,7 @@
 # appending to <outdir>/pad.txt and grab frames with tools/shot.sh.
 # SHOTS=1 in the environment saves a PNG at every step (m_<step>.png).
 # STEP (7 s between presses), SHOLD/AHOLD (hold ms), TITLE_FLIPS, LOADWAIT
+# LEVEL_KEYS picks a level (see below);
 # tune it; at software speed use STEP=25 SHOLD=3000 AHOLD=3000 TITLE_FLIPS=600.
 # A boot whose pad is dead (it happens) stops with "pad press not consumed".
 OUT=$1; WD=$2; shift 2
@@ -38,6 +39,10 @@ for n in profile nosignin campaign newcampaign level difficulty; do
       r=$(python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');v=[sum(im.crop((405,y-5,435,y+5)).getdata()) for y in (287,315,343,371,399)];print(v.index(max(v)))" "$OUT/row.png")
       [ "$r" = 0 ] && break; echo "up:150" >> "$OUT/pad.txt"; sleep 2
     done; mark before_campaign
+  fi
+  # LEVEL_KEYS="right,right,down": d-pad moves on Select Level before choosing (default: first level)
+  if [ $n = level ] && [ -n "$LEVEL_KEYS" ]; then
+    for k in ${LEVEL_KEYS//,/ }; do echo "$k:500" >> "$OUT/pad.txt"; sleep 2; done; mark level_moved
   fi
   echo "a:${AHOLD:-300}" >> "$OUT/pad.txt"; sleep $S; mark "after_$n"
 done
