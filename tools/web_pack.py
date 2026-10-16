@@ -28,7 +28,7 @@ import shutil
 import sys
 
 ALWAYS = {"mainmenu", "shared", "single_player_shared"}
-PAGE = ["halo2.js", "halo2.wasm", "input.js", "audio.js", "net.js"]
+PAGE = ["halo2.js", "halo2.wasm", "input.js", "audio.js", "net.js", "h2net.js"]
 
 
 def main():

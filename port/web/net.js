@@ -10,6 +10,11 @@
 //                          origin, no server at all (the default room is "lan")
 //   ?link=ws://host/path   WebSocket, one binary message per frame; the relay
 //                          forwards each message to everyone else in the room
+//   ?link=room:<code>      online system link: peer to peer over WebRTC data
+//                          channels with everyone in room <code>, native copies
+//                          included (net/h2net.js; the skatemods relay only
+//                          introduces the peers). RTCPeerConnection exists only
+//                          on the page, so the worker hands frames across.
 // Without ?link the game has a cable with nothing on the other end.
 // The game tells stations apart by Ethernet address only (its packets all
 // carry the address 0.0.0.1), so a hub that floods is all it needs.
@@ -46,12 +51,15 @@
     }
     onmessage = (e) => {
       const m = e.data;
+      if (m.rx) { deliver(new Uint8Array(m.rx)); return; }   // from the page's WebRTC mesh
       head = new Uint32Array(m.sab, m.ptr, 8);
       headI = new Int32Array(m.sab, m.ptr, 8);    // Atomics.waitAsync takes signed views only
       size = head[4]; mask = size - 1;
       tx = new Uint8Array(m.sab, m.ptr + 32, size);
       rx = new Uint8Array(m.sab, m.ptr + 32 + size, size);
-      if (m.link.startsWith('ws')) {
+      if (m.link.startsWith('room:')) {
+        send = (f) => postMessage({ tx: f.buffer }, [f.buffer]);
+      } else if (m.link.startsWith('ws')) {
         let ws = null;
         const open = () => {
           ws = new WebSocket(m.link);
@@ -81,7 +89,18 @@
     if (!ptr) { console.log('link: this build has no network ring'); return; }
     started = true;
     const w = new Worker(URL.createObjectURL(new Blob([WORKER], { type: 'text/javascript' })));
+    let mesh = null;
+    if (link.startsWith('room:')) {
+      import('./h2net.js').then(({ H2Net }) => {
+        mesh = new H2Net();
+        mesh.onframe = (f) => { const c = f.slice(); w.postMessage({ rx: c.buffer }, [c.buffer]); };
+        mesh.open(link.slice(5));
+        window.h2mesh = mesh;
+        console.log('link: online room "' + link.slice(5) + '"');
+      }).catch((err) => console.log('link: h2net.js failed: ' + err));
+    }
     w.onmessage = (e) => {
+      if (e.data.tx) { if (mesh) mesh.send(new Uint8Array(e.data.tx)); return; }
       if (e.data.log) console.log(e.data.log);
       if (e.data.stats) {
         window.h2link = e.data.stats;
