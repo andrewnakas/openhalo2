@@ -11576,10 +11576,39 @@ index e7ab880..8ddcb89 100644
              return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
          if m == "frndint":
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 3cd9250..b5a5098 100644
+index 3cd9250..d888aab 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -1316,6 +1316,7 @@ class FunctionTranslator:
+@@ -245,6 +245,19 @@ def _fixup_icall_esp_save(lines):
+         if 0 < sum("PUSH32(esp, %s)" % reg in line for line in lines)
+         <= sum("POP32(esp, %s)" % reg in line for line in lines)
+     )
++    # A register pushed more often than popped is both saved and passed:
++    # Halo 2's 0x2DBE10 does `push esi; push edi; mov edi, [ebp+0x10];
++    # push edi` before a virtual call. Its first Q pushes in program order
++    # (Q = pops) are the saves, the later ones arguments; absorbing the save
++    # rewound a failed call over it, and the epilogue then popped esi's slot
++    # into edi -- the Cairo Station door crash.
++    first_saves = set()
++    for reg in ("ebx", "esi", "edi", "ebp"):
++        pops = sum("POP32(esp, %s)" % reg in line for line in lines)
++        pushes = [k for k, line in enumerate(lines)
++                  if line.strip().startswith("PUSH32(esp, %s)" % reg)]
++        if pops and len(pushes) > pops:
++            first_saves.update(pushes[:pops])
+     result = []
+     # Find indices of all ICALL_SAFE lines
+     icall_indices = []
+@@ -278,7 +291,7 @@ def _fixup_icall_esp_save(lines):
+                 break
+             # A saved callee-saved register belongs to this function's frame,
+             # not to the call's arguments; the run ends here.
+-            if any(stripped.startswith(save) for save in saves):
++            if any(stripped.startswith(save) for save in saves) or j in first_saves:
+                 break
+             # Check if this is a PUSH32 line (arg push)
+             if stripped.startswith('PUSH32(esp,'):
+@@ -1316,6 +1329,7 @@ class FunctionTranslator:
          """Read the contiguous pointer cluster around an indexed-jump base."""
          def scan(step, first):
              targets = []
@@ -11587,7 +11616,7 @@ index 3cd9250..b5a5098 100644
              for index in range(first, max_entries + first):
                  entry_va = table_va + step * index * 4
                  if min_entry_va is not None and entry_va < min_entry_va:
-@@ -1324,8 +1325,14 @@ class FunctionTranslator:
+@@ -1324,8 +1338,14 @@ class FunctionTranslator:
                  if offset is None or offset + 4 > len(self.xbe_data):
                      break
                  target = struct.unpack_from('<I', self.xbe_data, offset)[0]
@@ -11602,7 +11631,7 @@ index 3cd9250..b5a5098 100644
                  targets.append(target)
              return targets
  
-@@ -1377,6 +1384,9 @@ class FunctionTranslator:
+@@ -1377,6 +1397,9 @@ class FunctionTranslator:
              m = insn.mnemonic
              if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr"):
                  return True

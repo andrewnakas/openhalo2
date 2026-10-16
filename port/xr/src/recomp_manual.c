@@ -45,7 +45,9 @@ typedef void (*recomp_func_t)(void);
 
 /* ── Register state (defined in xbox_memory_layout.c) ──────── */
 
-extern uint32_t g_eax;
+#include <windows.h>   /* __try / EXCEPTION_EXECUTE_HANDLER in the not-code log */
+/* Per-thread, as defined (RECOMP_TLS): a plain extern reads the wrong memory. */
+extern __declspec(thread) uint32_t g_eax, g_ecx, g_esp;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── Manual function overrides ─────────────────────────────── */
@@ -169,7 +171,40 @@ void recomp_icall_not_code_log(uint32_t va)
                     "(null or wild function pointer, at call #%llu)\n",
             va, (unsigned long long)hits[i],
             (unsigned long long)g_icall_count);
-    fflush(stderr);
+    /* Where, and through what: the call pushed its return address, and a
+     * virtual call has the object in ecx and the table at [ecx]. The first
+     * dozen get the object, its table and the guest stack's return addresses,
+     * which is what names the class whose table holds the bad entry. */
+    {
+        static int ctx;
+        if (ctx++ < 12) {
+            extern ptrdiff_t g_xbox_mem_offset;
+            uint32_t w[16];
+            uint32_t vt = 0;
+            int k;
+            #define NC_RD(a, dst) __try { dst = *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + (uint32_t)(a)); } \
+                                  __except (EXCEPTION_EXECUTE_HANDLER) { dst = 0xBAADF00Du; }
+            NC_RD(g_esp, w[0]);
+            fprintf(stderr, "  [ICALL] from return 0x%08X, ecx=0x%08X eax=0x%08X esp=0x%08X\n",
+                    w[0], g_ecx, g_eax, g_esp);
+            for (k = 0; k < 16; k++) NC_RD(g_ecx + 4 * k, w[k]);
+            vt = w[0];
+            fprintf(stderr, "  [ICALL] [ecx]:");
+            for (k = 0; k < 16; k++) fprintf(stderr, " %08X", w[k]);
+            for (k = 0; k < 12; k++) NC_RD(vt + 4 * k, w[k]);
+            fprintf(stderr, "\n  [ICALL] [[ecx]]:");
+            for (k = 0; k < 12; k++) fprintf(stderr, " %08X", w[k]);
+            fprintf(stderr, "\n  [ICALL] stack code words:");
+            for (k = 0, i = 0; k < 256 && i < 10; k++) {
+                uint32_t v;
+                NC_RD(g_esp + 4 * k, v);
+                if (v >= 0x00011000u && v < 0x00460000u) { fprintf(stderr, " +%X:%08X", 4 * k, v); i++; }
+            }
+            fprintf(stderr, "\n");
+            #undef NC_RD
+            fflush(stderr);
+        }
+    }
 }
 
 /* ── Untranslated instructions ───────────────────────────────────────────
