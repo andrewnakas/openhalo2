@@ -133,3 +133,19 @@ endif()
 #     ENABLE_ICALL_TRACE=1
 #     VERBOSE_KERNEL_LOG=1
 # )
+
+# Online system link (net/h2net.c, libdatachannel from vcpkg, static).
+# Built in when the vcpkg tree is there; RECOMP_NET_ROOM picks a room at run time.
+set(H2NET_VCPKG "D:/n64work/vcpkg/installed/x64-windows-static" CACHE PATH "vcpkg tree with libdatachannel")
+option(OPENHALO2_NET "Online system link transport" ON)
+if(WIN32 AND OPENHALO2_NET AND EXISTS "${H2NET_VCPKG}/lib/datachannel.lib")
+    target_sources(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../net/h2net.c)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE OPENHALO2_NET=1 RTC_STATIC=1)
+    target_include_directories(${PROJECT_NAME} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../net ${H2NET_VCPKG}/include)
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        ${H2NET_VCPKG}/lib/datachannel.lib ${H2NET_VCPKG}/lib/juice.lib
+        ${H2NET_VCPKG}/lib/usrsctp.lib ${H2NET_VCPKG}/lib/libssl.lib
+        ${H2NET_VCPKG}/lib/libcrypto.lib iphlpapi crypt32 bcrypt user32 advapi32)
+    message(STATUS "Online system link: libdatachannel from ${H2NET_VCPKG}")
+endif()

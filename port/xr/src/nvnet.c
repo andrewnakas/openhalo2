@@ -461,6 +461,16 @@ void recomp_nic_write(uint32_t va, uint32_t val, int size)
 static SOCKET s_sock = INVALID_SOCKET;
 static int s_my_port;
 
+/* Online system link (net/h2net.c): with a room code (RECOMP_NET_ROOM, or
+ * `room = ...` in halo2.ini) the frames go peer to peer over WebRTC data
+ * channels to everyone in that room, browsers included; the skatemods room
+ * relay only introduces the peers. RECOMP_NET_RELAY overrides the relay URL.
+ * Without a code: the local hub below, as before. */
+#ifdef OPENHALO2_NET
+#include "h2net.h"
+static int s_online;
+#endif
+
 static void hub_open(void)
 {
     const char *e = getenv("RECOMP_NIC_HUB");
@@ -470,6 +480,20 @@ static void hub_open(void)
 
     if (e && *e == '0')
         return;
+#ifdef OPENHALO2_NET
+    {
+        const char *room = getenv("RECOMP_NET_ROOM");
+        if (room && *room) {
+            if (h2net_open(room, getenv("RECOMP_NET_RELAY")) == 0) {
+                s_online = 1;
+                fprintf(stderr, "  [NIC] online system link: room %s\n", room);
+            } else {
+                fprintf(stderr, "  [NIC] online room %s could not be opened: no transport\n", room);
+            }
+            return;
+        }
+    }
+#endif
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
         return;
     s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -507,6 +531,12 @@ static void hub_send(const uint8_t *f, uint32_t len)
 {
     int i;
 
+#ifdef OPENHALO2_NET
+    if (s_online) {
+        h2net_send(f, len);
+        return;
+    }
+#endif
     if (s_sock == INVALID_SOCKET)
         return;
     for (i = 0; i < HUB_PORTS; i++) {
@@ -525,6 +555,10 @@ static int hub_recv(uint8_t *f, uint32_t max)
 {
     int n;
 
+#ifdef OPENHALO2_NET
+    if (s_online)
+        return h2net_recv(f, max);
+#endif
     if (s_sock == INVALID_SOCKET)
         return 0;
     /* Every frame goes to all eight hub ports, and Windows reports each send

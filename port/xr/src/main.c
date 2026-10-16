@@ -653,6 +653,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             { "fullscreen", "RECOMP_FULLSCREEN" },   { "mouse_sens", "RECOMP_MOUSE_SENS" },
             { "mouse_deadzone", "RECOMP_MOUSE_DEADZONE" }, { "volume_db", "RECOMP_APU_GAIN_DB" },
             { "debug_keys", "RECOMP_DEBUG_KEYS" },   { "log_cap_mb", "RECOMP_LOG_CAP_MB" },
+            { "room", "RECOMP_NET_ROOM" },          { "relay", "RECOMP_NET_RELAY" },
         };
         FILE *ini = fopen("halo2.ini", "r");
         char line[512];
