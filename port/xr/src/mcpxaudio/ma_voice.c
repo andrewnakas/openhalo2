@@ -300,8 +300,8 @@ again:
  * bytes). */
 static void hrtf_coefs(ma_state *s, int entry, float c[2][31], int *itd)
 {
-    uint32_t base = s->reg[R_HRTF_TARGET / 4];
-    const uint8_t *p = ma_pa(s, base + (uint32_t)(entry & 0x7F) * 0x40u);
+    const uint8_t *p = s->hrtf_tab[entry & 0xFF];
+    double n = 0;
     int k, ch;
     for (k = 0; k < 31; k++)
         for (ch = 0; ch < 2; ch++) {
@@ -309,16 +309,45 @@ static void hrtf_coefs(ma_state *s, int entry, float c[2][31], int *itd)
             float x = (float)(b & 0x7F) / 128.0f;
             c[ch][k] = (b & 0x80) ? -x : x;
         }
-    *itd = (int16_t)(p[62] | (p[63] << 8));
-    for (ch = 0; ch < 2; ch++) {
-        double n = 0;
-        for (k = 0; k < 31; k++)
-            n += s->hrtf_norm == 1 ? fabs(c[ch][k]) : (double)c[ch][k] * c[ch][k];
-        if (s->hrtf_norm == 2) n = sqrt(n);
-        if (s->hrtf_norm && n > 1e-6)
+    /* byte 63: interaural delay, signed, in half samples (matched against
+     * the oracle's [APUH] "itd" print: 42 -> 21.0, 252 -> -2.0) */
+    *itd = (int8_t)p[63];
+    /* gain: raw (/128), or one scale for both ears so the level difference
+     * between them stays: l1 (sum |c| = 1 on the louder ear) or the default,
+     * unit RMS over both ears */
+    if (s->hrtf_norm == 0)
+        return;
+    if (s->hrtf_norm == 1) {
+        double l[2] = { 0, 0 };
+        for (ch = 0; ch < 2; ch++)
+            for (k = 0; k < 31; k++)
+                l[ch] += fabs(c[ch][k]);
+        n = l[0] > l[1] ? l[0] : l[1];
+    } else if (s->hrtf_norm == 5) {
+        /* each ear to unit RMS on its own */
+        for (ch = 0; ch < 2; ch++) {
+            double e = 0;
+            for (k = 0; k < 31; k++)
+                e += (double)c[ch][k] * c[ch][k];
+            e = sqrt(e);
+            if (e > 1e-6)
+                for (k = 0; k < 31; k++)
+                    c[ch][k] = (float)(c[ch][k] / e);
+        }
+        return;
+    } else {
+        double e[2] = { 0, 0 };
+        for (ch = 0; ch < 2; ch++)
+            for (k = 0; k < 31; k++)
+                e[ch] += (double)c[ch][k] * c[ch][k];
+        n = s->hrtf_norm == 3 ? sqrt(e[0] > e[1] ? e[0] : e[1])
+          : s->hrtf_norm == 4 ? sqrt(e[0] + e[1])
+          : sqrt((e[0] + e[1]) / 2.0);
+    }
+    if (n > 1e-6)
+        for (ch = 0; ch < 2; ch++)
             for (k = 0; k < 31; k++)
                 c[ch][k] = (float)(c[ch][k] / n);
-    }
 }
 
 /* ---- one voice, one frame ---------------------------------------------------- */
@@ -406,7 +435,8 @@ void ma_render_voice(ma_state *s, int v, int list)
         int sb = (int)((fmt >> 16) & 31);
         for (n = 0; n < MA_FRAME; n++) {
             src[n][0] = src[n][1] = s->bin[sb][n];
-            s->bin[sb][n] = 0;
+            if (s->mp_mode == 0)
+                s->bin[sb][n] = 0;
         }
         fi.ch = 1;
     } else {
@@ -449,7 +479,7 @@ void ma_render_voice(ma_state *s, int v, int list)
                     if (c) tf = fopen(c + 1, "wb");
                 }
             }
-            if (v == tv && tf) {
+            if (v == tv && tf && !s->index) {
                 fwrite(src, sizeof(float), 2 * MA_FRAME, tf);
                 fflush(tf);
             }
@@ -464,13 +494,15 @@ void ma_render_voice(ma_state *s, int v, int list)
         hrtf_coefs(s, (int)(vc->snap[D_HRTF / 4] & 0xFFFF), c, &itd);
         for (n = 0; n < MA_FRAME; n++) {
             float acc0 = 0, acc1 = 0;
+            int dl = itd > 0 ? (itd + 1) / 2 : 0, dr = itd < 0 ? (-itd + 1) / 2 : 0;
+            if (!s->hrtf_itd) dl = dr = 0;
+            else if (s->hrtf_itd < 0) { int t2 = dl; dl = dr; dr = t2; }
             vc->fir_hist[vc->fir_pos] = src[n][0];
             for (k = 0; k < 31; k++) {
-                float x = vc->fir_hist[(vc->fir_pos - k) & 63];
-                acc0 += c[0][k] * x;
-                acc1 += c[1][k] * x;
+                acc0 += c[0][k] * vc->fir_hist[(vc->fir_pos - k - dl) & 127];
+                acc1 += c[1][k] * vc->fir_hist[(vc->fir_pos - k - dr) & 127];
             }
-            vc->fir_pos = (vc->fir_pos + 1) & 63;
+            vc->fir_pos = (vc->fir_pos + 1) & 127;
             out[0][n] = acc0;
             out[1][n] = acc1;
         }
@@ -509,14 +541,12 @@ void ma_render_voice(ma_state *s, int v, int list)
 
 /* ---- one frame -------------------------------------------------------------- */
 
-void ma_process_frame(ma_state *s)
+/* walks the three lists in order; pass 0 = every voice, pass 1 = all but the
+ * multipass (bin-reading) voices, pass 2 = only those */
+static void walk(ma_state *s, int pass)
 {
-    static uint32_t stamp[MA_VOICES], gen;
+    uint32_t *stamp = s->stamp, gen = ++s->gen;
     int list;
-
-    tables();
-    memset(s->bin, 0, sizeof s->bin);
-    gen++;
     for (list = 0; list < 3; list++) {
         uint32_t v = s->reg[R_LIST_TOP(list) / 4] & 0xFFFF;
         int guard = 0;
@@ -526,10 +556,25 @@ void ma_process_frame(ma_state *s)
                 break;                          /* a loop in the links */
             stamp[v] = gen;
             next = ma_desc(s, (int)v, D_LINK) & 0xFFFF;
-            if ((s->v[v].state & ST_ACTIVE) && !s->v[v].paused)
-                ma_render_voice(s, (int)v, list);
+            if ((s->v[v].state & ST_ACTIVE) && !s->v[v].paused) {
+                int mp = (ma_rd32(s, s->reg[R_DESC_BASE / 4] + v * 0x80u + D_FORMAT) & F_MULTIPASS) != 0;
+                if (pass == 0 || (pass == 1 && !mp) || (pass == 2 && mp))
+                    ma_render_voice(s, (int)v, list);
+            }
             v = next;
         }
+    }
+}
+
+void ma_process_frame(ma_state *s)
+{
+    tables();
+    memset(s->bin, 0, sizeof s->bin);
+    if (s->mp_mode == 1) {
+        walk(s, 1);
+        walk(s, 2);
+    } else {
+        walk(s, 0);
     }
     s->frames++;
     s->sample_count += MA_FRAME;

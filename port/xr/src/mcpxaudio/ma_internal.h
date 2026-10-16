@@ -114,7 +114,7 @@ typedef struct ma_voice {
     int      aenv_count;
     float    aenv_level;        /* 0..1                                     */
     /* HRTF FIR history (mono in) */
-    float    fir_hist[64];
+    float    fir_hist[128];
     int      fir_pos;
     /* bookkeeping */
     uint32_t frames_played;
@@ -143,6 +143,10 @@ typedef struct ma_tap {
 
 struct ma_state {
     int       mode;
+    char      cfg[512];         /* "NAME=value;..." overrides of getenv     */
+    int       index;            /* 0 = first shadow (the one that checks)  */
+    uint32_t  stamp[MA_VOICES], gen;
+    int       tap_tried;
     uint8_t  *phys;             /* host address of guest physical 0         */
     uint32_t  reg[0x30000 / 4];
     /* private copy of descriptor words for HW-owned fields */
@@ -151,6 +155,7 @@ struct ma_state {
     uint32_t  antecedent;
     uint32_t  seg_window;
     uint32_t  hrtf_sel;
+    uint8_t   hrtf_tab[256][64];  /* HRTF entries as the methods wrote them   */
     uint32_t  page_index;
     /* front-end trap queue (voice-ended reports) */
     uint32_t  trapq[512];
@@ -186,11 +191,16 @@ struct ma_state {
     int       interp;           /* 0 linear, 1 hermite                     */
     int       hrtf_norm;        /* 0 raw, 1 l1, 2 rms                      */
     int       hrtf_on;
+    int       mp_mode;          /* RECOMP_MA_MP_MODE: 0 in list order, a read empties the bin;
+                                 * 1 all other voices first, reads keep the bin; 2 list order, keep */
+    int       hrtf_itd;         /* RECOMP_MA_HRTF_ITD: 1 left on +, -1 right on +, 0 off */
     double    t0;
     uint64_t  st_pause_frames;
 };
 
 /* ma_regs.c */
+const char *ma_getenv(ma_state *s, const char *name);
+ma_state *ma_create_cfg(int mode, const char *cfg, int index);
 uint8_t *ma_pa(ma_state *s, uint32_t pa);                 /* host pointer */
 uint32_t ma_rd32(ma_state *s, uint32_t pa);
 void     ma_wr32(ma_state *s, uint32_t pa, uint32_t v);

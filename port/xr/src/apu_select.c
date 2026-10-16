@@ -35,6 +35,8 @@ extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr, uint32_t xb
 
 static int s_old_live;          /* the previous model answers */
 static ma_state *s_new;         /* the clean-room model, live or shadow */
+static ma_state *s_more[4];     /* extra shadows (RECOMP_MA_SHADOWS, RECOMP_MA_CFG<i>) */
+ma_state *ma_create_cfg(int mode, const char *cfg, int index);
 volatile int recomp_apu_on;
 
 /* Called once, where main.c used to call mcpx_apu_init_standalone. */
@@ -47,8 +49,16 @@ int recomp_apu_start(uint8_t *ram_ptr)
     if (!strcmp(impl, "old") || !strcmp(impl, "shadow")) {
         g_apu_state = mcpx_apu_init_standalone(ram_ptr);
         s_old_live = g_apu_state != NULL;
-        if (!strcmp(impl, "shadow") && s_old_live)
-            s_new = ma_create(MA_SHADOW);
+        if (!strcmp(impl, "shadow") && s_old_live) {
+            const char *n = getenv("RECOMP_MA_SHADOWS");
+            int i, k = n ? atoi(n) : 1;
+            s_new = ma_create_cfg(MA_SHADOW, getenv("RECOMP_MA_CFG0"), 0);
+            for (i = 1; i < k && i <= 4; i++) {
+                char name[32];
+                snprintf(name, sizeof name, "RECOMP_MA_CFG%d", i);
+                s_more[i - 1] = ma_create_cfg(MA_SHADOW, getenv(name), i);
+            }
+        }
         recomp_apu_on = s_old_live;
         fprintf(stderr, "[BOOT] APU: previous model%s\n", s_new ? " + clean-room shadow" : "");
         return s_old_live;
@@ -78,8 +88,13 @@ void recomp_apu_write(uint32_t off, uint32_t val, int size)
 #ifdef OPENHALO2_OLD_APU
     if (s_old_live) {
         mcpx_apu_mmio_write(g_apu_state, off, val, (unsigned)size);
-        if (s_new)
+        if (s_new) {
+            int i;
             ma_write(s_new, off, val, size);
+            for (i = 0; i < 4; i++)
+                if (s_more[i])
+                    ma_write(s_more[i], off, val, size);
+        }
         return;
     }
 #endif

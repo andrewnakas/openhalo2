@@ -133,7 +133,7 @@ static void shadow_check(ma_state *s, uint64_t block)
     uint32_t base = s->reg[R_DESC_BASE / 4];
     int v;
 
-    if (s->mode != MA_SHADOW || !base || lines > 400)
+    if (s->mode != MA_SHADOW || !base || lines > 400 || s->index)
         return;
     if (getenv("RECOMP_MA_WATCHRAM")) {
         /* which descriptor words change between blocks while no voice
@@ -330,9 +330,9 @@ static DWORD WINAPI frame_thread(LPVOID arg)
         timer = CreateWaitableTimerW(NULL, FALSE, NULL);
     t_report = t_last = t_chg = now_s();
     {
-        const char *e = getenv("RECOMP_MA_LOCK");
+        const char *e = ma_getenv(s, "RECOMP_MA_LOCK");
         lock_live = s->mode == MA_SHADOW && e && *e == '1';  /* off by default: it can drop blocks */
-        e = getenv("RECOMP_MA_BURST");
+        e = ma_getenv(s, "RECOMP_MA_BURST");
         /* 8 frames back to back once per block (what the previous model does,
          * so voice starts and stops land on the same block boundaries), or
          * one frame at a time at 1500 Hz with RECOMP_MA_BURST=0 */

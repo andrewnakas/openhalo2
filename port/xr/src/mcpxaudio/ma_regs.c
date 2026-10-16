@@ -168,13 +168,40 @@ static void voice_off(ma_state *s, uint32_t val)
 
 /* ---- creation ------------------------------------------------------------ */
 
-static int env_int(const char *name, int dflt)
+/* getenv, unless this instance's cfg string names the variable */
+const char *ma_getenv(ma_state *s, const char *name)
 {
-    const char *e = getenv(name);
+    static __declspec(thread) char val[512];
+    size_t n = strlen(name);
+    const char *p = s ? s->cfg : NULL;
+    while (p && *p) {
+        const char *end = strchr(p, ';');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len > n && !strncmp(p, name, n) && p[n] == '=') {
+            size_t vl = len - n - 1;
+            if (vl >= sizeof val) vl = sizeof val - 1;
+            memcpy(val, p + n + 1, vl);
+            val[vl] = 0;
+            return val;
+        }
+        p = end ? end + 1 : NULL;
+    }
+    return getenv(name);
+}
+
+#define env_int(name, dflt) env_int_(s, name, dflt)
+static int env_int_(ma_state *s, const char *name, int dflt)
+{
+    const char *e = ma_getenv(s, name);
     return (e && *e) ? (int)strtol(e, NULL, 0) : dflt;
 }
 
 ma_state *ma_create(int mode)
+{
+    return ma_create_cfg(mode, NULL, 0);
+}
+
+ma_state *ma_create_cfg(int mode, const char *cfg, int index)
 {
     ma_state *s = (ma_state *)calloc(1, sizeof *s);
     const char *e;
@@ -183,6 +210,9 @@ ma_state *ma_create(int mode)
     if (!s)
         return NULL;
     s->mode = mode;
+    s->index = index;
+    if (cfg)
+        strncpy(s->cfg, cfg, sizeof s->cfg - 1);
     s->phys = (uint8_t *)((uintptr_t)0x80000000u + xbox_GetMemoryOffset());
     for (i = 0; i < 3; i++)
         s->reg[R_LIST_TOP(i) / 4] = s->reg[R_LIST_TOP(i) / 4 + 1] = s->reg[R_LIST_TOP(i) / 4 + 2] = 0xFFFF;
@@ -190,14 +220,18 @@ ma_state *ma_create(int mode)
         s->v[i].blk_id = -1;
     s->adpcm_spb = env_int("RECOMP_MA_ADPCM_SPB", 64);
     s->interp = env_int("RECOMP_MA_INTERP", 1);
-    e = getenv("RECOMP_APU_HRTF_GAIN");
-    s->hrtf_norm = (e && !strcmp(e, "raw")) ? 0 : (e && !strcmp(e, "l1")) ? 1 : 2;
+    e = ma_getenv(s, "RECOMP_APU_HRTF_GAIN");
+    s->hrtf_norm = (e && !strcmp(e, "raw")) ? 0 : (e && !strcmp(e, "l1")) ? 1
+                 : (e && !strcmp(e, "max")) ? 3 : (e && !strcmp(e, "sum")) ? 4
+                 : (e && !strcmp(e, "ear")) ? 5 : (e && !strcmp(e, "rms")) ? 2 : 4;
     s->hrtf_on = env_int("RECOMP_APU_HRTF", 1);
+    s->hrtf_itd = env_int("RECOMP_MA_HRTF_ITD", -1);
+    s->mp_mode = env_int("RECOMP_MA_MP_MODE", 0);
     s->report_bins = env_int("RECOMP_APU_BINS", 0);
     s->report_voices = env_int("RECOMP_APU_VOICES", 0);
-    e = getenv("RECOMP_APU_DSP_ACK_GPS");
+    e = ma_getenv(s, "RECOMP_APU_DSP_ACK_GPS");
     s->gps_ack = e ? (uint32_t)strtoul(e, NULL, 0) : 0x810;
-    e = getenv("RECOMP_APU_DSP_SENTINEL");
+    e = ma_getenv(s, "RECOMP_APU_DSP_SENTINEL");
     if (e && *e && strcmp(e, "0")) {
         const char *c = strchr(e, ',');
         s->sentinel_ptr = (uint32_t)strtoul(e, NULL, 0);
@@ -309,6 +343,7 @@ static void method(ma_state *s, uint32_t m, uint32_t val)
     }
     if (m >= M_HRTF_COEF && m < M_HRTF_COEF + 0x40) {
         uint32_t base = s->reg[R_HRTF_TARGET / 4];
+        memcpy(&s->hrtf_tab[s->hrtf_sel & 0xFF][m - M_HRTF_COEF], &val, 4);
         if (base)
             ma_wr32(s, base + s->hrtf_sel * 0x40u + (m - M_HRTF_COEF), val);
         return;

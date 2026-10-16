@@ -12,9 +12,10 @@
 #include "ma_internal.h"
 #include "apu_xaudio2.h"
 
-static float env_float(const char *n, float d)
+#define env_float(n, d) env_float_(s, n, d)
+static float env_float_(ma_state *s, const char *n, float d)
 {
-    const char *e = getenv(n);
+    const char *e = ma_getenv(s, n);
     return (e && *e) ? (float)atof(e) : d;
 }
 
@@ -35,7 +36,7 @@ void ma_mix_init(ma_state *s)
     s->fold[6][0] = d3; s->fold[7][1] = d3;
     s->fold[8][0] = d3; s->fold[9][1] = d3;
     /* RECOMP_MA_FOLD=b:l:r,b:l:r overrides single bins */
-    e = getenv("RECOMP_MA_FOLD");
+    e = ma_getenv(s, "RECOMP_MA_FOLD");
     while (e && *e) {
         float l, rr;
         if (sscanf(e, "%d:%f:%f", &b, &l, &rr) == 3 && b >= 0 && b < MA_BINS) {
@@ -46,10 +47,10 @@ void ma_mix_init(ma_state *s)
         if (e) e++;
     }
     s->gain = (float)pow(10.0, env_float("RECOMP_APU_GAIN_DB", 0.0f) / 20.0);
-    e = getenv("RECOMP_APU_LIMIT");
+    e = ma_getenv(s, "RECOMP_APU_LIMIT");
     s->limit_mode = !e ? 1 : !strcmp(e, "0") ? 0 : !strcmp(e, "tanh") ? 2 : 1;
     s->lim.gain = 1.0f;
-    e = getenv("RECOMP_APU_REVERB");
+    e = ma_getenv(s, "RECOMP_APU_REVERB");
     s->reverb_on = e ? atoi(e) : 0;
     if (s->reverb_on)
         s->rv = ma_reverb_create();
@@ -106,15 +107,14 @@ static void wav_header(FILE *f, uint32_t frames)
 
 static void tap_open(ma_state *s)
 {
-    const char *e = getenv(s->mode == MA_LIVE ? "RECOMP_APU_WAV" : "RECOMP_MA_WAV");
+    const char *e = ma_getenv(s, s->mode == MA_LIVE ? "RECOMP_APU_WAV" : "RECOMP_MA_WAV");
     char path[512];
     const char *c;
     size_t n;
-    static int tried;
 
-    if (tried || !e || !*e)
+    if (s->tap_tried || !e || !*e)
         return;
-    tried = 1;
+    s->tap_tried = 1;
     c = strchr(e, ',');
     n = c ? (size_t)(c - e) : strlen(e);
     if (n >= sizeof path) n = sizeof path - 1;
