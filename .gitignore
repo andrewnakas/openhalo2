@@ -8,3 +8,4 @@ port/xr/game/
 __pycache__/
 *.pyc
 build/
+tools/import/bin/
