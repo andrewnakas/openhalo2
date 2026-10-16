@@ -311,6 +311,51 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             }
         }
 
+        /* Crash shield. A read or write of a guest address nothing maps --
+         * a pointer the title took from corrupted data -- gets a zeroed page
+         * there and the instruction runs again. Zero is what the title's own
+         * checks look for (null pointer, empty count, NONE datum), so it goes
+         * on the way it does for a missing object instead of ending the
+         * process. Only for faults raised by our own image (lifted code and
+         * the runtime), only inside the guest's 4 GB window and outside the
+         * device registers, bounded, and every one is logged: [RECOVER].
+         * RECOMP_CRASH_SHIELD=0 turns it off. */
+        {
+            static int shield = -1;
+            static uintptr_t img_lo, img_hi;
+            static volatile LONG pages, said;
+            uint32_t xbox_va = (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+            uintptr_t ip = CTX_IP(ep->ContextRecord);
+            if (shield < 0) {
+                const char *e = getenv("RECOMP_CRASH_SHIELD");
+                HMODULE m = GetModuleHandleW(NULL);
+                PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((uint8_t *)m +
+                                       ((PIMAGE_DOS_HEADER)m)->e_lfanew);
+                img_lo = (uintptr_t)m;
+                img_hi = img_lo + nt->OptionalHeader.SizeOfImage;
+                shield = !(e && *e == '0');
+            }
+            if (shield && ip >= img_lo && ip < img_hi
+                    && fault_addr >= (uintptr_t)g_xbox_mem_offset
+                    && fault_addr - (uintptr_t)g_xbox_mem_offset < 0x100000000ull
+                    && xbox_va < 0xF0000000u && pages < 4096) {   /* tiled views and device registers above */
+                void *pg = (void *)(fault_addr & ~(uintptr_t)0xFFF);
+                if (VirtualAlloc(pg, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
+                    LONG k = InterlockedIncrement(&pages);
+                    if (InterlockedIncrement(&said) <= 64) {
+                        fprintf(stderr, "[RECOVER] %s of unmapped guest 0x%08X from RVA 0x%llX "
+                                "(eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X esp=%08X): "
+                                "zero page #%ld, carrying on\n",
+                                ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
+                                xbox_va, (unsigned long long)(ip - img_lo),
+                                g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_esp, (long)k);
+                        fflush(stderr);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)CTX_IP(ep->ContextRecord),
             (unsigned long long)fault_addr,
