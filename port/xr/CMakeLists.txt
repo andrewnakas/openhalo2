@@ -10,6 +10,9 @@ cmake_minimum_required(VERSION 3.20)
 #   4. Add any game-specific compile definitions or link libraries
 # ============================================================================
 
+# Static C runtime: a player needs no Visual C++ redistributable.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 project(halo2_recomp C)
 
 set(CMAKE_C_STANDARD 11)
@@ -54,6 +57,8 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/mmio_direct.c
     src/nvnet.c
+    src/byog.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/import/h2import.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -75,6 +80,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
 # Include paths for generated recomp headers
 target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/import
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
     ${XBOXRECOMP_DIR}/include
@@ -91,6 +97,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     # function's symbol, i.e. to the guest function that faulted.
     dbghelp
     ws2_32
+    comdlg32
 )
 
 # MSVC-specific: large address aware, increase section limit for big generated files

@@ -41,6 +41,7 @@
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
+#include "byog.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -805,6 +806,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
     SetUnhandledExceptionFilter(unhandled_filter);
+
+    /* Bring your own game: game\default.xbe must be the retail build the
+     * code was lifted from; a first play-mode launch offers to import it. */
+    if (!byog_ensure_game(g_play_mode))
+        return 1;
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
