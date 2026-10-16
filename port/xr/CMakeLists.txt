@@ -149,3 +149,34 @@ if(WIN32 AND OPENHALO2_NET AND EXISTS "${H2NET_VCPKG}/lib/datachannel.lib")
         ${H2NET_VCPKG}/lib/libcrypto.lib iphlpapi crypt32 bcrypt user32 advapi32)
     message(STATUS "Online system link: libdatachannel from ${H2NET_VCPKG}")
 endif()
+
+# Clean-room APU model (src/mcpxaudio, docs/APU_CLEANROOM_DESIGN.md). While
+# OPENHALO2_OLD_APU is on, the previous model (xbox_apu) is linked too and
+# RECOMP_APU_IMPL=old|new|shadow picks at run time (src/apu_select.c).
+option(OPENHALO2_OLD_APU "Also link the previous APU model for A/B" ON)
+add_library(mcpx_audio STATIC
+    src/mcpxaudio/ma_regs.c
+    src/mcpxaudio/ma_voice.c
+    src/mcpxaudio/ma_mix.c
+    src/mcpxaudio/ma_fx.c
+    src/mcpxaudio/ma_thread.c
+    src/mcpxaudio/ma_softmix.c
+    src/mcpxaudio/ma_contract.c
+    src/mcpxaudio/apu_xaudio2.c
+)
+target_include_directories(mcpx_audio PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/mcpxaudio
+    PRIVATE ${XBOXRECOMP_DIR}/src)
+target_compile_definitions(mcpx_audio PRIVATE _CRT_SECURE_NO_WARNINGS)
+if(MSVC)
+    target_compile_options(mcpx_audio PRIVATE /W3 /O2 /fp:fast)
+endif()
+target_link_libraries(mcpx_audio PRIVATE winmm xaudio2_8 ole32)
+if(NOT OPENHALO2_OLD_APU)
+    target_compile_definitions(mcpx_audio PRIVATE MA_CONTRACT=1)
+endif()
+target_sources(${PROJECT_NAME} PRIVATE src/apu_select.c)
+target_link_libraries(${PROJECT_NAME} PRIVATE mcpx_audio)
+if(OPENHALO2_OLD_APU)
+    # only this file: a target-wide definition would rebuild the generated code
+    set_source_files_properties(src/apu_select.c PROPERTIES COMPILE_DEFINITIONS OPENHALO2_OLD_APU=1)
+endif()

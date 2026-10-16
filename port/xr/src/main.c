@@ -213,23 +213,11 @@ static void print_guest_context(void *rip)
     }
 }
 
-/* The emulated APU.
- *
- * Two entry points that had no callers anywhere in the tree. apu_mmio_hook.c
- * documents apu_hook_handle_mmio as "called from VEH in main.c" and no main.c
- * called it; apu_decode_and_handle's first line is `if (!g_apu_state) return
- * false` and nothing assigned g_apu_state. So with RECOMP_AC97_READY set the
- * APU's registers were unmapped to be trapped, and every trap was then
- * declined and surfaced as an access violation on the first register
- * DirectSound touched.
- *
- * Declared rather than included so this does not depend on src/apu being on
- * the include path. */
-typedef struct MCPXAPUState MCPXAPUState;
-extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
-extern MCPXAPUState *g_apu_state;
-extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
-                                 uint32_t fault_xbox_va, int is_write);
+/* The APU model: apu_select.c picks the previous model or the clean-room
+ * one (RECOMP_APU_IMPL) and routes register accesses and faults to it. */
+extern int  recomp_apu_start(uint8_t *ram_ptr);
+extern bool recomp_apu_fault(PCONTEXT ctx, uintptr_t fault_addr,
+                             uint32_t fault_xbox_va, int is_write);
 
 /* The trapped span, matching what MemoryLayoutInit unmaps: the APU's own
  * 512 KB, not the whole MCPX aperture. AC'97 above it stays plain memory,
@@ -308,7 +296,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             }
 
             if (xbox_va >= APU_TRAP_BASE && xbox_va < APU_TRAP_END
-                    && apu_hook_handle_mmio(
+                    && recomp_apu_fault(
                            ep->ContextRecord, fault_addr, xbox_va,
                            ep->ExceptionRecord->ExceptionInformation[0]
                                ? 1 : 0)) {
@@ -843,9 +831,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * Xbox physical RAM to find voice buffers, so it gets the guest RAM
      * base. */
     if (getenv("RECOMP_AC97_READY")) {
-        g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
-        fprintf(stderr, "[BOOT] emulated APU %s\n",
-                g_apu_state ? "up" : "FAILED to initialise");
+        int up = recomp_apu_start((uint8_t *)xbox_GetMemoryBase());
+        fprintf(stderr, "[BOOT] emulated APU %s\n", up ? "up" : "FAILED to initialise");
     }
 
     /* The pads. Does nothing unless RECOMP_USB is set. Needs guest memory

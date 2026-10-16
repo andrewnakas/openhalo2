@@ -33,10 +33,10 @@ int      recomp_nic_owns(uint32_t va);
 uint32_t recomp_nic_read(uint32_t va, int size);
 void     recomp_nic_write(uint32_t va, uint32_t val, int size);
 
-typedef struct MCPXAPUState MCPXAPUState;
-extern MCPXAPUState *g_apu_state;
-uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
-void     mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
+/* The APU model (apu_select.c). */
+extern volatile int recomp_apu_on;
+uint32_t recomp_apu_read(uint32_t off, int size);
+void     recomp_apu_write(uint32_t off, uint32_t val, int size);
 
 /* The APU's registers, as the memory layout traps them (APU_TRAP_BYTES in
  * xbox_memory_layout.c): the first 0x30000 only. Above that, to 0xFE880000,
@@ -282,10 +282,10 @@ uint32_t recomp_mmio_read(uint32_t va, int size)
         s_direct[1]++;
         return xbox_OhciRead(va, size);
     }
-    if (g_apu_state && va >= APU_TRAP_BASE && va < APU_TRAP_END) {
+    if (recomp_apu_on && va >= APU_TRAP_BASE && va < APU_TRAP_END) {
         uint32_t v;
         s_direct[2]++;
-        v = (uint32_t)mcpx_apu_mmio_read(g_apu_state, va - APU_TRAP_BASE, (unsigned)size);
+        v = recomp_apu_read(va - APU_TRAP_BASE, size);
         apu_trace(va, v, size, 0);
         return v;
     }
@@ -316,11 +316,11 @@ void recomp_mmio_write(uint32_t va, uint32_t val, int size)
         xbox_OhciWrite(va, val, size);
         return;
     }
-    if (g_apu_state && va >= APU_TRAP_BASE && va < APU_TRAP_END) {
+    if (recomp_apu_on && va >= APU_TRAP_BASE && va < APU_TRAP_END) {
         s_direct[2]++;
         apu_trace(va, val, size, 1);
         apu_trace_desc(va, val, 1, 0x7FFFFFFEu);
-        mcpx_apu_mmio_write(g_apu_state, va - APU_TRAP_BASE, val, (unsigned)size);
+        recomp_apu_write(va - APU_TRAP_BASE, val, size);
         apu_trace_desc(va, val, 1, 0x7FFFFFFDu);
         return;
     }
