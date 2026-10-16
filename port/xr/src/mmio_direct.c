@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <time.h>
+#include <string.h>
 
 extern ptrdiff_t g_xbox_mem_offset;
 
@@ -45,6 +46,185 @@ void     mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsig
  * its DSPs every frame again. */
 #define APU_TRAP_BASE 0xFE800000u
 #define APU_TRAP_END  0xFE830000u
+
+/* RECOMP_APU_TRACE=<file>[,MB]: every access to 0xFE800000-0xFE87FFFF (the
+ * APU registers and the two DSP windows) as 16-byte records
+ * {u64 microseconds since the first record, u32 offset | size << 24 |
+ * write << 31, u32 value}; a read records the value returned. Capped at MB
+ * megabytes (default 512). Black-box measurement for the clean-room APU
+ * (docs/APU_CLEANROOM_DESIGN.md 3c.1); tools/apu_trace.py reads it. */
+#include <windows.h>
+static FILE *s_tr;
+static long long s_tr_left = -1;
+static LARGE_INTEGER s_tr_t0, s_tr_f;
+static CRITICAL_SECTION s_tr_cs;
+
+/* RECOMP_APU_SNAP=<dir>[,period ms[,lo,hi]]: guest physical RAM lo..hi (hex,
+ * default 0..0x4000000) written to <dir>/snapNNNN.bin every period ms
+ * (default 10000; 0 = only on demand), and on demand when <dir>/snapnow
+ * exists (deleted once taken). RECOMP_APU_SNAP_ON=<off hex>[,count] also
+ * takes one right after each of the first count (default 8) writes to that
+ * register offset. Each snapshot is marked in the trace by a record with
+ * offset field 0x7FFFFFFF and the snapshot number as its value. */
+/* physical P is guest 0x80000000 + P (the contiguous window) */
+static char s_snap_dir[400];
+static unsigned s_snap_period = 10000, s_snap_lo = 0, s_snap_hi = 0x4000000;
+static unsigned s_snap_n, s_snap_on = 0xFFFFFFFFu, s_snap_on_left = 8;
+
+static void snap_take_locked(uint64_t us)
+{
+    char p[512];
+    FILE *f;
+    struct { uint64_t us; uint32_t ow; uint32_t v; } r;
+
+    snprintf(p, sizeof p, "%s/snap%04u.bin", s_snap_dir, s_snap_n);
+    f = fopen(p, "wb");
+    if (f) {
+        fwrite((uint8_t *)((uintptr_t)0x80000000u + g_xbox_mem_offset) + s_snap_lo, 1, s_snap_hi - s_snap_lo, f);
+        fclose(f);
+    }
+    r.us = us; r.ow = 0x7FFFFFFFu; r.v = s_snap_n++;
+    if (s_tr && s_tr_left > 0) { fwrite(&r, sizeof r, 1, s_tr); s_tr_left -= sizeof r; fflush(s_tr); }
+}
+
+static uint64_t tr_now(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)((t.QuadPart - s_tr_t0.QuadPart) * 1000000 / s_tr_f.QuadPart);
+}
+
+static DWORD WINAPI snap_thread(LPVOID arg)
+{
+    char trig[512];
+    DWORD waited = 0;
+    (void)arg;
+    snprintf(trig, sizeof trig, "%s/snapnow", s_snap_dir);
+    for (;;) {
+        Sleep(100); waited += 100;
+        if (GetFileAttributesA(trig) != INVALID_FILE_ATTRIBUTES
+                || (s_snap_period && waited >= s_snap_period)) {
+            waited = 0;
+            EnterCriticalSection(&s_tr_cs);
+            snap_take_locked(tr_now());
+            LeaveCriticalSection(&s_tr_cs);
+            DeleteFileA(trig);
+        }
+    }
+    return 0;
+}
+
+static void snap_init(void)
+{
+    const char *e = getenv("RECOMP_APU_SNAP"), *c;
+    size_t n;
+    if (!e || !*e) return;
+    c = strchr(e, ',');
+    n = c ? (size_t)(c - e) : strlen(e);
+    if (n >= sizeof s_snap_dir) n = sizeof s_snap_dir - 1;
+    memcpy(s_snap_dir, e, n); s_snap_dir[n] = 0;
+    if (c) {
+        s_snap_period = (unsigned)atoi(c + 1);
+        c = strchr(c + 1, ',');
+        if (c) {
+            s_snap_lo = (unsigned)strtoul(c + 1, NULL, 16);
+            c = strchr(c + 1, ',');
+            if (c) s_snap_hi = (unsigned)strtoul(c + 1, NULL, 16);
+        }
+    }
+    e = getenv("RECOMP_APU_SNAP_ON");
+    if (e && *e) {
+        s_snap_on = (unsigned)strtoul(e, NULL, 16);
+        c = strchr(e, ',');
+        if (c) s_snap_on_left = (unsigned)atoi(c + 1);
+    }
+    CreateThread(NULL, 0, snap_thread, NULL, 0, NULL);
+    fprintf(stderr, "[APUTRACE] snapshots to %s every %u ms, 0x%X..0x%X\n",
+            s_snap_dir, s_snap_period, s_snap_lo, s_snap_hi);
+}
+
+static void apu_trace(uint32_t va, uint32_t val, int size, int write)
+{
+    struct { uint64_t us; uint32_t ow; uint32_t v; } r;
+    LARGE_INTEGER t;
+
+    if (s_tr_left == 0 || va < APU_TRAP_BASE || va >= 0xFE880000u)
+        return;
+    if (s_tr_left < 0) {
+        static volatile long once;
+        const char *e = getenv("RECOMP_APU_TRACE");
+        if (InterlockedExchange(&once, 1)) { while (s_tr_left < 0) Sleep(0); return; }
+        if (e && *e) {
+            char path[512];
+            const char *c = strchr(e, ',');
+            size_t n = c ? (size_t)(c - e) : strlen(e);
+            if (n >= sizeof path) n = sizeof path - 1;
+            memcpy(path, e, n); path[n] = 0;
+            InitializeCriticalSection(&s_tr_cs);
+            QueryPerformanceFrequency(&s_tr_f);
+            QueryPerformanceCounter(&s_tr_t0);
+            s_tr = fopen(path, "wb");
+            if (s_tr) setvbuf(s_tr, NULL, _IOFBF, 1 << 20);
+            s_tr_left = s_tr ? (long long)(c ? atoi(c + 1) : 512) << 20 : 0;
+            fprintf(stderr, "[APUTRACE] %s: %s\n", path, s_tr ? "recording" : "cannot open");
+            if (s_tr) snap_init();
+        } else {
+            s_tr_left = 0;
+        }
+        if (!s_tr_left) return;
+    }
+    QueryPerformanceCounter(&t);
+    r.us = (uint64_t)((t.QuadPart - s_tr_t0.QuadPart) * 1000000 / s_tr_f.QuadPart);
+    r.ow = (va - APU_TRAP_BASE) | ((uint32_t)size << 24) | (write ? 0x80000000u : 0);
+    r.v = val;
+    EnterCriticalSection(&s_tr_cs);
+    if (s_tr_left > 0) {
+        fwrite(&r, sizeof r, 1, s_tr);
+        s_tr_left -= sizeof r;
+        if (s_tr_left <= 0) { s_tr_left = 0; fclose(s_tr); s_tr = NULL; }
+        else {
+            static uint64_t last_flush;
+            if (r.us - last_flush > 500000) { last_flush = r.us; fflush(s_tr); }
+        }
+        if (write && s_snap_on_left && s_snap_dir[0] && va - APU_TRAP_BASE == s_snap_on) {
+            s_snap_on_left--;
+            snap_take_locked(r.us);
+        }
+    }
+    LeaveCriticalSection(&s_tr_cs);
+}
+
+/* RECOMP_APU_TRACE_DESC=1 (with the trace): around every voice-method write
+ * (0x20100-0x203FF) the selected voice's 0x80-byte descriptor is recorded
+ * twice, before (offset field 0x7FFFFFFE) and after (0x7FFFFFFD) the model
+ * took the write: a header record whose value is the voice number, then the
+ * 128 bytes. The voice is the last value written to 0x202F8 and the
+ * descriptor array base the last value written to 0x202C (both measured,
+ * docs/APU_FACTS.md). */
+static int s_trd = -1;
+static uint32_t s_trd_voice, s_trd_vpv;
+
+static void apu_trace_desc(uint32_t va, uint32_t val, int write, uint32_t tag)
+{
+    struct { uint64_t us; uint32_t ow; uint32_t v; } r;
+    uint32_t o = va - APU_TRAP_BASE;
+
+    if (s_trd < 0) { const char *e = getenv("RECOMP_APU_TRACE_DESC"); s_trd = e && *e == '1'; }
+    if (!s_trd || !s_tr || !write) return;
+    if (tag == 0x7FFFFFFEu) {
+        if (o == 0x202C) s_trd_vpv = val;
+        if (o == 0x202F8) s_trd_voice = val & 0xFFFF;
+    }
+    if (o < 0x20100 || o >= 0x20400 || !s_trd_vpv || s_trd_voice > 0xFF) return;
+    r.us = tr_now(); r.ow = tag; r.v = s_trd_voice;
+    EnterCriticalSection(&s_tr_cs);
+    if (s_tr && s_tr_left > 0x100) {
+        fwrite(&r, sizeof r, 1, s_tr);
+        fwrite((uint8_t *)((uintptr_t)0x80000000u + g_xbox_mem_offset) + s_trd_vpv + s_trd_voice * 0x80, 1, 0x80, s_tr);
+        s_tr_left -= sizeof r + 0x80;
+    }
+    LeaveCriticalSection(&s_tr_cs);
+}
 
 static volatile long s_direct[4];   /* nv2a, ohci, apu, plain */
 static volatile long s_faults;
@@ -103,8 +283,11 @@ uint32_t recomp_mmio_read(uint32_t va, int size)
         return xbox_OhciRead(va, size);
     }
     if (g_apu_state && va >= APU_TRAP_BASE && va < APU_TRAP_END) {
+        uint32_t v;
         s_direct[2]++;
-        return (uint32_t)mcpx_apu_mmio_read(g_apu_state, va - APU_TRAP_BASE, (unsigned)size);
+        v = (uint32_t)mcpx_apu_mmio_read(g_apu_state, va - APU_TRAP_BASE, (unsigned)size);
+        apu_trace(va, v, size, 0);
+        return v;
     }
     s_direct[3]++;
     {
@@ -112,6 +295,7 @@ uint32_t recomp_mmio_read(uint32_t va, int size)
         uint32_t v = size == 1 ? *p : size == 2 ? *(const volatile uint16_t *)p
                                                : *(const volatile uint32_t *)p;
         nic_trace(va, v, size, 0);
+        apu_trace(va, v, size, 0);
         return v;
     }
 }
@@ -134,11 +318,15 @@ void recomp_mmio_write(uint32_t va, uint32_t val, int size)
     }
     if (g_apu_state && va >= APU_TRAP_BASE && va < APU_TRAP_END) {
         s_direct[2]++;
+        apu_trace(va, val, size, 1);
+        apu_trace_desc(va, val, 1, 0x7FFFFFFEu);
         mcpx_apu_mmio_write(g_apu_state, va - APU_TRAP_BASE, val, (unsigned)size);
+        apu_trace_desc(va, val, 1, 0x7FFFFFFDu);
         return;
     }
     s_direct[3]++;
     nic_trace(va, val, size, 1);
+    apu_trace(va, val, size, 1);
     {
         volatile uint8_t *p = (volatile uint8_t *)((uintptr_t)va + g_xbox_mem_offset);
         if (size == 1) *p = (uint8_t)val;
