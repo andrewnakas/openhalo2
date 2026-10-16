@@ -582,6 +582,21 @@ static void h2_tag_check_start(void)
  * whether the log went to halo2_recomp.log. */
 static int g_play_mode, g_log_to_file;
 
+/* A double-clicked game logs to halo2_recomp.log; left running it grew about
+ * 30 MB an hour. The file is opened for appending, so cutting it back to zero
+ * from here is safe: every later write lands at the new end. The newest part
+ * (where a crash report would be) is what survives. RECOMP_LOG_CAP_MB, 0 = no cap. */
+static DWORD WINAPI log_cap_thread(LPVOID arg)
+{
+    long long cap = (long long)(size_t)arg << 20;
+    for (;;) {
+        Sleep(30000);
+        int fd = _fileno(stderr);
+        if (fd >= 0 && _filelengthi64(fd) > cap && _chsize_s(fd, 0) == 0)
+            fprintf(stderr, "[LOG] log passed %lld MB, cut back to empty\n", cap >> 20);
+    }
+}
+
 /* A fault nothing handled. The vectored handler above has already written
  * the report; with a window on screen and no console, say where it is
  * instead of vanishing. */
@@ -628,6 +643,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         }
     }
 
+    /* halo2.ini beside the program: player settings as KEY = VALUE lines
+     * (# or ; starts a comment). A RECOMP_* name passes through as is; the
+     * friendly names below map onto one. The environment wins over the file,
+     * so a test script's settings are never changed by it. */
+    {
+        static const char *const alias[][2] = {
+            { "fullscreen", "RECOMP_FULLSCREEN" },   { "mouse_sens", "RECOMP_MOUSE_SENS" },
+            { "mouse_deadzone", "RECOMP_MOUSE_DEADZONE" }, { "volume_db", "RECOMP_APU_GAIN_DB" },
+            { "debug_keys", "RECOMP_DEBUG_KEYS" },   { "log_cap_mb", "RECOMP_LOG_CAP_MB" },
+        };
+        FILE *ini = fopen("halo2.ini", "r");
+        char line[512];
+        while (ini && fgets(line, sizeof line, ini)) {
+            char *k = line, *v = strchr(line, '='), *e;
+            if (!v || *k == '#' || *k == ';')
+                continue;
+            *v++ = 0;
+            while (*k == ' ' || *k == '\t') k++;
+            for (e = k + strlen(k); e > k && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+            while (*v == ' ' || *v == '\t') v++;
+            for (e = v + strlen(v); e > v && (unsigned char)e[-1] <= ' '; ) *--e = 0;
+            const char *name = strncmp(k, "RECOMP_", 7) == 0 ? k : NULL;
+            for (size_t ai = 0; !name && ai < sizeof alias / sizeof alias[0]; ai++)
+                if (_stricmp(k, alias[ai][0]) == 0)
+                    name = alias[ai][1];
+            if (name && *v && !getenv(name))
+                _putenv_s(name, v);
+        }
+        if (ini)
+            fclose(ini);
+    }
+
     /* Play or test.
      *
      * A plain launch (double-click, no environment) is the playable one: the
@@ -669,7 +716,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             && to != FILE_TYPE_DISK && to != FILE_TYPE_PIPE) {
             MoveFileExA("halo2_recomp.log", "halo2_recomp.prev.log",
                         MOVEFILE_REPLACE_EXISTING);
-            if (freopen("halo2_recomp.log", "w", stderr)) {
+            if (freopen("halo2_recomp.log", "a", stderr)) {
                 /* One file, one position: stdout becomes a second descriptor
                  * on the same open file. */
                 if (freopen("NUL", "w", stdout))
@@ -679,6 +726,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 SetStdHandle(STD_OUTPUT_HANDLE,
                              (HANDLE)_get_osfhandle(_fileno(stderr)));
                 g_log_to_file = 1;
+                {
+                    const char *e = getenv("RECOMP_LOG_CAP_MB");
+                    size_t mb = e ? (size_t)strtoul(e, NULL, 10) : 64;
+                    if (mb)
+                        CloseHandle(CreateThread(NULL, 0, log_cap_thread, (LPVOID)mb, 0, NULL));
+                }
             }
         }
     }
