@@ -7614,7 +7614,7 @@ index 0000000..531a104
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..ce04203 100644
+index c65632c..bb1ffbe 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -37,6 +37,7 @@
@@ -8638,7 +8638,7 @@ index c65632c..ce04203 100644
          return;
      }
      {
-@@ -2156,12 +2823,138 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -2156,12 +2823,147 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
              xf_lerp(&va, &vb, t, &poly[n++]);
          }
      }
@@ -8722,7 +8722,16 @@ index c65632c..ce04203 100644
 +                fmax(fabs((double)b->pos[3]), fabs((double)c->pos[3]))) * 1e-6;
 +    if (wmin < NV_CLIP_W) wmin = NV_CLIP_W;
 +    zp = xf_zpersp();
-+    near_on = (s_gpu.zminmax_control & 0x0F) != 0 && s_gpu.clip_zmin > 0.0f;
++    /* RECOMP_GPU_NEAR=0: no clip at SET_CLIP_MIN, only the w guard (A/B for
++     * near objects the owner still sees cut). */
++    {
++        static int near_env = -1;
++        if (near_env < 0) {
++            const char *e = getenv("RECOMP_GPU_NEAR");
++            near_env = !(e && *e == '0');
++        }
++        near_on = near_env && (s_gpu.zminmax_control & 0x0F) != 0 && s_gpu.clip_zmin > 0.0f;
++    }
 +    {
 +        const float *sc = nv2a_vsh_constant(58), *of = nv2a_vsh_constant(59);
 +        for (i = 0; i < 3; i++) { k[i] = sc[i]; o[i] = of[i]; }
@@ -8778,7 +8787,7 @@ index c65632c..ce04203 100644
  }
  
  static Nv2aVshOutput s_xf[NV_MAX_INDICES];
-@@ -2180,9 +2973,82 @@ static void raster_batch_program(void)
+@@ -2180,9 +2982,82 @@ static void raster_batch_program(void)
  {
      uint32_t i, n = s_gpu.idx_count;
  
@@ -8864,7 +8873,7 @@ index c65632c..ce04203 100644
      s_gpu.batches_program++;
      s_gpu.verts_program += n;
      if (s_gpu.blend_enable) {
-@@ -2243,6 +3109,15 @@ static void raster_batch_program(void)
+@@ -2243,6 +3118,15 @@ static void raster_batch_program(void)
      }
      if (s_gpu.texs[0].valid)
          note_texture_use();
@@ -8880,7 +8889,7 @@ index c65632c..ce04203 100644
  
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
-@@ -2250,8 +3125,11 @@ static void raster_batch_program(void)
+@@ -2250,8 +3134,11 @@ static void raster_batch_program(void)
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -8893,7 +8902,7 @@ index c65632c..ce04203 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -2271,6 +3149,7 @@ static void raster_batch_program(void)
+@@ -2271,6 +3158,7 @@ static void raster_batch_program(void)
          }
          break;
      default:
@@ -8901,7 +8910,7 @@ index c65632c..ce04203 100644
          break;
      }
  }
-@@ -2280,8 +3159,11 @@ static void raster_batch(void)
+@@ -2280,8 +3168,11 @@ static void raster_batch(void)
      uint32_t i;
      uint32_t before = s_gpu.tris_drawn;
  
@@ -8914,7 +8923,7 @@ index c65632c..ce04203 100644
      static int no_vsh = -1;
      if (no_vsh < 0)
          no_vsh = getenv("RECOMP_NO_VSH") != NULL;
-@@ -2348,6 +3230,7 @@ static void raster_batch(void)
+@@ -2348,6 +3239,7 @@ static void raster_batch(void)
          }
          break;
      default:
@@ -8922,7 +8931,7 @@ index c65632c..ce04203 100644
          break;                             /* points and lines: not yet */
      }
  
-@@ -2380,9 +3263,23 @@ static void raster_batch(void)
+@@ -2380,9 +3272,23 @@ static void raster_batch(void)
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
@@ -8947,7 +8956,7 @@ index c65632c..ce04203 100644
          return;
      if (s_ftrace == 3) {
          /* Deleting the flag file re-arms the trace for the next time it
-@@ -2395,6 +3292,19 @@ static void frame_trace_flip(void)
+@@ -2395,6 +3301,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -8967,7 +8976,7 @@ index c65632c..ce04203 100644
          s_ftrace = 3;
          fprintf(stderr, "[FTRACE] end of frame\n");
          return;
-@@ -2417,7 +3327,12 @@ static void draw_primitive(void)
+@@ -2417,7 +3336,12 @@ static void draw_primitive(void)
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
@@ -8981,7 +8990,7 @@ index c65632c..ce04203 100644
          fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
      s_gpu.verts += s_gpu.idx_count;
  
-@@ -2440,8 +3355,22 @@ static void draw_primitive(void)
+@@ -2440,8 +3364,22 @@ static void draw_primitive(void)
      {
          uint32_t t0 = s_gpu.tris_drawn;
          uint64_t p0 = s_gpu.pixels;
@@ -9004,7 +9013,7 @@ index c65632c..ce04203 100644
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
                      " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
-@@ -2489,9 +3418,12 @@ static void draw_primitive(void)
+@@ -2489,9 +3427,12 @@ static void draw_primitive(void)
          }
      }
  
@@ -9020,7 +9029,7 @@ index c65632c..ce04203 100644
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
                              " off 0x%08X type %u size %u stride %u\n",
                      s_gpu.prim, s_gpu.idx_count, s_gpu.attr[0].offset,
-@@ -2840,6 +3772,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2840,6 +3781,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
      case NV097_SET_TEXTURE_CONTROL1:
          t->pitch = param >> 16;          /* linear formats only */
          break;
@@ -9030,7 +9039,7 @@ index c65632c..ce04203 100644
      case NV097_SET_TEXTURE_IMAGE_RECT:
          t->width  = param >> 16;
          t->height = param & 0xFFFF;
-@@ -2851,12 +3786,367 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2851,12 +3795,367 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          break;
      }
      tex_update_valid(t);
@@ -9398,7 +9407,7 @@ index c65632c..ce04203 100644
      static int inited;
      if (!inited) {
          inited = 1;
-@@ -2956,6 +4246,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2956,6 +4255,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          s_gpu.rc_seen = 1;
          break;
      case 0x1E70: s_gpu.rc.stage_program = param; break;
@@ -9408,7 +9417,7 @@ index c65632c..ce04203 100644
      case 0x17F8: s_gpu.clip_plane_mode = param; break;
  
      /* Alpha test and fog. */
-@@ -2967,6 +4260,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2967,6 +4269,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x029C: s_gpu.fog_mode = param; break;
      case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
@@ -9418,7 +9427,7 @@ index c65632c..ce04203 100644
      case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
          s_gpu.zpass_count = 0;
          break;
-@@ -2980,10 +4276,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2980,10 +4285,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
           * starts the slot at 0xFFFFFFFF) sees every test incomplete. Burnout
           * 3 culls its world with these, so the race's main view drew only
           * the sky while the cube-map passes, which do not test, drew it all.
@@ -9452,7 +9461,7 @@ index c65632c..ce04203 100644
          memcpy(mem + at, &stamp, 8);
          memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
          memset(mem + at + 12, 0, 4);
-@@ -3004,8 +4321,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3004,8 +4330,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -9469,7 +9478,7 @@ index c65632c..ce04203 100644
          break;
  
      case NV097_SET_BEGIN_END:
-@@ -3052,19 +4375,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3052,19 +4384,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  
          if (!s_gpu.prim)
              break;
@@ -9526,7 +9535,7 @@ index c65632c..ce04203 100644
      case NV097_SET_FLIP_READ:
          if (s_ftrace == 2)
              fprintf(stderr, "[FTRACE] P_READ %u%c", param, 10);
-@@ -3099,6 +4454,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3099,6 +4463,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
@@ -9534,7 +9543,7 @@ index c65632c..ce04203 100644
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -3119,6 +4475,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3119,6 +4484,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -9558,7 +9567,7 @@ index c65632c..ce04203 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-@@ -3146,6 +4519,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3146,6 +4528,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -9567,7 +9576,7 @@ index c65632c..ce04203 100644
  
          if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
              static unsigned n;
-@@ -3177,12 +4552,37 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3177,12 +4561,37 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  
      /* Depth. */
      case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
@@ -9605,7 +9614,7 @@ index c65632c..ce04203 100644
          if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
              s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
              break;
-@@ -3449,6 +4849,20 @@ void nv2a_pb_exec_report(void)
+@@ -3449,6 +4858,20 @@ void nv2a_pb_exec_report(void)
      /* Drawn and skipped separately: "nothing appeared" and "every batch needed
       * a vertex program we do not run" look identical on screen, and only one
       * of them means the rasteriser is broken. */
@@ -9626,7 +9635,7 @@ index c65632c..ce04203 100644
      fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
      fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
                      " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
-@@ -3460,8 +4874,28 @@ void nv2a_pb_exec_report(void)
+@@ -3460,8 +4883,28 @@ void nv2a_pb_exec_report(void)
              s_gpu.tris_drawn, s_gpu.batches_untransformed,
              s_gpu.tris_skipped_offscreen);
      fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
@@ -9657,7 +9666,7 @@ index c65632c..ce04203 100644
      fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
                      " %u drawn; pixels %llu written, %llu depth-failed;"
                      " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
-@@ -3471,6 +4905,19 @@ void nv2a_pb_exec_report(void)
+@@ -3471,6 +4914,19 @@ void nv2a_pb_exec_report(void)
              s_gpu.xf_min[0], s_gpu.xf_max[0], s_gpu.xf_min[1], s_gpu.xf_max[1],
              s_gpu.xf_min[2], s_gpu.xf_max[2]);
      {
