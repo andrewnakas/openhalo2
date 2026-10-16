@@ -1,0 +1,24 @@
+Open Halo 2 -- third-party notices
+
+1. xboxrecomp (static recompilation toolkit and Xbox runtime)
+   https://github.com/sp00nznet/xboxrecomp  -- MIT License, Copyright (c) 2026 sp00nz.
+   Used with the changes in patches/xboxrecomp-full-vs-193e299.diff (same licence).
+
+2. halo2-decompiled  https://github.com/kirklandsig/halo2-decompiled -- CC0 1.0.
+   Used as a reference for function boundaries and names; no code is compiled in.
+
+3. Audio hardware model (src/apu in the toolkit) -- derived from xemu,
+   LGPL-2.1-or-later, Copyright (c) 2012 espes, 2018-2019 Jannik Vogel,
+   2019-2025 Matt Borgerson. TEMPORARY: being replaced by an original
+   implementation before any public release (see docs/APU_CLEANROOM_DESIGN.md).
+   Files: apu_core.c, apu_vp.c, apu_dsp.c, apu_state.h, apu_regs.h, apu_debug.h,
+   fpconv.h, apu_shim.h, apu.h, nv2a/qemu_shim.h.
+
+4. Network transport (net/, when built in) -- libdatachannel (MPL-2.0),
+   libjuice (MPL-2.0), usrsctp (BSD-3-Clause), OpenSSL (Apache-2.0).
+   See net/README.md.
+
+5. Microsoft Windows SDK import libraries (system DLLs only).
+
+Halo 2 is a trademark of Microsoft. No game data is distributed with this
+program; it runs only with the user's own copy of the game.
