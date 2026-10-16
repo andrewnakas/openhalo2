@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>h2net test</title>
+<style>
+  :root { --bg: #fff; --fg: #111; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #ddd; } }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.4 ui-monospace, monospace; margin: 16px; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<p>h2net browser station. Query: <code>?room=h2t-xxxx&amp;idx=9&amp;n=2&amp;frames=1000[&amp;relay=wss://...]</code></p>
+<pre id="out"></pre>
+<script type="module">
+// Same protocol as test/h2net_test.c: MAC 02:68:32:00:00:<idx>, HELLO / PING / PONG / BCAST / DONE.
+import { H2Net } from '../h2net.js';
+
+const q = new URLSearchParams(location.search);
+const room = q.get('room'), me = +(q.get('idx') || 9), stations = +(q.get('n') || 2), frames = +(q.get('frames') || 1000);
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += s + '\n'; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const MAXI = 16;
+const myMac = [0x02, 0x68, 0x32, 0, 0, me];
+const heard = new Array(MAXI).fill(0), doneFrom = new Array(MAXI).fill(0);
+const pingRx = new Array(MAXI).fill(0), pongRx = new Array(MAXI).fill(0), bcastRx = new Array(MAXI).fill(0);
+let misdelivered = 0, bcastsSent = 0;
+const rtt = [];
+window.h2result = null;
+
+const net = new H2Net(q.get('relay') ? { relay: q.get('relay') } : {});
+window.h2net = net;
+
+function put(dst, type, seq, t, len) {
+  const f = new Uint8Array(Math.max(60, len));
+  if (dst) { f.set(myMac, 0); f[5] = dst; } else f.fill(0xff, 0, 6);
+  f.set(myMac, 6);
+  f[12] = 0x88; f[13] = 0xb5; f[14] = type.charCodeAt(0);
+  const dv = new DataView(f.buffer);
+  dv.setUint32(15, seq, true);
+  dv.setBigUint64(19, BigInt(Math.floor(t)), true);
+  f[27] = me;
+  net.send(f);
+  if (!dst) bcastsSent++;
+}
+const nowUs = () => performance.now() * 1000;
+
+function poll() {
+  for (let f; (f = net.recv()); ) {
+    const bc = f[0] === 0xff, src = f[11], type = String.fromCharCode(f[14]);
+    if (f.length < 28 || f[12] !== 0x88 || f[13] !== 0xb5 || src <= 0 || src >= MAXI) continue;
+    if (!bc && (f[0] !== myMac[0] || f[5] !== me)) { misdelivered++; continue; }
+    const dv = new DataView(f.buffer, f.byteOffset);
+    const seq = dv.getUint32(15, true), t = Number(dv.getBigUint64(19, true));
+    if (type === 'H') heard[src] = 1;
+    else if (type === 'D') { doneFrom[src] = 1; heard[src] = 1; }
+    else if (type === 'B') bcastRx[src]++;
+    else if (type === 'P') { pingRx[src]++; put(src, 'Q', seq, t, f.length); }
+    else if (type === 'Q') { pongRx[src]++; rtt.push((nowUs() - t) / 1000); }
+  }
+}
+const count = (a) => a.filter((v, i) => i !== me && v).length;
+async function wait(ms) { const end = performance.now() + ms; while (performance.now() < end) { poll(); await sleep(1); } }
+
+async function run() {
+  net.open(room);
+  let t0 = performance.now();
+  while (net.peers() < stations - 1) {
+    if (performance.now() - t0 > 60000) return { ok: false, text: `st${me}: TIMEOUT waiting for peers: ${net.status()}` };
+    poll(); await sleep(5);
+  }
+  log(`st${me}: mesh up in ${Math.round(performance.now() - t0)} ms`);
+  t0 = performance.now();
+  let tEnd = 0;
+  while (!tEnd || performance.now() < tEnd) {
+    put(0, 'H', 0, nowUs(), 60);
+    await wait(50);
+    if (!tEnd && count(heard) >= stations - 1) tEnd = performance.now() + 500;
+    if (performance.now() - t0 > 20000) break;
+  }
+  // rounds paced at 2 ms by elapsed time (browser timers are coarser, so several rounds per tick)
+  t0 = performance.now();
+  for (let seq = 0; seq < frames; ) {
+    while (seq < frames && performance.now() - t0 >= seq * 2) {
+      const len = seq % 10 === 9 ? 1514 : 300;
+      for (let i = 1; i < MAXI; i++) if (i !== me && heard[i]) put(i, 'P', seq, nowUs(), len);
+      put(0, 'B', seq, nowUs(), len);
+      seq++;
+    }
+    poll(); await sleep(1);
+  }
+  await wait(1000);
+  t0 = performance.now(); tEnd = 0;
+  while (!tEnd || performance.now() < tEnd) {
+    put(0, 'D', 0, nowUs(), 60);
+    await wait(100);
+    if (!tEnd && count(doneFrom) >= stations - 1) tEnd = performance.now() + 1000;
+    if (performance.now() - t0 > 15000) break;
+  }
+  const stats = await net.stats();
+  rtt.sort((a, b) => a - b);
+  const lines = [];
+  let ok = count(heard) >= stations - 1 && !misdelivered;
+  for (let i = 1; i < MAXI; i++) {
+    if (i === me || !heard[i]) continue;
+    lines.push(`st${me}<-st${i}: ping ${pingRx[i]}/${frames}  bcast ${bcastRx[i]}/${frames}  pong ${pongRx[i]}/${frames}`);
+    if (Math.min(pingRx[i], bcastRx[i], pongRx[i]) < frames * 0.99) ok = false;
+  }
+  const pct = (p) => (rtt.length ? rtt[Math.min(rtt.length - 1, Math.floor(rtt.length * p))].toFixed(2) : '0');
+  const flood = net.counters.flood;
+  lines.push(`st${me}: rtt p50=${pct(0.5)} p95=${pct(0.95)} max=${pct(1)} ms (n=${rtt.length})  misdelivered=${misdelivered} unicast-flooded=${flood - bcastsSent}`);
+  lines.push(`st${me}: ${net.status()}`);
+  lines.push(`st${me}: pairs ${stats.map((s) => `${s.id}:${s.pair}`).join(' ')}`);
+  lines.push(`st${me}: ${ok ? 'PASS' : 'FAIL'}`);
+  net.close();
+  return { ok, text: lines.join('\n') };
+}
+
+run().then((r) => { log(r.text); window.h2result = r; }, (e) => { log(String(e)); window.h2result = { ok: false, text: String(e) }; });
+</script>
+</body>
+</html>
