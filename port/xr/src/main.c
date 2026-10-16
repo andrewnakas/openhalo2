@@ -257,6 +257,11 @@ void xbox_Nv2aRegTrapReport(void);
 void recomp_mmio_note_fault(uintptr_t ip, uint32_t va);
 void recomp_mmio_report(void);
 
+int recomp_sanitize_fatal(void);           /* xbox_memory_layout.c */
+void xbox_ReadAuditCheck(const char *why); /* kernel_bridge.c: read audit */
+void xbox_ReadAuditWhere(const char *name, uint32_t va);
+static __declspec(thread) int t_in_report;
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -333,12 +338,16 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
                                        ((PIMAGE_DOS_HEADER)m)->e_lfanew);
                 img_lo = (uintptr_t)m;
                 img_hi = img_lo + nt->OptionalHeader.SizeOfImage;
-                shield = !(e && *e == '0');
+                /* Off under the sanitizer: carrying on hides the first fault. */
+                shield = (e && *e) ? (*e != '0') : !recomp_sanitize_fatal();
             }
             if (shield && ip >= img_lo && ip < img_hi
                     && fault_addr >= (uintptr_t)g_xbox_mem_offset
                     && fault_addr - (uintptr_t)g_xbox_mem_offset < 0x100000000ull
-                    && xbox_va < 0xF0000000u && pages < 4096) {   /* tiled views and device registers above */
+                    /* tiled views and device registers above 0xF0000000, but
+                     * the top 64 KB is a null pointer minus a field offset */
+                    && (xbox_va < 0xF0000000u || xbox_va >= 0xFFFF0000u)
+                    && pages < 4096) {
                 void *pg = (void *)(fault_addr & ~(uintptr_t)0xFFF);
                 if (VirtualAlloc(pg, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
                     LONG k = InterlockedIncrement(&pages);
@@ -356,6 +365,13 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             }
         }
 
+        /* A fault while writing the report (a dump read through a wild
+         * register) comes back here: let the __except below take it, so the
+         * report ends with one line instead of a second [CRASH] over it. */
+        if (t_in_report)
+            return EXCEPTION_CONTINUE_SEARCH;
+        t_in_report = 1;
+        __try {
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)CTX_IP(ep->ContextRecord),
             (unsigned long long)fault_addr,
@@ -386,6 +402,11 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
                             *(const uint32_t *)(m + a + i * 4));
                 fputc('\n', stderr);
             }
+            /* Read audit: the file read each register's target came from, and
+             * whether that loaded data has been written over since. */
+            for (r = 0; r < 6; r++)
+                xbox_ReadAuditWhere(nm[r], rv[r]);
+            xbox_ReadAuditCheck("at crash");
         }
         /* The raw guest stack: ebp lives in the lifted function's locals, so
          * the frame (and its arguments) is only reachable through esp. */
@@ -405,6 +426,43 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
                             *(const uint32_t *)(m + g_esp + i * 4 + 24),
                             *(const uint32_t *)(m + g_esp + i * 4 + 28));
             }
+        }
+
+        /* Halo 2: a fault inside object creation's allocator calls (0xB7B40
+         * calling 0xBC380, ret 0xC). Its frame holds the object definition at
+         * [esp+0x20] and the model definition, looked up through the tag
+         * table, at [esp+0x1c]. Print the model tag index (definition +0x38),
+         * the table entry it selects and where that entry was loaded from,
+         * which says whether the index or the entry is wrong. */
+        {
+            const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+            int k;
+            if (g_esp >= 0x1000u && g_esp < 0x04000000u - 0x400u)
+                for (k = 0; k < 64; k++) {
+                    uint32_t ra = *(const uint32_t *)(m + g_esp + k * 4);
+                    if (ra == 0xB7FBDu || ra == 0xB7FDFu || ra == 0xB8003u
+                            || ra == 0xB8023u || ra == 0xB8043u) {
+                        uint32_t fr = g_esp + k * 4 + 4 + 12;
+                        uint32_t model = *(const uint32_t *)(m + fr + 0x1C);
+                        uint32_t odef = *(const uint32_t *)(m + fr + 0x20);
+                        uint32_t base = *(const uint32_t *)(m + 0x4E3B44u);
+                        fprintf(stderr, "  [H2OBJ] object creation frame esp=0x%08X (call returning to 0x%X): "
+                                "object def 0x%08X, model def 0x%08X, tag table 0x%08X\n",
+                                fr, ra, odef, model, base);
+                        if (odef >= 0x80000000u && odef < 0x84000000u - 0x40u) {
+                            uint32_t idx = *(const uint32_t *)(m + odef + 0x38);
+                            uint32_t ent = base + (idx & 0xFFFFu) * 16u;
+                            const uint32_t *e = (const uint32_t *)(m + ent);
+                            fprintf(stderr, "  [H2OBJ] def+0x38 model datum %08X -> entry 0x%08X: "
+                                    "%08X %08X %08X %08X; object def head %08X %08X\n",
+                                    idx, ent, e[0], e[1], e[2], e[3],
+                                    *(const uint32_t *)(m + odef), *(const uint32_t *)(m + odef + 4));
+                            xbox_ReadAuditWhere("objdef", odef + 0x38);
+                            xbox_ReadAuditWhere("entry", ent + 8);
+                        }
+                        break;
+                    }
+                }
         }
 
         /*
@@ -439,10 +497,85 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
                 }
             }
         }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            fprintf(stderr, "  (report cut short: a dump read faulted)\n");
+        }
+        t_in_report = 0;
         fflush(stderr);
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Tag-table checker (RECOMP_TAG_CHECK=1, on by default under RECOMP_SANITIZE=1).
+ *
+ * Halo 2 finds every tag through the table at [0x4E3B44]: 16-byte entries
+ * {group, datum, address, size}, address at +8. Every crash at the Cairo
+ * Station door read a definition through an entry whose address was garbage
+ * (0x82EC0417 in two runs, misaligned). This thread snapshots the table once a
+ * second and logs an entry whose address turns bad -- misaligned or outside
+ * guest memory -- with when, which entry and the old and new words, so the
+ * next run can watch that exact address and name the code that writes it. */
+static DWORD WINAPI h2_tag_check_thread(LPVOID unused)
+{
+    enum { MAXE = 65536 };
+    static uint32_t prev[MAXE * 4];
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    uint32_t base_prev = 0, n_prev = 0, reported = 0;
+    DWORD t0 = GetTickCount();
+    (void)unused;
+    t_in_report = 1;    /* the crash handler leaves this thread's faults to __except */
+    for (;;) {
+        uint32_t base, i, n = 0;
+        Sleep(1000);
+        __try {
+        base = *(const volatile uint32_t *)(m + 0x4E3B44u);
+        if (!((base >= 0x00010000u && base < 0x04000000u - 16u * MAXE)
+              || (base >= 0x80000000u && base < 0x84000000u - 16u * MAXE)))
+            continue;
+        /* entries run while the group tag reads as four printable bytes or the
+         * slot is empty; stop at a long empty run */
+        for (i = 0; i < MAXE; i++) {
+            const uint32_t *e = (const uint32_t *)(m + base + i * 16u);
+            uint32_t a = e[2];
+            int bad = e[0] && (a & 3u || !((a >= 0x00010000u && a < 0x04000000u)
+                                           || (a >= 0x80000000u && a < 0x84000000u)));
+            if (base == base_prev && i < n_prev && a != prev[i * 4 + 2] && bad
+                    && reported < 64) {
+                reported++;
+                fprintf(stderr, "[TAGCHK] t=%lus entry %u at 0x%08X: address %08X -> %08X "
+                        "(group %08X datum %08X size %08X) BAD\n",
+                        (unsigned long)((GetTickCount() - t0) / 1000), i,
+                        base + i * 16u + 8u, prev[i * 4 + 2], a, e[0], e[1], e[3]);
+                xbox_ReadAuditWhere("entry", base + i * 16u + 8u);
+                fflush(stderr);
+            }
+            memcpy(&prev[i * 4], e, 16);
+            if (e[0] || e[2]) n = i + 1;
+            else if (i > n + 256) break;
+        }
+        if (base != base_prev) {
+            uint32_t nbad = 0;
+            for (i = 0; i < n; i++)
+                if (prev[i * 4] && (prev[i * 4 + 2] & 3u)) nbad++;
+            fprintf(stderr, "[TAGCHK] table at 0x%08X, %u entries, %u misaligned now\n",
+                    base, n, nbad);
+            fflush(stderr);
+        }
+        base_prev = base;
+        n_prev = n;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            base_prev = 0;      /* table moved under us: resnapshot next pass */
+        }
+    }
+    return 0;
+}
+
+static void h2_tag_check_start(void)
+{
+    const char *e = getenv("RECOMP_TAG_CHECK");
+    if (e && *e == '1')     /* opt-in: the region also holds tag data that loads rewrite */
+        CloseHandle(CreateThread(NULL, 0, h2_tag_check_thread, NULL, 0, NULL));
 }
 
 /* Set in WinMain: the playable configuration (window, real input), and
@@ -728,6 +861,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * silently inert, and the one diagnostic that tells a hang from slowness
      * does nothing while appearing to be set. */
     xbox_WatchdogStart();
+    h2_tag_check_start();
 
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");

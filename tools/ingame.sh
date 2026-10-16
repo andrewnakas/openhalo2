@@ -16,9 +16,9 @@ rm -f "$OUT/dumpflag"
 cd ${XRDIR:-/d/n64work/halo2/build/xr}   # XRDIR=/d/n64work/halo2/build/xr32 runs the 32-bit build
 env "$@" RECOMP_WATCHDOG_SECS=$WD RECOMP_PB_REPORT_MS=${REPORT_MS:-5000} \
     RECOMP_PAD_LIVE=$OUT/pad.txt RECOMP_FB_DUMP_FLIPS=$OUT/dumpflag \
-    RECOMP_FB_DUMP=$OUT/fb ./halo2_recomp.exe > "$OUT/out.log" 2>&1 &
+    RECOMP_FB_DUMP=$OUT/fb ./${EXE:-halo2_recomp.exe} > "$OUT/out.log" 2>&1 &
 flips() { grep -a "fps (" "$OUT/out.log" | tail -1 | sed 's/.*(\([0-9]*\) flips).*/\1/'; }
-alive() { tasklist 2>/dev/null | grep -q halo2_recomp; }
+alive() { tasklist 2>/dev/null | grep -q "${EXE:-halo2_recomp.exe}"; }
 mark() { echo "MARK $1 at flips $(flips) t=$SECONDS" >> "$OUT/marks.txt"
          [ -n "$SHOTS" ] && bash /d/n64work/openhalo2/tools/shot.sh "$OUT" "m_$1" > /dev/null; }
 : > "$OUT/marks.txt"
@@ -39,6 +39,11 @@ for n in profile nosignin campaign newcampaign level difficulty; do
       r=$(python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');v=[sum(im.crop((405,y-5,435,y+5)).getdata()) for y in (287,315,343,371,399)];print(v.index(max(v)))" "$OUT/row.png")
       [ "$r" = 0 ] && break; echo "up:150" >> "$OUT/pad.txt"; sleep 2
     done; mark before_campaign
+  fi
+  # CAMPAIGN_DOWN=<n>: on Campaign Options (Resume / Select Level / Cooperative
+  # on a save with progress) press down n times first; 1 = Select Level
+  if [ $n = newcampaign ] && [ -n "$CAMPAIGN_DOWN" ]; then
+    for i in $(seq 1 $CAMPAIGN_DOWN); do echo "down:${CAMPAIGN_HOLD:-120}" >> "$OUT/pad.txt"; sleep 2; done; mark campaign_moved
   fi
   # LEVEL_KEYS="right,right,down": d-pad moves on Select Level before choosing (default: first level)
   if [ $n = level ] && [ -n "$LEVEL_KEYS" ]; then

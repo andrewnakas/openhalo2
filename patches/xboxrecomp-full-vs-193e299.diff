@@ -1868,7 +1868,7 @@ index b9a02bc..930e1e6 100644
  /* Total crossings of the DISPATCH boundary, and who is holding it up.
   * A depth that is non-zero while this stops moving is stuck, not busy. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..d15a14a 100644
+index c65ba43..ce98d39 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
@@ -2169,7 +2169,202 @@ index c65ba43..d15a14a 100644
          CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
      }
  
-@@ -3880,6 +4042,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3399,6 +3561,164 @@ static int bridge_async_io_enabled(void)
+     return on;
+ }
+ 
++/* ── Read audit (RECOMP_READ_AUDIT=1, on by default under RECOMP_SANITIZE=1) ──
++ *
++ * Every file read into guest memory is remembered with a hash per 4 KB page
++ * of what it delivered. xbox_ReadAuditCheck rehashes them all and says which
++ * loaded data has changed since (something wrote over it), and
++ * xbox_ReadAuditWhere names the read a guest address came from and whether
++ * its page still holds what was read. A later read into the same place
++ * supersedes the older record. Halo 2's crashes all read tag data that is
++ * garbage; this says whether it was loaded that way or overwritten after. */
++#ifdef _WIN32
++typedef struct {
++    uint32_t dest, len, seq, tick;
++    int64_t  foff;
++    char     file[28];       /* basename of the file read */
++    uint32_t *hash;          /* one per page, NULL = superseded */
++} read_audit_rec;
++#define READ_AUDIT_MAX 32768
++static read_audit_rec *g_ra;
++static LONG g_ra_n, g_ra_seq;
++static SRWLOCK g_ra_lock = SRWLOCK_INIT;
++static int g_ra_on = -1;
++
++extern int recomp_sanitize_fatal(void);
++
++static int read_audit_enabled(void)
++{
++    if (g_ra_on < 0) {
++        const char *e = getenv("RECOMP_READ_AUDIT");
++        g_ra_on = (e && *e) ? (*e != '0') : recomp_sanitize_fatal();
++        if (g_ra_on) {
++            g_ra = (read_audit_rec *)calloc(READ_AUDIT_MAX, sizeof *g_ra);
++            if (!g_ra) g_ra_on = 0;
++            else fprintf(stderr, "  [AUDIT] read audit on\n");
++        }
++    }
++    return g_ra_on;
++}
++
++static uint32_t ra_hash(const uint8_t *p, uint32_t n)
++{
++    uint32_t h = 2166136261u, i;
++    for (i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
++    return h;
++}
++
++static void read_audit_note(uint32_t dest, uint32_t len, int64_t foff, HANDLE h)
++{
++    read_audit_rec *r;
++    uint32_t pages, i;
++    LONG k;
++    if (!len || !read_audit_enabled())
++        return;
++    pages = (len + 4095) / 4096;
++    AcquireSRWLockExclusive(&g_ra_lock);
++    for (k = 0; k < g_ra_n; k++) {          /* older reads into the same place */
++        r = &g_ra[k];
++        if (r->hash && r->dest < dest + len && dest < r->dest + r->len) {
++            free(r->hash);
++            r->hash = NULL;
++        }
++    }
++    if (g_ra_n == READ_AUDIT_MAX) {         /* full: compact out the dead */
++        LONG w = 0;
++        for (k = 0; k < g_ra_n; k++)
++            if (g_ra[k].hash) g_ra[w++] = g_ra[k];
++        g_ra_n = w;
++    }
++    if (g_ra_n < READ_AUDIT_MAX) {
++        r = &g_ra[g_ra_n];
++        r->hash = (uint32_t *)malloc(pages * sizeof(uint32_t));
++        if (r->hash) {
++            const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(dest);
++            for (i = 0; i < pages; i++)
++                r->hash[i] = ra_hash(p + i * 4096, (i + 1 == pages) ? len - i * 4096 : 4096);
++            r->dest = dest; r->len = len; r->foff = foff;
++            r->seq = (uint32_t)++g_ra_seq; r->tick = GetTickCount();
++            {
++                char full[MAX_PATH]; DWORD n = GetFinalPathNameByHandleA(h, full, MAX_PATH, 0);
++                const char *b = full, *q;
++                if (!n || n >= MAX_PATH) strcpy(full, "?");
++                for (q = full; *q; q++) if (*q == '\\' || *q == '/') b = q + 1;
++                strncpy(r->file, b, sizeof r->file - 1); r->file[sizeof r->file - 1] = 0;
++            }
++            g_ra_n++;
++        }
++    }
++    ReleaseSRWLockExclusive(&g_ra_lock);
++}
++
++/* Which loaded data has changed since it was read. Prints a summary and the
++ * first records with changed pages. */
++void xbox_ReadAuditCheck(const char *why)
++{
++    LONG k, live = 0, changed = 0, shown = 0;
++    uint32_t now = GetTickCount();
++    if (g_ra_on <= 0)
++        return;
++    AcquireSRWLockShared(&g_ra_lock);
++    for (k = g_ra_n - 1; k >= 0; k--) {     /* newest first */
++        read_audit_rec *r = &g_ra[k];
++        uint32_t pages, i, first = 0xFFFFFFFFu, nch = 0;
++        const uint8_t *p;
++        if (!r->hash)
++            continue;
++        live++;
++        pages = (r->len + 4095) / 4096;
++        p = (const uint8_t *)XBOX_TO_NATIVE(r->dest);
++        for (i = 0; i < pages; i++)
++            if (r->hash[i] != ra_hash(p + i * 4096, (i + 1 == pages) ? r->len - i * 4096 : 4096)) {
++                if (first == 0xFFFFFFFFu) first = i;
++                nch++;
++            }
++        if (nch) {
++            changed++;
++            if (shown++ < 24)
++                fprintf(stderr, "  [AUDIT] read #%u -> 0x%08X len %u file@%lld, %u s ago: "
++                                "%u of %u pages changed, first +0x%X (%s)\n",
++                        r->seq, r->dest, r->len, (long long)r->foff,
++                        (now - r->tick) / 1000, nch, pages, first * 4096, r->file);
++        }
++    }
++    fprintf(stderr, "  [AUDIT] %s: %ld loaded regions, %ld changed since read\n",
++            why, (long)live, (long)changed);
++    ReleaseSRWLockShared(&g_ra_lock);
++    fflush(stderr);
++}
++
++/* The read a guest address came from, and whether its page still holds what
++ * was read. Silent when no read covers it. */
++void xbox_ReadAuditWhere(const char *name, uint32_t va)
++{
++    LONG k;
++    if (g_ra_on <= 0)
++        return;
++    AcquireSRWLockShared(&g_ra_lock);
++    for (k = g_ra_n - 1; k >= 0; k--) {
++        read_audit_rec *r = &g_ra[k];
++        if (r->hash && va >= r->dest && va - r->dest < r->len) {
++            uint32_t i = (va - r->dest) / 4096;
++            uint32_t n = (i + 1 == (r->len + 4095) / 4096) ? r->len - i * 4096 : 4096;
++            int same = r->hash[i] == ra_hash((const uint8_t *)XBOX_TO_NATIVE(r->dest + i * 4096), n);
++            fprintf(stderr, "  [AUDIT] %s=0x%08X is in read #%u (0x%08X len %u file@%lld), "
++                            "page %s since read (%s)\n", name, va, r->seq, r->dest, r->len,
++                    (long long)r->foff, same ? "UNCHANGED" : "CHANGED", r->file);
++            break;
++        }
++    }
++    ReleaseSRWLockShared(&g_ra_lock);
++}
++#else
++static void read_audit_note(uint32_t dest, uint32_t len, int64_t foff, void *h)
++{ (void)dest; (void)len; (void)foff; (void)h; }
++void xbox_ReadAuditCheck(const char *why) { (void)why; }
++void xbox_ReadAuditWhere(const char *name, uint32_t va) { (void)name; (void)va; }
++#endif
++
++void xbox_WatchHostWrite(uint32_t va, uint32_t len, int after);  /* RECOMP_WATCH */
++
+ /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
+ static void bridge_NtReadFile(void)
+ {
+@@ -3422,8 +3742,10 @@ static void bridge_NtReadFile(void)
+         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
+         poff = &off;
+     }
++    xbox_WatchHostWrite(buffer_va, length, 0);
+     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                 XBOX_TO_NATIVE(buffer_va), length, poff);
++    xbox_WatchHostWrite(buffer_va, (uint32_t)ios.Information, 1);
+ 
+     /* What a read actually delivered. A decoder that rejects its input cannot
+      * say whether the bytes were wrong or the read was, and the two look
+@@ -3451,6 +3773,18 @@ static void bridge_NtReadFile(void)
+                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+         fflush(stderr);
+     }
++#ifdef _WIN32
++    if (ios.Information && read_audit_enabled()) {
++        int64_t fo = -1;
++        if (poff) fo = off.QuadPart;
++        else {
++            LARGE_INTEGER z = {0}, pos;
++            if (SetFilePointerEx(handle, z, &pos, FILE_CURRENT))
++                fo = pos.QuadPart - (int64_t)ios.Information;
++        }
++        read_audit_note(buffer_va, (uint32_t)ios.Information, fo, handle);
++    }
++#endif
+     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
+     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
+                             iostatus);
+@@ -3880,6 +4214,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
@@ -2186,7 +2381,7 @@ index c65ba43..d15a14a 100644
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
-@@ -9353,7 +9525,17 @@ static void kernel_thunk_dispatch_body(void);
+@@ -9353,7 +9697,17 @@ static void kernel_thunk_dispatch_body(void);
   * thread sets, with no kernel call in the loop, deadlocks here. The console
   * would preempt it on its quantum; the upgrade is a periodic yield point in
   * the lifted code's backward branches. */
@@ -2205,7 +2400,7 @@ index c65ba43..d15a14a 100644
  static int g_guest_cpu_on = -1;
  static RECOMP_TLS int t_guest_thread;     /* this host thread runs a guest thread */
  static RECOMP_TLS int t_guest_held;       /* and holds the guest CPU */
-@@ -9363,52 +9545,175 @@ static int guest_cpu_enabled(void)
+@@ -9363,52 +9717,189 @@ static int guest_cpu_enabled(void)
  {
      if (g_guest_cpu_on < 0) {
          const char *e = getenv("RECOMP_GUEST_LOCK");
@@ -2303,6 +2498,20 @@ index c65ba43..d15a14a 100644
 +        guest_cpu_give();
 +}
 +
++/* Lock audit: a device-level ISR (xbox_IrqlEnterInterrupt(>2)) runs guest
++ * code on a host thread without the guest CPU. On the console it would have
++ * stopped the running thread at an instruction boundary; here it runs beside
++ * it. Counted when another thread holds the CPU at that moment, printed in the
++ * [KERNEL] summary as "ISRs beside". */
++static volatile LONG g_guest_cpu_isr_beside, g_guest_cpu_isr_total;
++void xbox_GuestCpuNoteIsr(void)
++{
++    LONG owner = g_guest_cpu_owner;
++    InterlockedIncrement(&g_guest_cpu_isr_total);
++    if (g_guest_cpu_on > 0 && owner && owner != (LONG)GetCurrentThreadId())
++        InterlockedIncrement(&g_guest_cpu_isr_beside);
++}
++
 +/* Kernel calls that may wait on another thread: always let go for these.
 + * Any other call made at DISPATCH_LEVEL keeps the CPU, as on the console,
 + * where nothing else runs until the thread lowers its IRQL. */
@@ -2393,7 +2602,7 @@ index c65ba43..d15a14a 100644
      }
      (void)held;
  }
-@@ -9473,6 +9778,31 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9473,6 +9964,44 @@ static void kernel_thunk_dispatch_body(void)
                      fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
                              (unsigned long long)g_ordinal_calls[best]);
                  }
@@ -2417,10 +2626,23 @@ index c65ba43..d15a14a 100644
 +                                (double)g_ordinal_ticks[best] / (double)qf.QuadPart);
 +                    }
 +                    fprintf(stderr, " | waiting for guest CPU %.1fs (kept raised %ld, gave up %ld,"
-+                            " DPCs borrowed %ld, ran beside %ld)\n",
++                            " DPCs borrowed %ld, ran beside %ld, ISRs beside %ld of %ld)\n",
 +                            (double)g_guest_cpu_wait_ticks / (double)qf.QuadPart,
 +                            (long)g_guest_cpu_kept, (long)g_guest_cpu_timeouts,
-+                            (long)g_guest_cpu_borrowed, (long)g_guest_cpu_borrow_missed);
++                            (long)g_guest_cpu_borrowed, (long)g_guest_cpu_borrow_missed,
++                            (long)g_guest_cpu_isr_beside, (long)g_guest_cpu_isr_total);
++                }
++            }
++            {   /* RECOMP_READ_AUDIT_EVERY=<s>: rehash loaded data on a timer */
++                static int every = -1;
++                static DWORD last_audit;
++                if (every < 0) {
++                    const char *e = getenv("RECOMP_READ_AUDIT_EVERY");
++                    every = e ? atoi(e) : 0;
++                }
++                if (every > 0 && now - last_audit >= (DWORD)every * 1000u) {
++                    last_audit = now;
++                    xbox_ReadAuditCheck("periodic");
 +                }
              }
              fflush(stderr);
@@ -3021,7 +3243,7 @@ index 42135e0..7b420a1 100644
                  ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
                  ULONGLONG avail = (ULONGLONG)vfs.f_bavail * vfs.f_frsize;
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 1ad4fff..9dcf75c 100644
+index 1ad4fff..991cced 100644
 --- a/src/kernel/kernel_hal.c
 +++ b/src/kernel/kernel_hal.c
 @@ -167,6 +167,152 @@ void xbox_IrqlDumpHolders(void)
@@ -3209,9 +3431,17 @@ index 1ad4fff..9dcf75c 100644
      d = now ? InterlockedIncrement(&g_irql_raised_count)
              : InterlockedDecrement(&g_irql_raised_count);
      InterlockedIncrement(&s_transitions);
-@@ -213,7 +384,9 @@ int xbox_IrqlEnterInterrupt(int level)
+@@ -209,11 +380,17 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+  *
+  * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
+  * DPC, the device level for an ISR -- and code checks: see irql_publish. */
++void xbox_GuestCpuNoteIsr(void);   /* kernel_bridge.c: lock audit */
++
+ int xbox_IrqlEnterInterrupt(int level)
  {
      int saved = (int)g_current_irql;
++    if (level > DISPATCH_LEVEL)
++        xbox_GuestCpuNoteIsr();
      if (g_current_irql != (KIRQL)level) {
 +        t_irql_no_lock = (level > DISPATCH_LEVEL);
          irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
@@ -7236,7 +7466,7 @@ index 0000000..531a104
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..9ee2e7d 100644
+index c65632c..82b87e1 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -37,6 +37,7 @@
@@ -7247,7 +7477,46 @@ index c65632c..9ee2e7d 100644
  #if defined(_WIN32)
  #include <windows.h>
  #define NV_TLS __declspec(thread)
-@@ -225,7 +226,14 @@ typedef struct {
+@@ -121,6 +122,38 @@ static uint32_t dma_resolve(uint32_t offset)
+     return offset;                         /* nothing better to offer */
+ }
+ 
++/* Where a GET_REPORT (visibility-test result) goes.
++ *
++ * D3D builds the parameter from its report slot's window address as
++ * (va & 0x0EFFFFFF) | 0x01000000: address bits 0-23 and 25-27, with bit 24
++ * forced on as the "pixel count" type. Only the low 24 bits were taken as
++ * the offset, which dropped bits 25-27. Halo 2's second D3D device lives just
++ * above the title's 51 MB pool pinned at physical 0x61000 (its last block
++ * ends at 0x8366C000), so every report for slot 0x8366C0xx landed at
++ * 0x8066C0xx instead -- inside the pool, on Cairo Station's tag data. That
++ * zeroed an object definition (0x8066C168); object creation then took a
++ * garbage size, ran a zeroing loop over the rest of memory, and crashed at
++ * the station door. D3D's own slots never got a result either, so its
++ * occlusion queries read stale answers.
++ *
++ * Bit 24 cannot be told from the type flag by the number alone. The slot is
++ * D3D's own allocation, never inside a range the title pinned at a fixed
++ * address: of the two candidates take the one outside the pinned pool,
++ * preferring bit 24 as sent. */
++static uint32_t report_resolve(uint32_t base, uint32_t param)
++{
++    extern int xbox_ContiguousPinned(uint32_t va);
++    uint32_t hi = base + (param & 0x0FFFFFFFu);   /* bit 24 as sent */
++    uint32_t lo = base + (param & 0x0EFFFFFFu);   /* bit 24 clear */
++    uint32_t pa = hi;
++    if ((uint64_t)hi < XBOX_CONTIG_SIZE && xbox_ContiguousPinned(XBOX_CONTIG_BASE + hi)
++            && !xbox_ContiguousPinned(XBOX_CONTIG_BASE + lo))
++        pa = lo;
++    if ((uint64_t)pa < XBOX_CONTIG_SIZE)
++        return XBOX_CONTIG_BASE + pa;
++    return dma_resolve(pa);
++}
++
+ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
+ {
+     static int said;
+@@ -225,7 +258,14 @@ typedef struct {
  } VertexAttr;
  
  #define NV_VERTEX_ATTRS 16
@@ -7263,7 +7532,7 @@ index c65632c..9ee2e7d 100644
  #define NV_MAX_INLINE   65536           /* dwords of INLINE_ARRAY per batch */
  
  /* Texture stage 0, decoded from what the title programmed.
-@@ -234,24 +242,28 @@ typedef struct {
+@@ -234,24 +274,28 @@ typedef struct {
   * nothing writes to is a stage nothing can be sampled from. The rest arrive
   * as unhandled methods and are counted as such, which is how the next title
   * that needs them will say so. */
@@ -7305,7 +7574,7 @@ index c65632c..9ee2e7d 100644
      /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
       * instead of into a buffer the title points at. Same vertex format, a
       * different place to read them from. */
-@@ -307,6 +319,7 @@ static struct {
+@@ -307,6 +351,7 @@ static struct {
      Nv2aCombiner rc;
      int      rc_seen;
      uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
@@ -7313,7 +7582,7 @@ index c65632c..9ee2e7d 100644
      uint32_t alpha_test, alpha_func, alpha_ref;
      uint32_t fog_enable, fog_mode, fog_color;
      float    fog_param[2];
-@@ -315,13 +328,14 @@ static struct {
+@@ -315,13 +360,14 @@ static struct {
      uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
      uint32_t batches_program, verts_program, tris_behind;
      /* Where program-path triangles go, so "nothing drew" has a reason. */
@@ -7329,7 +7598,7 @@ index c65632c..9ee2e7d 100644
  } s_gpu;
  
  /* Unhandled methods, ranked. The interesting output is not that something was
-@@ -440,8 +454,97 @@ static void note_texture_use(void)
+@@ -440,8 +486,97 @@ static void note_texture_use(void)
      }
  }
  
@@ -7427,7 +7696,7 @@ index c65632c..9ee2e7d 100644
      int i;
  
      s_gpu.unhandled_total++;
-@@ -583,12 +686,18 @@ static uint32_t surface_bpp(void)
+@@ -583,12 +718,18 @@ static uint32_t surface_bpp(void)
   * the sequence. */
  static int s_flip_dumping;
  
@@ -7446,7 +7715,7 @@ index c65632c..9ee2e7d 100644
      uint32_t pitch = drawn ? s_gpu.drawn_pitch : s_gpu.pitch;
      uint32_t cx = drawn ? s_gpu.drawn_x : s_gpu.clip_x;
      uint32_t cy = drawn ? s_gpu.drawn_y : s_gpu.clip_y;
-@@ -649,6 +758,11 @@ static void dump_surface_bmp(void)
+@@ -649,6 +790,11 @@ static void dump_surface_bmp(void)
          }
      }
      fclose(f);
@@ -7458,7 +7727,7 @@ index c65632c..9ee2e7d 100644
      if (seq == 1)
          fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
                  path, w, h, s_gpu.color_offset, bpp);
-@@ -659,6 +773,7 @@ static void dump_surface_bmp(void)
+@@ -659,6 +805,7 @@ static void dump_surface_bmp(void)
  static void raster_triangle(const float a[2], const float b[2],
                              const float c[2], uint32_t argb,
                              const float uv[3][2]);
@@ -7466,7 +7735,7 @@ index c65632c..9ee2e7d 100644
  
  static void clear_surface(uint32_t param)
  {
-@@ -679,13 +794,63 @@ static void clear_surface(uint32_t param)
+@@ -679,13 +826,63 @@ static void clear_surface(uint32_t param)
          s_gpu.color_base = base;
      }
  
@@ -7533,7 +7802,7 @@ index c65632c..9ee2e7d 100644
          } else if (bpp == 2) {
              /* The clear value is always given as A8R8G8B8; a 16-bit surface
               * takes the same colour reduced to 5:6:5. */
-@@ -693,7 +858,7 @@ static void clear_surface(uint32_t param)
+@@ -693,7 +890,7 @@ static void clear_surface(uint32_t param)
                                    | ((s_gpu.clear_color >> 5) & 0x07E0)
                                    | ((s_gpu.clear_color >> 3) & 0x001F));
              uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
@@ -7542,7 +7811,7 @@ index c65632c..9ee2e7d 100644
                  p[x] = v;
          }
      }
-@@ -701,7 +866,7 @@ static void clear_surface(uint32_t param)
+@@ -701,7 +898,7 @@ static void clear_surface(uint32_t param)
      /* Progress markers, interleaved with everything else in the log. The
       * summary says drawing stopped; only a marker next to the surrounding
       * activity says what the title was doing when it stopped. */
@@ -7551,7 +7820,7 @@ index c65632c..9ee2e7d 100644
          fprintf(stderr, "  [GPU] clear #%u\n", s_gpu.clears);
      /* Distinct clear colours actually used. "Cleared to black" and "the clear
       * never ran" look identical in the framebuffer, and only one of them is a
-@@ -854,6 +1019,11 @@ static uint32_t linear_twin(uint32_t fmt)
+@@ -854,6 +1051,11 @@ static uint32_t linear_twin(uint32_t fmt)
  {
      switch (fmt) {
      case 0x00: return 0x13;                /* L8        -> LIN_L8        */
@@ -7563,7 +7832,7 @@ index c65632c..9ee2e7d 100644
      case 0x02: return 0x10;                /* A1R5G5B5  -> LIN_A1R5G5B5  */
      case 0x03: return 0x1C;                /* X1R5G5B5  -> LIN_X1R5G5B5  */
      case 0x04: return 0x1D;                /* A4R4G4B4  -> LIN_A4R4G4B4  */
-@@ -1006,6 +1176,20 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1006,6 +1208,20 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
      case 0x1F:                                      /* LIN_A8 */
          *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
          return 1;
@@ -7584,7 +7853,7 @@ index c65632c..9ee2e7d 100644
  
      /* 4:2:2 packed YUV, two texels per four bytes.
       *
-@@ -1245,6 +1429,55 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
+@@ -1245,6 +1461,55 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
      }
  }
  
@@ -7640,7 +7909,7 @@ index c65632c..9ee2e7d 100644
  /* Half-space fill. Barycentric edge functions rather than scanline slopes:
   * the same test decides both windings, so a title that emits clockwise
   * triangles does not silently render nothing. */
-@@ -1285,6 +1518,15 @@ static void raster_triangle(const float a[2], const float b[2],
+@@ -1285,6 +1550,15 @@ static void raster_triangle(const float a[2], const float b[2],
          return;
      }
  
@@ -7656,7 +7925,7 @@ index c65632c..9ee2e7d 100644
      for (y = miny; y < maxy; y++) {
          for (x = minx; x < maxx; x++) {
              float px = (float)x + 0.5f, py = (float)y + 0.5f;
-@@ -1620,9 +1862,12 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+@@ -1620,9 +1894,12 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
  {
      switch (fmt) {
      case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
@@ -7670,7 +7939,7 @@ index c65632c..9ee2e7d 100644
          return 2;
      default:
          return 4;
-@@ -1702,14 +1947,17 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
+@@ -1702,14 +1979,17 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
          return 1;
      case 1: case 2:                               /* PROJECT2D / 3D */
          rc_texel(t, 0, c[0] / q, c[1] / q, out);
@@ -7690,7 +7959,7 @@ index c65632c..9ee2e7d 100644
          }
          if (ax >= ay && ax >= az) {
              face = x > 0 ? 0 : 1; ma = ax; sc = x > 0 ? -z : z; tc = -y;
-@@ -1785,6 +2033,111 @@ static int alpha_test_pass(float a)
+@@ -1785,6 +2065,111 @@ static int alpha_test_pass(float a)
      }
  }
  
@@ -7802,7 +8071,7 @@ index c65632c..9ee2e7d 100644
  /* Everything a triangle's pixels need, computed once per triangle, so the
   * pixel loop can run over any subset of rows on any thread. */
  typedef struct {
-@@ -1794,7 +2147,10 @@ typedef struct {
+@@ -1794,7 +2179,10 @@ typedef struct {
      const float *a, *b, *c;
      float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
      float *zb;
@@ -7813,7 +8082,7 @@ index c65632c..9ee2e7d 100644
  } XfTri;
  
  typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
-@@ -1819,7 +2175,16 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -1819,7 +2207,16 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                  continue;
              /* w1 is opposite a, w2 opposite b, w0 opposite c. */
              l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
@@ -7831,7 +8100,7 @@ index c65632c..9ee2e7d 100644
              {
                  float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
                  int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
-@@ -1904,12 +2269,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -1904,12 +2301,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -7875,7 +8144,7 @@ index c65632c..9ee2e7d 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -1919,7 +2315,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -1919,7 +2347,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -7890,7 +8159,7 @@ index c65632c..9ee2e7d 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -1985,12 +2387,92 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -1985,12 +2419,92 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
  }
  #endif
  
@@ -7983,7 +8252,7 @@ index c65632c..9ee2e7d 100644
      const float *a, *b, *c;
      float area, su = 1.0f, sv = 1.0f;
      int k;
-@@ -2004,6 +2486,42 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2004,6 +2518,42 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      T.textured = s_gpu.texs[0].valid;
      T.use_rc = s_gpu.rc_seen && !no_rc;
      T.va = va; T.vb = vb; T.vc = vc;
@@ -8026,7 +8295,7 @@ index c65632c..9ee2e7d 100644
  
      v[0] = va; v[1] = vb; v[2] = vc;
      a = va->pos; b = vb->pos; c = vc->pos;
-@@ -2016,9 +2534,83 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2016,9 +2566,83 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      }
      area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
      if (area == 0.0f || area != area) {
@@ -8110,7 +8379,7 @@ index c65632c..9ee2e7d 100644
      for (k = 0; k < 3; k++) {
          if (!s_gpu.xf_seeded)
              s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
-@@ -2028,7 +2620,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2028,7 +2652,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_seeded = 1;
      if (!surface_begin_batch(T.mem))
          return;
@@ -8120,7 +8389,7 @@ index c65632c..9ee2e7d 100644
          T.zb = zbuf_current(1);
      if (tex_size_from_format(s_gpu.texs[0].color)) {
          su = (float)s_gpu.texs[0].width;
-@@ -2070,7 +2663,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2070,7 +2695,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -8151,7 +8420,7 @@ index c65632c..9ee2e7d 100644
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
      s_gpu.zpass_count += cnt.zpass;
-@@ -2180,9 +2795,82 @@ static void raster_batch_program(void)
+@@ -2180,9 +2827,82 @@ static void raster_batch_program(void)
  {
      uint32_t i, n = s_gpu.idx_count;
  
@@ -8237,7 +8506,7 @@ index c65632c..9ee2e7d 100644
      s_gpu.batches_program++;
      s_gpu.verts_program += n;
      if (s_gpu.blend_enable) {
-@@ -2250,8 +2938,11 @@ static void raster_batch_program(void)
+@@ -2250,8 +2970,11 @@ static void raster_batch_program(void)
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -8250,7 +8519,7 @@ index c65632c..9ee2e7d 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -2380,9 +3071,23 @@ static void raster_batch(void)
+@@ -2380,9 +3103,23 @@ static void raster_batch(void)
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
@@ -8275,7 +8544,7 @@ index c65632c..9ee2e7d 100644
          return;
      if (s_ftrace == 3) {
          /* Deleting the flag file re-arms the trace for the next time it
-@@ -2417,7 +3122,12 @@ static void draw_primitive(void)
+@@ -2417,7 +3154,12 @@ static void draw_primitive(void)
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
@@ -8289,7 +8558,7 @@ index c65632c..9ee2e7d 100644
          fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
      s_gpu.verts += s_gpu.idx_count;
  
-@@ -2440,8 +3150,22 @@ static void draw_primitive(void)
+@@ -2440,8 +3182,22 @@ static void draw_primitive(void)
      {
          uint32_t t0 = s_gpu.tris_drawn;
          uint64_t p0 = s_gpu.pixels;
@@ -8312,7 +8581,7 @@ index c65632c..9ee2e7d 100644
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
                      " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
-@@ -2489,9 +3213,12 @@ static void draw_primitive(void)
+@@ -2489,9 +3245,12 @@ static void draw_primitive(void)
          }
      }
  
@@ -8328,7 +8597,7 @@ index c65632c..9ee2e7d 100644
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
                              " off 0x%08X type %u size %u stride %u\n",
                      s_gpu.prim, s_gpu.idx_count, s_gpu.attr[0].offset,
-@@ -2840,6 +3567,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2840,6 +3599,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
      case NV097_SET_TEXTURE_CONTROL1:
          t->pitch = param >> 16;          /* linear formats only */
          break;
@@ -8338,7 +8607,7 @@ index c65632c..9ee2e7d 100644
      case NV097_SET_TEXTURE_IMAGE_RECT:
          t->width  = param >> 16;
          t->height = param & 0xFFFF;
-@@ -2851,12 +3581,361 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2851,12 +3613,367 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          break;
      }
      tex_update_valid(t);
@@ -8468,6 +8737,8 @@ index c65632c..9ee2e7d 100644
 +static uint32_t s_sem_handle, s_sem_offset;
 +static uint32_t s_report_handle;         /* SET_CONTEXT_DMA_REPORT, see GET_REPORT */
 +
++static uint32_t s_dma_last_w[4];        /* last object looked up: w0, w1 (limit), w2, inst */
++
 +static int dma_object_base(uint32_t handle, uint32_t *base_out)
 +{
 +    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -8484,6 +8755,10 @@ index c65632c..9ee2e7d 100644
 +            uint32_t inst = (ctx & 0xFFFFu) << 4;
 +            uint32_t w0 = *(const uint32_t *)(mem + ramin + inst);
 +            uint32_t w2 = *(const uint32_t *)(mem + ramin + inst + 8);
++            s_dma_last_w[0] = w0;
++            s_dma_last_w[1] = *(const uint32_t *)(mem + ramin + inst + 4);
++            s_dma_last_w[2] = w2;
++            s_dma_last_w[3] = inst;
 +            *base_out = (w2 & 0xFFFFF000u) + (w0 >> 20);
 +            return 1;
 +        }
@@ -8700,7 +8975,7 @@ index c65632c..9ee2e7d 100644
      static int inited;
      if (!inited) {
          inited = 1;
-@@ -2956,6 +4035,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2956,6 +4073,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          s_gpu.rc_seen = 1;
          break;
      case 0x1E70: s_gpu.rc.stage_program = param; break;
@@ -8708,7 +8983,7 @@ index c65632c..9ee2e7d 100644
      case 0x17F8: s_gpu.clip_plane_mode = param; break;
  
      /* Alpha test and fog. */
-@@ -2967,6 +4047,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2967,6 +4085,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x029C: s_gpu.fog_mode = param; break;
      case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
@@ -8718,7 +8993,7 @@ index c65632c..9ee2e7d 100644
      case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
          s_gpu.zpass_count = 0;
          break;
-@@ -2980,10 +4063,25 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2980,10 +4101,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
           * starts the slot at 0xFFFFFFFF) sees every test incomplete. Burnout
           * 3 culls its world with these, so the race's main view drew only
           * the sky while the cube-map passes, which do not test, drew it all.
@@ -8733,20 +9008,26 @@ index c65632c..9ee2e7d 100644
 -        uint32_t at = dma_resolve(param & 0x00FFFFFFu);
 +        uint32_t base = 0, at;
          uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
-+        if (s_report_handle && !dma_object_base(s_report_handle, &base))
++        int found = s_report_handle && dma_object_base(s_report_handle, &base);
++        if (!found)
 +            base = 0;
-+        at = dma_resolve(base + (param & 0x00FFFFFFu));
++        at = report_resolve(base, param);
 +        {
 +            static unsigned shown;
++            extern int xbox_PhysicalKind(uint32_t pa);
 +            if (shown++ < 4)
-+                fprintf(stderr, "  [NV2A] report %u -> 0x%08X (object 0x%X base 0x%08X + 0x%X)\n",
-+                        s_gpu.zpass_count, at, s_report_handle, base,
-+                        param & 0x00FFFFFFu);
++                fprintf(stderr, "  [NV2A] report %u -> 0x%08X (param 0x%08X, object 0x%X %s, base 0x%08X, page kind %d)\n",
++                        s_gpu.zpass_count, at, param, s_report_handle,
++                        found ? "found in RAMHT" : "NOT FOUND in RAMHT", base,
++                        xbox_PhysicalKind(base + (param & 0x00FFFFFFu)));
++            if (shown <= 4 && found)
++                fprintf(stderr, "  [NV2A]   report object instance 0x%X: %08X %08X %08X\n",
++                        s_dma_last_w[3], s_dma_last_w[0], s_dma_last_w[1], s_dma_last_w[2]);
 +        }
          memcpy(mem + at, &stamp, 8);
          memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
          memset(mem + at + 12, 0, 4);
-@@ -3004,8 +4102,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3004,8 +4146,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -8763,7 +9044,7 @@ index c65632c..9ee2e7d 100644
          break;
  
      case NV097_SET_BEGIN_END:
-@@ -3052,19 +4156,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3052,19 +4200,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  
          if (!s_gpu.prim)
              break;
@@ -8820,7 +9101,7 @@ index c65632c..9ee2e7d 100644
      case NV097_SET_FLIP_READ:
          if (s_ftrace == 2)
              fprintf(stderr, "[FTRACE] P_READ %u%c", param, 10);
-@@ -3099,6 +4235,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3099,6 +4279,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
@@ -8828,7 +9109,7 @@ index c65632c..9ee2e7d 100644
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -3119,6 +4256,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3119,6 +4300,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -8852,7 +9133,7 @@ index c65632c..9ee2e7d 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-@@ -3146,6 +4300,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3146,6 +4344,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -8861,7 +9142,7 @@ index c65632c..9ee2e7d 100644
  
          if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
              static unsigned n;
-@@ -3181,8 +4337,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3181,8 +4381,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
      case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
      case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
@@ -8893,7 +9174,7 @@ index c65632c..9ee2e7d 100644
          if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
              s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
              break;
-@@ -3449,6 +4628,20 @@ void nv2a_pb_exec_report(void)
+@@ -3449,6 +4672,20 @@ void nv2a_pb_exec_report(void)
      /* Drawn and skipped separately: "nothing appeared" and "every batch needed
       * a vertex program we do not run" look identical on screen, and only one
       * of them means the rasteriser is broken. */
@@ -8914,7 +9195,7 @@ index c65632c..9ee2e7d 100644
      fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
      fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
                      " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
-@@ -3462,6 +4655,26 @@ void nv2a_pb_exec_report(void)
+@@ -3462,6 +4699,26 @@ void nv2a_pb_exec_report(void)
      fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                      " %u triangles dropped behind the eye\n",
              s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
@@ -10163,7 +10444,7 @@ index 8acb0af..8570caa 100644
  void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
  const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..15554ef 100644
+index 72d5131..6ffb011 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -152,6 +152,9 @@ static size_t xbox_TiledApertureSize(void)
@@ -10340,7 +10621,194 @@ index 72d5131..15554ef 100644
          Sleep(0);  /* yield; the waiter is spinning on another core */
      }
      return 0;
-@@ -1176,6 +1267,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+@@ -1173,9 +1264,199 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+ }
+ #endif
+ 
++/* ── Sanitizer (RECOMP_SANITIZE) ─────────────────────────────
++ *
++ * RECOMP_SANITIZE=1 in the environment makes the first violation fatal: the
++ * report names the guest site and its return chain, then an access violation
++ * is raised so the port's crash handler adds the full register/stack dump.
++ * Without it each check logs and the run carries on (the old behaviour). The
++ * per-call ABI check needs the build flag -DRECOMP_SANITIZE as well; the bulk
++ * write guard and strict indirect calls work in every build. */
++int recomp_sanitize_fatal(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        /* RECOMP_SANITIZE=log: report every violation once, never stop
++         * (crash shield and skips as normal) -- one run lists them all. */
++        const char *e = getenv("RECOMP_SANITIZE");
++        on = (e && *e && *e != '0' && strcmp(e, "log") != 0);
++        if (on)
++            fprintf(stderr, "[SAN] sanitizer on: first violation stops the run\n");
++        else if (e && !strcmp(e, "log"))
++            fprintf(stderr, "[SAN] sanitizer in log mode: violations reported, run continues\n");
++    }
++    return on;
++}
++
++/* The guest return chain from `esp`: words that point into code. */
++void recomp_san_guest_chain(uint32_t esp)
++{
++    const uint32_t *sp;
++    int i, shown = 0;
++    if (!g_xbox_mem_offset || esp < 0x1000u || esp >= 0x04000000u - 1024u)
++        return;
++    sp = (const uint32_t *)((uintptr_t)g_xbox_mem_offset + esp);
++    fprintf(stderr, "[SAN]   guest chain from esp=%08X:", esp);
++    for (i = 0; i < 256 && shown < 16; i++)
++        if (sp[i] > g_xbox_code_lo && sp[i] < g_xbox_code_hi) {
++            fprintf(stderr, " +%X:%08X", i * 4, sp[i]);
++            shown++;
++        }
++    fprintf(stderr, "\n[SAN]   args:");
++    for (i = 0; i < 8; i++)
++        fprintf(stderr, " %08X", sp[i]);
++    fputc('\n', stderr);
++}
++
++void xbox_ReadAuditWhere(const char *name, uint32_t va);   /* kernel_bridge.c */
++
++void recomp_san_stop(const char *what)
++{
++    fprintf(stderr, "[SAN] STOP: %s\n", what);
++    /* Pointers on the guest stack that point into loaded file data: the read
++     * each came from, and whether that page has changed since. */
++    if (g_xbox_mem_offset && g_esp >= 0x1000u && g_esp < 0x04000000u - 512u) {
++        const uint32_t *sp = (const uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
++        char nm[16];
++        int i;
++        for (i = 0; i < 96; i++) {
++            uint32_t v = sp[i];
++            if ((v >= 0x00010000u && v < 0x04000000u) || (v >= 0x80000000u && v < 0x84000000u)) {
++                snprintf(nm, sizeof nm, "[esp+%X]", i * 4);
++                xbox_ReadAuditWhere(nm, v);
++            }
++        }
++    }
++    fflush(stderr);
++#ifdef _WIN32
++    {
++        ULONG_PTR info[2] = { 1, 0x5A4E };   /* "write" of host 0x5A4E: never shielded */
++        RaiseException(EXCEPTION_ACCESS_VIOLATION, EXCEPTION_NONCONTINUABLE, 2, info);
++    }
++#endif
++    abort();
++}
++
++#ifdef RECOMP_SANITIZE
++RECOMP_TLS uint32_t g_last_ret_n;
++extern RECOMP_TLS int g_fp_top;          /* defined below */
++
++/* A call came back unbalanced. Printed once per target (with a count kept
++ * for the summary), fatal under RECOMP_SANITIZE=1. */
++void recomp_san_abi(uint32_t va, uint32_t ebx0, uint32_t esi0, uint32_t edi0,
++                    uint32_t esp0, uint32_t retn, int fp0)
++{
++    enum { SLOTS = 256 };
++    static volatile uint32_t seen[SLOTS];
++    static volatile LONG count;
++    LONG i, n = count;
++    int32_t want = (retn != 0xFFFFFFFFu) ? (int32_t)(4 + retn) : 4;
++    /* RECOMP_SAN_IGNORE=va,va,...: helpers whose convention is to move the
++     * caller's stack or registers (__SEH_prolog/epilog, _chkstk). */
++    static uint32_t ign[64];
++    static int nign = -1;
++    if (nign < 0) {
++        const char *e = getenv("RECOMP_SAN_IGNORE");
++        int c = 0;
++        while (e && *e && c < 64) {
++            char *end;
++            uint32_t v = (uint32_t)strtoul(e, &end, 0);
++            if (end == e) break;
++            ign[c++] = v;
++            e = (*end == ',') ? end + 1 : end;
++        }
++        nign = c;
++    }
++    for (i = 0; i < nign; i++)
++        if (ign[i] == va)
++            return;
++    for (i = 0; i < n && i < SLOTS; i++)
++        if (seen[i] == va)
++            return;
++    i = InterlockedIncrement(&count) - 1;
++    if (i < SLOTS)
++        seen[i] = va;
++    fprintf(stderr, "[SAN] ABI sub_%08X:%s%s%s%s%s\n"
++                    "[SAN]   ebx %08X->%08X esi %08X->%08X edi %08X->%08X"
++                    " esp %08X->%08X (delta %+d, %s %d) x87 top %d->%d\n",
++            va,
++            g_ebx != ebx0 ? " ebx" : "", g_esi != esi0 ? " esi" : "",
++            g_edi != edi0 ? " edi" : "",
++            (int32_t)(g_esp - esp0) != want ? " esp" : "",
++            (((g_fp_top - fp0) & 7) != 0 && ((g_fp_top - fp0) & 7) != 7) ? " x87" : "",
++            ebx0, g_ebx, esi0, g_esi, edi0, g_edi, esp0, g_esp,
++            (int32_t)(g_esp - esp0),
++            retn != 0xFFFFFFFFu ? "ret wants" : "no lifted ret, at least", want,
++            fp0, g_fp_top);
++    recomp_san_guest_chain(esp0 + 4);
++    /* Logged, not fatal, unless asked: register-argument helpers (LTCG
++     * `movsx esi, si`, __aulldvrm's ebx, __chkstk's esp, the CRT's x87
++     * argument pops) break the plain convention by design. */
++    {
++        const char *e = getenv("RECOMP_SAN_ABI_FATAL");
++        if (e && *e == '1')
++            recomp_san_stop("unbalanced call (see the ABI line above)");
++    }
++}
++#endif
++
++/* Which region a guest address is in: [lo, hi), or 0 for "other". */
++static int rep_region(uint32_t a, uint32_t *lo, uint32_t *hi)
++{
++    if (a >= 0x00010000u && a < 0x04000000u) { *lo = 0x00010000u; *hi = 0x04000000u; return 1; }
++    if (a >= 0x80000000u && a < 0x84000000u) { *lo = 0x80000000u; *hi = 0x84000000u; return 2; }
++    return 0;
++}
++
++static int rep_range_ok(uint32_t a, uint64_t bytes, int down, uint32_t size)
++{
++    uint32_t lo, hi;
++    uint64_t first, last;
++    if (bytes >= 0x04000000ull)
++        return 0;                       /* bigger than all of RAM */
++    if (down) { first = (uint64_t)a + size - bytes; last = (uint64_t)a + size; }
++    else      { first = a; last = (uint64_t)a + bytes; }
++    if (!rep_region(a, &lo, &hi))
++        return last <= 0x100000000ull && first < 0x100000000ull;
++    return first >= lo && last <= hi;
++}
++
++/* See RECOMP_REP_GUARD in recomp_types.h. Returns the count to use. */
++uint32_t recomp_rep_guard(uint32_t site, uint32_t dst, uint32_t src,
++                          uint32_t count, uint32_t size)
++{
++    extern RECOMP_TLS int g_df;
++    static volatile LONG said;
++    uint64_t bytes = (uint64_t)count * size;
++    int ok = rep_range_ok(dst, bytes, g_df, size);
++    /* rep movs reads esi; stos leaves it unrelated, so only judge it for movs
++     * (the lifter passes the current esi either way; a stos site cannot be
++     * told apart here, so a wild esi alone never fails a write). */
++    (void)src;
++    if (ok)
++        return count;
++    if (InterlockedIncrement(&said) <= 32 || recomp_sanitize_fatal()) {
++        fprintf(stderr, "[SAN] bulk write at guest 0x%08X: %u x %u bytes to 0x%08X%s "
++                        "leaves its region -- %s\n",
++                site, count, size, dst, g_df ? " (down)" : "",
++                recomp_sanitize_fatal() ? "stopping" : "skipped");
++        recomp_san_guest_chain(g_esp);
++        fflush(stderr);
++    }
++    if (recomp_sanitize_fatal())
++        recomp_san_stop("bulk write out of its region");
++    return 0;
++}
++
  /* SEH frame pointer bridge (see recomp_types.h for explanation) */
  RECOMP_TLS uint32_t g_seh_ebp = 0;
  RECOMP_TLS double g_fp_stack[8];
@@ -10353,7 +10821,33 @@ index 72d5131..15554ef 100644
  RECOMP_TLS int g_fp_top = 0;
  
  /* Set once at startup. The generated code reads it at the ret of every
-@@ -1387,6 +1484,9 @@ static void watch_report(void)
+@@ -1333,6 +1614,7 @@ static void    *g_watch_page;
+ static uint32_t g_watch_last;
+ static void    *g_watch_veh;
+ static RECOMP_TLS int s_watch_stepping;
++static RECOMP_TLS uintptr_t s_watch_rip;     /* host instruction that wrote */
+ 
+ /* A plausible guest code address: inside the image's executable sections,
+  * as recorded from the section headers at load. */
+@@ -1349,8 +1631,15 @@ static void watch_report(void)
+ 
+     if (now == g_watch_last)
+         return;
+-    fprintf(stderr, "[WATCH] [%08X] %08X -> %08X  (esp=%08X)\n",
+-            g_watch_va, g_watch_last, now, esp);
++    fprintf(stderr, "[WATCH] [%08X] %08X -> %08X  (esp=%08X, host tid %lu, writer RVA 0x%llX)\n",
++            g_watch_va, g_watch_last, now, esp,
++#ifdef _WIN32
++            (unsigned long)GetCurrentThreadId(),
++            (unsigned long long)(s_watch_rip - (uintptr_t)GetModuleHandleA(NULL))
++#else
++            0ul, 0ull
++#endif
++            );
+     g_watch_last = now;
+ 
+     /* Return addresses the recompiled code pushed, innermost first. Values
+@@ -1387,6 +1676,9 @@ static void watch_report(void)
  
  static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
  {
@@ -10363,7 +10857,17 @@ index 72d5131..15554ef 100644
      DWORD code = ep->ExceptionRecord->ExceptionCode;
      DWORD old;
  
-@@ -1414,6 +1514,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+@@ -1409,11 +1701,17 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+                 && fault < (uintptr_t)g_watch_page + 4096) {
+             if (!VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old))
+                 return EXCEPTION_CONTINUE_SEARCH;
++#if defined(_M_X64)
++            s_watch_rip = (uintptr_t)ep->ContextRecord->Rip;
++#else
++            s_watch_rip = (uintptr_t)ep->ContextRecord->Eip;
++#endif
+             s_watch_stepping = 1;
+             ep->ContextRecord->EFlags |= 0x100u;
              return EXCEPTION_CONTINUE_EXECUTION;
          }
      }
@@ -10371,7 +10875,42 @@ index 72d5131..15554ef 100644
      return EXCEPTION_CONTINUE_SEARCH;
  }
  
-@@ -1761,11 +1862,41 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -1529,6 +1827,34 @@ static int watch_arm(uint32_t va)
+     return 1;
+ }
+ 
++/* A host-side write into guest memory (a file read) is not a guest store and
++ * would fail on the protected page: open the page for it, then re-protect
++ * and take the new value as the baseline -- the load is not the culprit. */
++void xbox_WatchHostWrite(uint32_t va, uint32_t len, int after)
++{
++#ifdef _WIN32
++    DWORD old;
++    if (!g_watch_page || len == 0)
++        return;
++    {
++        uint64_t page = g_watch_va & ~4095u;
++        if (!((uint64_t)va < page + 4096u && page < (uint64_t)va + len))
++            return;
++    }
++    if (!after) {
++        VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old);
++        return;
++    }
++    g_watch_last = *(const uint32_t *)((const uint8_t *)g_memory_offset + g_watch_va);
++    fprintf(stderr, "[WATCH] [%08X] loaded by a file read: now %08X (re-armed)\n",
++            g_watch_va, g_watch_last);
++    fflush(stderr);
++    VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old);
++#else
++    (void)va; (void)len; (void)after;
++#endif
++}
++
+ /* Print the RECOMP_PEEK globals. Shared, because the two moments worth
+  * sampling are a hang and an early exit, and only the first had it: a title
+  * whose main() returns during init never reaches the watchdog, so the one
+@@ -1761,11 +2087,41 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
       */
      {
          static const uintptr_t try_bases[] = {
@@ -10413,7 +10952,7 @@ index 72d5131..15554ef 100644
              0,                      /* sentinel - let OS choose */
          };
  
-@@ -2548,7 +2679,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -2548,7 +2904,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          uint64_t tiled_lo = XBOX_TILED_BASE;
          uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
  
@@ -10429,7 +10968,7 @@ index 72d5131..15554ef 100644
              uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                      (uintptr_t)(m + 1) * g_memory_size;
              uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
-@@ -2627,7 +2765,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+@@ -2627,7 +2990,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
           */
          if (tiled_size > XBOX_CONTIG_SIZE)
              tiled_size = XBOX_CONTIG_SIZE;
@@ -10438,7 +10977,7 @@ index 72d5131..15554ef 100644
              ? MapViewOfFileEx(
                  g_contig_mapping,
                  FILE_MAP_ALL_ACCESS,
-@@ -3094,6 +3232,40 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+@@ -3094,6 +3457,60 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
      g_contig_block_count++;
  }
  
@@ -10456,11 +10995,31 @@ index 72d5131..15554ef 100644
 + * The bump pointer is moved past the pinned block. Blocks handed out below it
 + * earlier are the caller's business: the title frees what it had there before
 + * it pins, as it would have to on the console. */
++/* The pinned ranges themselves, so a device model can tell title-owned pool
++ * memory from memory the arena handed out (see xbox_ContiguousPinned). */
++static struct { uint32_t lo, hi; } g_contig_pinned[16];
++static int g_contig_pinned_n;
++
++/* 1 if guest VA `va` (window address) is inside a range the title pinned. */
++int xbox_ContiguousPinned(uint32_t va)
++{
++    int i;
++    for (i = 0; i < g_contig_pinned_n; i++)
++        if (va >= g_contig_pinned[i].lo && va < g_contig_pinned[i].hi)
++            return 1;
++    return 0;
++}
++
 +void xbox_ContiguousReserve(uint32_t va, uint32_t size)
 +{
 +    uint32_t end = (va + size + 4095u) & ~4095u;
 +
 +    AcquireSRWLockExclusive(&g_contig_lock);
++    if (g_contig_pinned_n < 16) {
++        g_contig_pinned[g_contig_pinned_n].lo = va;
++        g_contig_pinned[g_contig_pinned_n].hi = end;
++        g_contig_pinned_n++;
++    }
 +    if (end > g_contig_next) {
 +        if (xbox_HeapReclaimEnabled()) {
 +            if (va > g_contig_next)
@@ -10479,6 +11038,24 @@ index 72d5131..15554ef 100644
  uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  {
      uint32_t result = 0;
+@@ -3154,6 +3571,17 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+         ReleaseSRWLockExclusive(&g_contig_lock);
+ 
+     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
++    {   /* RECOMP_CONTIG_LOG=1: every allocation with the guest caller */
++        static int lg = -1;
++        if (lg < 0) lg = getenv("RECOMP_CONTIG_LOG") != NULL;
++        if (lg) {
++            uint32_t ra = 0;
++            if (g_esp >= 0x1000u && g_esp < 0x04000000u)
++                ra = *(const uint32_t *)((uintptr_t)g_memory_offset + g_esp);
++            fprintf(stderr, "  [CONTIG] alloc 0x%08X..0x%08X (%u bytes, align %u) for guest [esp]=0x%08X\n",
++                    result, result + size, size, alignment, ra);
++        }
++    }
+     return result;
+ }
+ 
 diff --git a/src/nv2a/nv2a_mmio_hook.c b/src/nv2a/nv2a_mmio_hook.c
 index d2b401d..615160d 100644
 --- a/src/nv2a/nv2a_mmio_hook.c
@@ -10929,7 +11506,7 @@ index 08bae4b..922e860 100644
  int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
  void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
-index 8e9325e..3c7e4a1 100644
+index 8e9325e..63837a3 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
 @@ -225,7 +225,9 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
@@ -10991,7 +11568,65 @@ index 8e9325e..3c7e4a1 100644
  /* ================================================================
   * SSE / XMM register state
   *
-@@ -1431,6 +1475,54 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
+@@ -927,7 +971,32 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
+  * 2's static init, where the clobber demonstrably exists. It is the right tool
+  * for vtable-dispatch-heavy code and the wrong one for early boot.
+  */
+-#ifdef RECOMP_ABI_CHECK
++#if defined(RECOMP_SANITIZE)
++/* The sanitizer build (-DRECOMP_SANITIZE): every call, direct or indirect,
++ * must come back with ebx/esi/edi unchanged and esp exactly where the callee's
++ * own `ret N` puts it. Each lifted ret records its N in g_last_ret_n
++ * (RECOMP_NOTE_RET); a target that never runs a lifted ret (kernel bridge,
++ * hand-written replacement) leaves the sentinel and only gets the one-sided
++ * esp check. A mismatch means the callee's body is unbalanced -- a lost push,
++ * an absorbed register save, a skipped call that rewound the wrong amount --
++ * which corrupts the caller silently in a normal build. The x87 depth is
++ * reported too: a call may leave one value (a float result) and no more. */
++extern RECOMP_TLS uint32_t g_last_ret_n;
++void recomp_san_abi(uint32_t va, uint32_t ebx0, uint32_t esi0, uint32_t edi0,
++                    uint32_t esp0, uint32_t retn, int fp0);
++#define RECOMP_NOTE_RET(n) (g_last_ret_n = (n))
++#define RECOMP_ABI_CALL(va, fn) do { \
++    uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
++    int _af = g_fp_top; uint32_t _rn; \
++    g_last_ret_n = 0xFFFFFFFFu; \
++    (fn)(); \
++    _rn = g_last_ret_n; \
++    if (g_ebx != _ab || g_esi != _as || g_edi != _ad \
++        || (_rn != 0xFFFFFFFFu ? g_esp != _ap + 4 + _rn : g_esp < _ap + 4) \
++        || (((g_fp_top - _af) & 7) != 0 && ((g_fp_top - _af) & 7) != 7)) \
++        recomp_san_abi((va), _ab, _as, _ad, _ap, _rn, _af); \
++} while(0)
++#elif defined(RECOMP_ABI_CHECK)
+ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                               uint32_t edi0, uint32_t esp0);
+ #define RECOMP_ABI_CALL(va, fn) do { \
+@@ -945,6 +1014,23 @@ void recomp_call_profile_hit(uint32_t va);
+ #else
+ #define RECOMP_ABI_CALL(va, fn) (fn)()
+ #endif
++#ifndef RECOMP_NOTE_RET
++#define RECOMP_NOTE_RET(n) ((void)0)
++#endif
++
++/* Bulk writes (rep stos / rep movs) of 16 MB or more go through
++ * recomp_rep_guard first. A count that big is almost always a negative size
++ * that went through `shr ecx, 2`; Halo 2's object allocator (0x000BC380) was
++ * handed one and zeroed everything from its pool to the end of the 64 MB
++ * contiguous window. The guard returns the count to use: unchanged when the
++ * range stays inside the region it starts in, 0 (skip, logged) otherwise;
++ * under RECOMP_SANITIZE=1 it reports and stops instead. */
++uint32_t recomp_rep_guard(uint32_t site, uint32_t dst, uint32_t src,
++                          uint32_t count, uint32_t size);
++#define RECOMP_REP_GUARD(site, sz) do { \
++    if ((uint64_t)ecx * (sz) >= 0x01000000ull) \
++        ecx = recomp_rep_guard((site), edi, esi, ecx, (sz)); \
++} while(0)
+ 
+ /* A guarded arm of an indirect call. When a recorded run saw a call site
+  * reach only a few translated functions, the lifter compares the target
+@@ -1431,6 +1517,54 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
   * state, and with RECOMP_UNIMPL_TRAP=1 it stops at the first one. The lifter
   * keeps the comment beside the call so `grep TODO:` over a gen tree still
   * enumerates every site whether or not it is ever reached. */
@@ -11392,7 +12027,7 @@ index 37542d8..16fcc4d 100644
      def _pass_indirect_call_slots(self) -> None:
          """
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index e7ab880..8ddcb89 100644
+index e7ab880..c3d7efb 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
 @@ -127,6 +127,11 @@ def _fmt_reg(name, size=4):
@@ -11501,7 +12136,22 @@ index e7ab880..8ddcb89 100644
          a = _fmt_operand_read(ops[0])
          b = _fmt_operand_read(ops[1])
          return [
-@@ -2507,13 +2578,20 @@ class Lifter:
+@@ -2471,10 +2542,12 @@ class Lifter:
+             prefix = (f'if (g_force_return) eax = '
+                       f'0x{self.force_return_value:X}U; ') + prefix
+ 
++        # RECOMP_NOTE_RET: under -DRECOMP_SANITIZE the caller checks that esp
++        # came back exactly 4+N above where the call left it; empty otherwise.
+         if len(ops) >= 1 and ops[0].type == "imm":
+             n = ops[0].imm
+-            return [f"{prefix}esp += {4 + n}; return; /* ret {n} */"]
+-        return [f"{prefix}esp += 4; return; /* ret */"]
++            return [f"RECOMP_NOTE_RET({n}u); {prefix}esp += {4 + n}; return; /* ret {n} */"]
++        return [f"RECOMP_NOTE_RET(0u); {prefix}esp += 4; return; /* ret */"]
+ 
+     def _forced_tail(self, tail):
+         """Apply --force-return to a tail jump.
+@@ -2507,13 +2580,20 @@ class Lifter:
          if offset is None:
              return []
          targets = []
@@ -11522,7 +12172,62 @@ index e7ab880..8ddcb89 100644
              targets.append(val)
          return targets
  
-@@ -3293,14 +3371,16 @@ class Lifter:
+@@ -2756,7 +2836,7 @@ class Lifter:
+ 
+     # ── String operations ──
+ 
+-    def _lift_rep_movs(self, size, m):
++    def _lift_rep_movs(self, size, m, site=0):
+         """Keep forward non-overlap memcpy; MMIO/overlap/DF use volatile elements.
+ 
+         Validate the entire guest range in 64 bits before the host fast path,
+@@ -2764,6 +2844,7 @@ class Lifter:
+         """
+         mem = f"MEM{size*8}"
+         return [
++            f"RECOMP_REP_GUARD(0x{site:08X}u, {size}u);",
+             "{ uint64_t _n = (uint64_t)ecx * %du;" % size,
+             "if (!g_df && esi < 0xFD000000u && edi < 0xFD000000u"
+             " && (uint64_t)esi + _n <= 0xFD000000u"
+@@ -2800,19 +2881,25 @@ class Lifter:
+         #
+         # memcpy is still used when the ranges provably do not overlap, which
+         # is the overwhelming majority of calls.
++        # Every bulk write first passes RECOMP_REP_GUARD: a count of 16 MB or
++        # more is checked against the region it starts in (recomp_types.h).
++        site = insn.address
++        guard = lambda sz: f"RECOMP_REP_GUARD(0x{site:08X}u, {sz}u);"
+         if "movsb" in m:
+-            return self._lift_rep_movs(1, m)
++            return self._lift_rep_movs(1, m, site)
+         if "movsd" in m:
+-            return self._lift_rep_movs(4, m)
++            return self._lift_rep_movs(4, m, site)
+         if "movsw" in m:
+-            return self._lift_rep_movs(2, m)
++            return self._lift_rep_movs(2, m, site)
+         if "stosb" in m:
+-            return ["if (!g_df) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
++            return [guard(1),
++                    "if (!g_df) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
+                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                     " MEM8(edi - _i) = LO8(eax); edi -= ecx; }",
+                     "ecx = 0; /* rep stosb */"]
+         if "stosd" in m:
+             return [
++                guard(4),
+                 "{ uint32_t _i; int32_t _st = RECOMP_DF_STEP(4);"
+                 " for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*_st) = eax;"
+                 " edi += ecx * _st; }",
+@@ -2820,6 +2907,7 @@ class Lifter:
+             ]
+         if "stosw" in m:
+             return [
++                guard(2),
+                 "{ uint32_t _i; int32_t _st = RECOMP_DF_STEP(2);"
+                 " for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*_st) = LO16(eax);"
+                 " edi += ecx * _st; }",
+@@ -3293,14 +3381,16 @@ class Lifter:
                  return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
          if m in ("cvtss2si", "cvttss2si"):
              if nops >= 2:
@@ -11541,7 +12246,7 @@ index e7ab880..8ddcb89 100644
          if m == "cvtss2sd":
              if nops >= 2:
                  return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
-@@ -3491,6 +3571,9 @@ class Lifter:
+@@ -3491,6 +3581,9 @@ class Lifter:
                          return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld float */"]
                      elif ops[0].mem_size == 8:
                          return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
@@ -11551,7 +12256,7 @@ index e7ab880..8ddcb89 100644
                      return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld */"]
                  if ops[0].type == "reg":
                      # fld st(i) pushes a COPY of st(i). Was a no-op comment,
-@@ -3518,6 +3601,9 @@ class Lifter:
+@@ -3518,6 +3611,9 @@ class Lifter:
                      return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{do_pop} /* {m} */"]
                  elif ops[0].mem_size == 8:
                      return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{do_pop} /* {m} */"]
@@ -11561,7 +12266,7 @@ index e7ab880..8ddcb89 100644
              # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
              # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
              # is the common idiom for "pop the value fptan/fsincos just pushed";
-@@ -3672,7 +3758,12 @@ class Lifter:
+@@ -3672,7 +3768,12 @@ class Lifter:
              # fprem truncates toward zero, fprem1 rounds to nearest (IEEE), which
              # is the difference between fmod and remainder.
              fn = "fmod" if m == "fprem" else "remainder"
@@ -11575,6 +12280,92 @@ index e7ab880..8ddcb89 100644
          if m == "fscale":
              return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
          if m == "frndint":
+diff --git a/tools/recomp/test_rep_movs_mmio.py b/tools/recomp/test_rep_movs_mmio.py
+index 0aca1c5..492a93f 100644
+--- a/tools/recomp/test_rep_movs_mmio.py
++++ b/tools/recomp/test_rep_movs_mmio.py
+@@ -19,6 +19,7 @@ void* touch(uint32_t a){accesses++;return mem+slot(a);}
+ #define MEM16(a) (*(volatile uint16_t*)touch(a))
+ #define MEM32(a) (*(volatile uint32_t*)touch(a))
+ #define RECOMP_DF_STEP(s) (g_df?-(s):(s))
++#define RECOMP_REP_GUARD(site, sz) ((void)0)
+ '''
+     functions=[]
+     for size in (1,2,4):
+diff --git a/tools/recomp/test_sanitize_emission.py b/tools/recomp/test_sanitize_emission.py
+new file mode 100644
+index 0000000..3eb36a1
+--- /dev/null
++++ b/tools/recomp/test_sanitize_emission.py
+@@ -0,0 +1,68 @@
++"""The sanitizer hooks the lifter emits (RECOMP_SANITIZE, recomp_types.h).
++
++Halo 2's object allocator was handed a negative size and its `rep stosd`
++zeroed everything from its pool to the end of the 64 MB contiguous window;
++every crash after that read zeros. The guard has to sit in front of every bulk
++write, and every ret has to record its N so a caller can check that esp came
++back exactly where the callee's own epilogue puts it.
++"""
++import re
++import unittest
++
++from .disasm import BasicBlock, Instruction, Operand
++from .lifter import Lifter, lift_basic_block
++
++
++def _lift(*instructions):
++    lifted, _ = lift_basic_block(
++        Lifter(), BasicBlock(start=0x1000, instructions=list(instructions)))
++    return "\n".join(lifted)
++
++
++class RepGuardEmissionTest(unittest.TestCase):
++    def test_every_bulk_write_is_guarded_with_its_site_and_width(self):
++        for text, raw, size in (("rep stosb", "f3aa", 1), ("rep stosw", "66f3ab", 2),
++                                ("rep stosd", "f3ab", 4), ("rep movsb", "f3a4", 1),
++                                ("rep movsw", "66f3a5", 2), ("rep movsd", "f3a5", 4)):
++            with self.subTest(text=text):
++                generated = _lift(Instruction(0x1000, 2, text, "", raw))
++                self.assertIn(f"RECOMP_REP_GUARD(0x00001000u, {size}u);", generated)
++
++    def test_guard_comes_before_the_write(self):
++        generated = _lift(Instruction(0x1000, 2, "rep stosd", "", "f3ab"))
++        self.assertLess(generated.index("RECOMP_REP_GUARD"),
++                        generated.index("MEM32(edi"))
++
++    def test_compares_are_not_guarded(self):
++        # repe cmps / repne scas only read.
++        generated = _lift(Instruction(0x1000, 2, "repne scasb", "", "f2ae"))
++        self.assertNotIn("RECOMP_REP_GUARD", generated)
++
++
++class RetNoteEmissionTest(unittest.TestCase):
++    def test_ret_records_zero(self):
++        generated = _lift(Instruction(0x1000, 1, "ret", "", "c3"))
++        self.assertRegex(generated, r"RECOMP_NOTE_RET\(0u\);.*esp \+= 4; return;")
++
++    def test_ret_n_records_n(self):
++        generated = _lift(Instruction(0x1000, 3, "ret", "0xc", "c20c00",
++                                     operands=[Operand(type="imm", imm=12)]))
++        self.assertRegex(generated, r"RECOMP_NOTE_RET\(12u\);.*esp \+= 16; return;")
++
++
++class SanitizeMacroTest(unittest.TestCase):
++    """The header's ABI macro checks the exact esp a callee's ret produces."""
++
++    def test_macro_checks_exact_esp_when_a_lifted_ret_ran(self):
++        from pathlib import Path
++        header = (Path(__file__).resolve().parents[2]
++                  / "templates" / "runtime" / "recomp_types.h").read_text(encoding="utf-8")
++        block = header[header.index("#if defined(RECOMP_SANITIZE)"):
++                       header.index("#elif defined(RECOMP_ABI_CHECK)")]
++        self.assertIn("g_esp != _ap + 4 + _rn", block)
++        self.assertIn("g_last_ret_n = 0xFFFFFFFFu;", block)
++        self.assertTrue(re.search(r"#define RECOMP_NOTE_RET\(n\) \(g_last_ret_n = \(n\)\)", block))
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
 index 3cd9250..d888aab 100644
 --- a/tools/recomp/translator.py

@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>   /* getenv: before first use, or it is an implicit int */
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -137,6 +138,10 @@ void recomp_icall_fail_log(uint32_t va)
  * Rate-limited per address: a spin can produce millions of these, and the
  * useful information is which addresses occur, not how often.
  */
+extern int recomp_sanitize_fatal(void);
+extern void recomp_san_stop(const char *what);
+extern void recomp_san_guest_chain(uint32_t esp);
+
 void recomp_icall_not_code_log(uint32_t va)
 {
     enum { SLOTS = 16 };
@@ -144,6 +149,51 @@ void recomp_icall_not_code_log(uint32_t va)
     static uint64_t hits[SLOTS];
     static int count;
     int i;
+
+    /* Strict: the console never calls a null or wild pointer, so a skip here
+     * is already running on corrupted state. RECOMP_SANITIZE=1 (or
+     * RECOMP_ICALL_STRICT=1) stops at the first one, with the object, its
+     * table and the guest chain printed below. */
+    {
+        static int strict = -1;
+        if (strict < 0) {
+            const char *e = getenv("RECOMP_ICALL_STRICT");
+            strict = (e && *e) ? (*e != '0') : recomp_sanitize_fatal();
+        }
+        /* RECOMP_SAN_ICALL_OK=<return addr>,...: known sites that stay skipped
+         * (0x334BAD: XHV voice talker on a headset-removal DPC, a USB model
+         * issue, not the memory corruption being hunted). */
+        int allowed = 0;
+        if (strict) {
+            const char *ok = getenv("RECOMP_SAN_ICALL_OK");
+            uint32_t ra = 0;
+            __try { ra = *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { ra = 0; }
+            while (ok && *ok) {
+                char *end;
+                uint32_t v = (uint32_t)strtoul(ok, &end, 0);
+                if (end == ok) break;
+                if (v == ra) { allowed = 1; break; }
+                ok = (*end == ',') ? end + 1 : end;
+            }
+        }
+        if (strict && !allowed) {
+            fprintf(stderr, "[SAN] indirect call to 0x%08X (not code), ecx=0x%08X eax=0x%08X\n",
+                    va, g_ecx, g_eax);
+            recomp_san_guest_chain(g_esp);
+            {
+                uint32_t k, w;
+                fprintf(stderr, "[SAN]   [ecx]:");
+                for (k = 0; k < 12; k++) {
+                    __try { w = *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + (uint32_t)(g_ecx + 4 * k)); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { w = 0xBAADF00Du; }
+                    fprintf(stderr, " %08X", w);
+                }
+                fputc('\n', stderr);
+            }
+            recomp_san_stop("indirect call through a null or wild pointer");
+        }
+    }
 
     for (i = 0; i < count; i++)
         if (seen[i] == va)
