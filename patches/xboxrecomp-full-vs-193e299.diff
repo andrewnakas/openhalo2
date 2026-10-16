@@ -1850,16 +1850,17 @@ index a045752..8987665 100644
      # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
      find_package(OpenSSL REQUIRED)
 diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
-index b9a02bc..69e4715 100644
+index b9a02bc..930e1e6 100644
 --- a/src/kernel/kernel.h
 +++ b/src/kernel/kernel.h
-@@ -796,6 +796,12 @@ int     xbox_IrqlBlocksInterrupts(void);
+@@ -796,6 +796,13 @@ int     xbox_IrqlBlocksInterrupts(void);
  int     xbox_IrqlRaisedCount(void);
  int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
  void    xbox_IrqlLeaveInterrupt(int saved);
 +/* The dispatch lock (kernel_hal.c): one thread at DISPATCH_LEVEL at a time. */
 +void    xbox_IrqlDispatchLock(void);
 +void    xbox_IrqlDispatchUnlock(void);
++int     xbox_IrqlDispatchHeld(void);            /* this thread holds it */
 +int     xbox_IrqlDispatchSuspend(void);         /* around a blocking wait */
 +void    xbox_IrqlDispatchResume(int held);
 +void    xbox_IrqlDispatchReport(void);
@@ -1867,7 +1868,7 @@ index b9a02bc..69e4715 100644
  /* Total crossings of the DISPATCH boundary, and who is holding it up.
   * A depth that is non-zero while this stops moving is stuck, not busy. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..314b14d 100644
+index c65ba43..d15a14a 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
@@ -1917,7 +1918,34 @@ index c65ba43..314b14d 100644
  }
  
  /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
-@@ -2105,7 +2119,7 @@ static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
+@@ -2004,6 +2018,9 @@ static void bridge_HalReadSMCTrayState(void)
+  *
+  * Returns 1 if the routine was found and called.
+  */
++static int guest_cpu_borrow(void);          /* the guest CPU lock, below */
++static void guest_cpu_return(int borrowed);
++
+ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+ {
+     uint32_t routine, context;
+@@ -2033,7 +2050,15 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
+     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+-    { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
++    {   /* Dispatch lock first, then the guest CPU (the order a raising guest
++         * thread takes them in), so the routine runs between the guest's
++         * instructions, never beside them -- as on the one-CPU console. */
++        int _irql = xbox_IrqlEnterInterrupt(2);
++        int _cpu = guest_cpu_borrow();
++        fn();
++        guest_cpu_return(_cpu);
++        xbox_IrqlLeaveInterrupt(_irql);
++    }
+     return 1;
+ }
+ 
+@@ -2105,7 +2130,7 @@ static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
   * DPC ordering beyond "after the ISR".
   */
  #define XBOX_MAX_PENDING_DPC 64
@@ -1926,7 +1954,7 @@ index c65ba43..314b14d 100644
  static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
  static volatile LONG g_dpc_head, g_dpc_tail;
  
-@@ -2163,9 +2177,17 @@ static void bridge_KeInsertQueueDpc(void)
+@@ -2163,9 +2188,17 @@ static void bridge_KeInsertQueueDpc(void)
      g_dpc_queue[tail].dpc  = dpc;
      g_dpc_queue[tail].arg1 = arg1;
      g_dpc_queue[tail].arg2 = arg2;
@@ -1944,7 +1972,7 @@ index c65ba43..314b14d 100644
      g_eax = 1;
  }
  
-@@ -2251,6 +2273,8 @@ static int kernel_raise_interrupt(uint32_t vector)
+@@ -2251,6 +2284,8 @@ static int kernel_raise_interrupt(uint32_t vector)
  #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
  #define NV2A_VECTOR            3u
  
@@ -1953,7 +1981,7 @@ index c65ba43..314b14d 100644
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
-@@ -2262,16 +2286,34 @@ static void kernel_vblank_tick(void)
+@@ -2262,16 +2297,34 @@ static void kernel_vblank_tick(void)
      if (!enabled)
          return;
  
@@ -1994,7 +2022,7 @@ index c65ba43..314b14d 100644
  
      {
          static unsigned n;
-@@ -2284,6 +2326,68 @@ static void kernel_vblank_tick(void)
+@@ -2284,6 +2337,68 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -2063,7 +2091,7 @@ index c65ba43..314b14d 100644
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2302,8 +2406,35 @@ static void kernel_drain_dpcs(void)
+@@ -2302,8 +2417,35 @@ static void kernel_drain_dpcs(void)
          if (d.dpc)
              BRIDGE_MEM8(d.dpc + 2) = 0;
          LeaveCriticalSection(&g_dpc_lock);
@@ -2100,7 +2128,7 @@ index c65ba43..314b14d 100644
      }
  }
  
-@@ -2566,12 +2697,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2566,12 +2708,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          g_fs_base = tib;
      }
  
@@ -2133,7 +2161,7 @@ index c65ba43..314b14d 100644
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -2619,6 +2769,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -2619,6 +2780,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      if (!g_timer_started) {
          InitializeCriticalSection(&g_timer_lock);
          g_timer_started = 1;
@@ -2141,7 +2169,7 @@ index c65ba43..314b14d 100644
          CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
      }
  
-@@ -3880,6 +4031,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3880,6 +4042,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
@@ -2158,7 +2186,160 @@ index c65ba43..314b14d 100644
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
-@@ -9391,24 +9552,45 @@ void guest_cpu_part(void)
+@@ -9353,7 +9525,17 @@ static void kernel_thunk_dispatch_body(void);
+  * thread sets, with no kernel call in the loop, deadlocks here. The console
+  * would preempt it on its quantum; the upgrade is a periodic yield point in
+  * the lifted code's backward branches. */
+-static CRITICAL_SECTION g_guest_cpu;
++/* On by default (RECOMP_GUEST_LOCK=0 turns it off). Halo 2's physics state
++ * was being corrupted with the threads running side by side.
++ *
++ * Bounded like the dispatch lock: a holder that keeps the CPU for
++ * GUEST_CPU_WAIT_MS without one kernel call (the spin the note above
++ * describes) is given up on, and the waiter runs beside it -- the old
++ * behaviour, never a hang. Counted and printed in the [KERNEL] summary. */
++#define GUEST_CPU_WAIT_MS 250
++static volatile LONG g_guest_cpu_owner;    /* host thread id, 0 = free */
++static volatile LONG g_guest_cpu_seq;      /* bumped on every acquisition */
++static volatile LONG g_guest_cpu_timeouts, g_guest_cpu_kept;
+ static int g_guest_cpu_on = -1;
+ static RECOMP_TLS int t_guest_thread;     /* this host thread runs a guest thread */
+ static RECOMP_TLS int t_guest_held;       /* and holds the guest CPU */
+@@ -9363,52 +9545,175 @@ static int guest_cpu_enabled(void)
+ {
+     if (g_guest_cpu_on < 0) {
+         const char *e = getenv("RECOMP_GUEST_LOCK");
+-        InitializeCriticalSection(&g_guest_cpu);
+-        g_guest_cpu_on = e && *e == '1';
++        g_guest_cpu_on = !(e && *e == '0');
+         if (g_guest_cpu_on)
+             fprintf(stderr, "  [KERNEL] guest CPU lock on: one guest thread runs at a time\n");
+     }
+     return g_guest_cpu_on;
+ }
+ 
++/* 1 = taken, 0 = went ahead without it (holder stuck). */
++static int guest_cpu_take(void)
++{
++    LONG me = (LONG)GetCurrentThreadId();
++    LONG seq;
++    DWORD t0;
++    unsigned spins = 0;
++    if (InterlockedCompareExchange(&g_guest_cpu_owner, me, 0) == 0)
++        goto got;
++    seq = g_guest_cpu_seq;
++    t0 = GetTickCount();
++    for (;;) {
++        if (InterlockedCompareExchange(&g_guest_cpu_owner, me, 0) == 0)
++            goto got;
++        if (++spins < 2000) {
++            YieldProcessor();
++            if ((spins & 31) == 0)
++                SwitchToThread();
++            continue;
++        }
++        Sleep(0);
++        if (g_guest_cpu_seq != seq) {        /* the CPU changed hands: wait on */
++            seq = g_guest_cpu_seq;
++            t0 = GetTickCount();
++        } else if (GetTickCount() - t0 > GUEST_CPU_WAIT_MS) {
++            LONG k = InterlockedIncrement(&g_guest_cpu_timeouts);
++            if (k <= 8) {
++                fprintf(stderr, "  [KERNEL] guest CPU held %d ms without a kernel call "
++                        "by tid %ld; tid %lu runs beside it\n", GUEST_CPU_WAIT_MS,
++                        (long)g_guest_cpu_owner, (unsigned long)me);
++                fflush(stderr);
++            }
++            return 0;
++        }
++        if ((spins & 1023) == 0)
++            Sleep(1);
++    }
++got:
++    InterlockedIncrement(&g_guest_cpu_seq);
++    return 1;
++}
++
++static void guest_cpu_give(void)
++{
++    LONG me = (LONG)GetCurrentThreadId();
++    InterlockedCompareExchange(&g_guest_cpu_owner, 0, me);
++}
++
++/* A DPC run by a host thread borrows the guest CPU for the routine's length,
++ * waiting at most GUEST_CPU_BORROW_US for a guest thread's next kernel call
++ * (they come thousands of times a second); past that it runs anyway, so a
++ * guest thread that spins waiting on the DPC never stalls. 1 = borrowed. */
++#define GUEST_CPU_BORROW_US 2000
++static volatile LONG g_guest_cpu_borrowed, g_guest_cpu_borrow_missed;
++static int guest_cpu_borrow(void)
++{
++    LONG me = (LONG)GetCurrentThreadId();
++    LARGE_INTEGER f, t0, t;
++    if (!guest_cpu_enabled() || t_guest_held || g_guest_cpu_owner == me)
++        return 0;
++    if (InterlockedCompareExchange(&g_guest_cpu_owner, me, 0) != 0) {
++        QueryPerformanceFrequency(&f);
++        QueryPerformanceCounter(&t0);
++        for (;;) {
++            YieldProcessor();
++            if (InterlockedCompareExchange(&g_guest_cpu_owner, me, 0) == 0)
++                break;
++            QueryPerformanceCounter(&t);
++            if ((t.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart > GUEST_CPU_BORROW_US) {
++                InterlockedIncrement(&g_guest_cpu_borrow_missed);
++                return 0;
++            }
++        }
++    }
++    InterlockedIncrement(&g_guest_cpu_seq);
++    InterlockedIncrement(&g_guest_cpu_borrowed);
++    return 1;
++}
++
++static void guest_cpu_return(int borrowed)
++{
++    if (borrowed)
++        guest_cpu_give();
++}
++
++/* Kernel calls that may wait on another thread: always let go for these.
++ * Any other call made at DISPATCH_LEVEL keeps the CPU, as on the console,
++ * where nothing else runs until the thread lowers its IRQL. */
++static int guest_cpu_ordinal_waits(ULONG ord)
++{
++    switch (ord) {
++    case 99:  /* KeDelayExecutionThread */
++    case 158: case 159:     /* KeWaitFor*Object(s) */
++    case 190: case 219: case 236:   /* NtCreateFile, NtReadFile, NtWriteFile */
++    case 234: case 235:     /* NtWaitFor*Object(s)Ex */
++    case 238:               /* NtYieldExecution */
++    case 277:               /* RtlEnterCriticalSection */
++        return 1;
++    }
++    return 0;
++}
++
+ /* Called once on each host thread that runs a guest thread, before its first
+  * guest instruction. */
+ void guest_cpu_join(void)
+ {
+     t_guest_thread = 1;
+-    if (guest_cpu_enabled() && !t_guest_held) {
+-        EnterCriticalSection(&g_guest_cpu);
+-        t_guest_held = 1;
+-    }
++    if (guest_cpu_enabled() && !t_guest_held)
++        t_guest_held = guest_cpu_take();
+ }
+ 
+ void guest_cpu_part(void)
+ {
+     if (t_guest_held) {
+         t_guest_held = 0;
+-        LeaveCriticalSection(&g_guest_cpu);
++        guest_cpu_give();
+     }
      t_guest_thread = 0;
  }
  
@@ -2175,14 +2356,20 @@ index c65ba43..314b14d 100644
  static void kernel_thunk_dispatch(void)
  {
      int held = t_guest_held;
+-    if (held) {                        /* let other guest threads run meanwhile */
 +    LARGE_INTEGER t0, t1, t2;
 +    int tslot = g_kernel_dispatch_slot;
 +    ULONG tord = (tslot >= 0 && tslot < XBOX_KERNEL_THUNK_TABLE_SIZE)
 +                     ? g_slot_ordinals[tslot] : 0;
 +    int outer = (t_dispatch_depth == 0);
-     if (held) {                        /* let other guest threads run meanwhile */
++    /* Raised to DISPATCH_LEVEL and not about to wait: keep the CPU. */
++    int keep = held && xbox_IrqlDispatchHeld() && !guest_cpu_ordinal_waits(tord);
++    if (keep)
++        InterlockedIncrement(&g_guest_cpu_kept);
++    if (held && !keep) {               /* let other guest threads run meanwhile */
          t_guest_held = 0;
-         LeaveCriticalSection(&g_guest_cpu);
+-        LeaveCriticalSection(&g_guest_cpu);
++        guest_cpu_give();
      }
 +    QueryPerformanceCounter(&t0);
      t_dispatch_depth++;
@@ -2195,16 +2382,18 @@ index c65ba43..314b14d 100644
      /* Back to guest code: take the CPU again. Only at the outermost call --
       * a guest callback a bridge runs (an APC) returns into the bridge, not to
       * the thread's own code -- and only if the thread still exists as one. */
-     if (t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
-         EnterCriticalSection(&g_guest_cpu);
-         t_guest_held = 1;
+-    if (t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
+-        EnterCriticalSection(&g_guest_cpu);
+-        t_guest_held = 1;
++    if (!keep && t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
++        t_guest_held = guest_cpu_take();
 +        QueryPerformanceCounter(&t2);
 +        InterlockedExchangeAdd64(&g_guest_cpu_wait_ticks,
 +                                 t2.QuadPart - t1.QuadPart);
      }
      (void)held;
  }
-@@ -9473,6 +9655,28 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9473,6 +9778,31 @@ static void kernel_thunk_dispatch_body(void)
                      fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
                              (unsigned long long)g_ordinal_calls[best]);
                  }
@@ -2227,8 +2416,11 @@ index c65ba43..314b14d 100644
 +                        fprintf(stderr, " ord %d %.1fs", best,
 +                                (double)g_ordinal_ticks[best] / (double)qf.QuadPart);
 +                    }
-+                    fprintf(stderr, " | waiting for guest CPU %.1fs\n",
-+                            (double)g_guest_cpu_wait_ticks / (double)qf.QuadPart);
++                    fprintf(stderr, " | waiting for guest CPU %.1fs (kept raised %ld, gave up %ld,"
++                            " DPCs borrowed %ld, ran beside %ld)\n",
++                            (double)g_guest_cpu_wait_ticks / (double)qf.QuadPart,
++                            (long)g_guest_cpu_kept, (long)g_guest_cpu_timeouts,
++                            (long)g_guest_cpu_borrowed, (long)g_guest_cpu_borrow_missed);
 +                }
              }
              fflush(stderr);
@@ -2829,10 +3021,10 @@ index 42135e0..7b420a1 100644
                  ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
                  ULONGLONG avail = (ULONGLONG)vfs.f_bavail * vfs.f_frsize;
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 1ad4fff..0af83a3 100644
+index 1ad4fff..9dcf75c 100644
 --- a/src/kernel/kernel_hal.c
 +++ b/src/kernel/kernel_hal.c
-@@ -167,6 +167,151 @@ void xbox_IrqlDumpHolders(void)
+@@ -167,6 +167,152 @@ void xbox_IrqlDumpHolders(void)
      fflush(stderr);
  }
  
@@ -2946,6 +3138,7 @@ index 1ad4fff..0af83a3 100644
 +/* For a device model's ISR that must not run beside DISPATCH_LEVEL code. */
 +void xbox_IrqlDispatchLock(void)   { dispatch_lock_acquire(); }
 +void xbox_IrqlDispatchUnlock(void) { dispatch_lock_release(); }
++int  xbox_IrqlDispatchHeld(void)   { return t_dl_held > 0; }
 +
 +/* Around a blocking wait: a thread that sleeps while raised would hold every
 + * DPC out until the wait ends, and the wait is often for one of them.
@@ -2984,7 +3177,7 @@ index 1ad4fff..0af83a3 100644
  static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  {
      int was = (old_level >= DISPATCH_LEVEL);
-@@ -176,6 +321,31 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+@@ -176,6 +322,31 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
      if (now == was)
          return;
  
@@ -3016,7 +3209,7 @@ index 1ad4fff..0af83a3 100644
      d = now ? InterlockedIncrement(&g_irql_raised_count)
              : InterlockedDecrement(&g_irql_raised_count);
      InterlockedIncrement(&s_transitions);
-@@ -213,7 +383,9 @@ int xbox_IrqlEnterInterrupt(int level)
+@@ -213,7 +384,9 @@ int xbox_IrqlEnterInterrupt(int level)
  {
      int saved = (int)g_current_irql;
      if (g_current_irql != (KIRQL)level) {
@@ -11199,7 +11392,7 @@ index 37542d8..16fcc4d 100644
      def _pass_indirect_call_slots(self) -> None:
          """
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index e7ab880..849d891 100644
+index e7ab880..8ddcb89 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
 @@ -127,6 +127,11 @@ def _fmt_reg(name, size=4):
@@ -11368,6 +11561,20 @@ index e7ab880..849d891 100644
              # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
              # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
              # is the common idiom for "pop the value fptan/fsincos just pushed";
+@@ -3672,7 +3758,12 @@ class Lifter:
+             # fprem truncates toward zero, fprem1 rounds to nearest (IEEE), which
+             # is the difference between fmod and remainder.
+             fn = "fmod" if m == "fprem" else "remainder"
+-            return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */"]
++            # C2 must read clear afterwards: the CRT loops `fprem; fnstsw ax;
++            # sahf; jp again`, and that jp tests g_fp_cmp == 2 -- left over
++            # from whatever compare came before, an unordered one meant the
++            # loop never ended (insn_diff found it).
++            return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */",
++                    "g_fp_cc &= (uint16_t)~0x0400u; if (g_fp_cmp == 2) g_fp_cmp = 0; /* C2 = 0: complete */"]
+         if m == "fscale":
+             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
+         if m == "frndint":
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
 index 3cd9250..b5a5098 100644
 --- a/tools/recomp/translator.py

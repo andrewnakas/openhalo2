@@ -44,6 +44,15 @@ for n in profile nosignin campaign newcampaign level difficulty; do
   if [ $n = level ] && [ -n "$LEVEL_KEYS" ]; then
     for k in ${LEVEL_KEYS//,/ }; do echo "$k:500" >> "$OUT/pad.txt"; sleep 2; done; mark level_moved
   fi
+  # LEVEL_PICK=<row y>: on Select Level, press down until the row at that y
+  # (Heretic 92, Armory 114, Cairo 136, ...) is lit rather than the Armory's.
+  if [ $n = level ] && [ -n "$LEVEL_PICK" ]; then
+    for i in 1 2 3 4 5 6 7 8; do
+      sleep 6; bash /d/n64work/openhalo2/tools/shot.sh "$OUT" lvl > /dev/null; cp "$OUT/lvl.png" "$OUT/lvl_$i.png"
+      h=$(python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');y=int(sys.argv[2]);a=sum(im.crop((140,y-6,330,y+6)).getdata());b=sum(im.crop((140,108,330,120)).getdata());print(1 if a>b*1.1 else 0)" "$OUT/lvl.png" "$LEVEL_PICK" 2>/dev/null)
+      [ "$h" = 1 ] && break; echo "${LEVEL_DIR:-down}:150" >> "$OUT/pad.txt"
+    done; mark level_picked
+  fi
   echo "a:${AHOLD:-300}" >> "$OUT/pad.txt"; sleep $S; mark "after_$n"
 done
 sleep ${LOADWAIT:-75}
