@@ -18,7 +18,7 @@ bash /d/n64work/openhalo2/port/web/build_web.sh | head -8
 mkdir -p $SITE
 [ "$SITE" != "$BUILT" ] && cp $BUILT/halo2.js $BUILT/halo2.wasm $SITE/
 cp /d/n64work/openhalo2/port/web/dev.html $SITE/index.html
-cp /d/n64work/openhalo2/port/web/input.js /d/n64work/openhalo2/port/web/audio.js /d/n64work/openhalo2/port/web/net.js /d/n64work/openhalo2/net/h2net.js $SITE/
+cp /d/n64work/openhalo2/port/web/input.js /d/n64work/openhalo2/port/web/audio.js /d/n64work/openhalo2/port/web/net.js /d/n64work/openhalo2/net/h2net.js /d/n64work/openhalo2/port/web/byog.js $SITE/
 python /d/n64work/openhalo2/tools/web_manifest.py "$(cygpath -m $SITE)"
 cd /d/n64work/halo2-cleanroom
 curl -s -o /dev/null http://localhost:$PORT/index.html || { (python ports/wasm/serve.py $SITE $PORT > /dev/null 2>&1 &); sleep 2; }

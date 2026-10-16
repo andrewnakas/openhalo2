@@ -98,6 +98,33 @@ async function importTree(man) {
       + failed + ' failed, ' + ((performance.now() - t0) / 1000 | 0) + ' s');
   if (failed) throw new Error('some game files could not be downloaded; reload the page to try again');
 }
+async function ensureGame() {
+  const byog = await import('./byog.js');
+  if (await byog.haveGame()) { say('byog: your game is already imported'); return; }
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000d;z-index:9';
+  box.innerHTML = '<div style="max-width:560px;padding:24px;background:#1b1f24;border:1px solid #445;font:15px sans-serif;color:#dde">'
+    + '<h2 style="margin-top:0">Open Halo 2 needs your own copy of Halo 2</h2>'
+    + '<p>Choose your original Xbox Halo 2 disc image (a Redump .iso or an XISO), or the folder of a copy you extracted. '
+    + 'The files the game needs (about 4.5 GB) are copied into this browser\'s private storage, once. Nothing is uploaded.</p>'
+    + '<p><label>Disc image: <input type="file" id="byogIso" accept=".iso,.xiso"></label></p>'
+    + '<p><label>Extracted folder: <input type="file" id="byogDir" webkitdirectory></label></p>'
+    + '<p id="byogMsg" style="color:#9cf"></p></div>';
+  document.body.appendChild(box);
+  const msg = box.querySelector('#byogMsg');
+  if (navigator.storage.persist) navigator.storage.persist();
+  await new Promise((resolve) => {
+    const run = async (src) => {
+      try {
+        msg.textContent = 'reading...';
+        await byog.importGame(src, (t) => { msg.textContent = t; say(t); });
+        box.remove(); resolve();
+      } catch (e) { msg.style.color = '#f99'; msg.textContent = String(e.message || e); }
+    };
+    box.querySelector('#byogIso').onchange = (e) => e.target.files[0] && run(e.target.files[0]);
+    box.querySelector('#byogDir').onchange = (e) => e.target.files.length && run(e.target.files);
+  });
+}
 (async function () {
   try {
     // A static host (GitHub Pages) cannot send the isolation headers threads need:
@@ -110,6 +137,10 @@ async function importTree(man) {
     let man = null;
     try { man = await (await fetch('manifest.json')).json(); } catch (e) {}
     if (man && (q.get('import') || !Array.isArray(man))) await importTree(man);
+    // Bring your own game (a site packed with --byog carries no game files, or ?byog=1):
+    // the player's own disc image or extracted folder is copied into the private
+    // file system once (byog.js), and checked against the retail default.xbe.
+    if ((man && man.byog) || q.get('byog')) await ensureGame();
     if (q.get('ls')) {   // what the private file system holds, seen from the page
       const root = await navigator.storage.getDirectory();
       for await (const [name, h] of root.entries()) {

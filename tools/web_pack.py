@@ -28,7 +28,7 @@ import shutil
 import sys
 
 ALWAYS = {"mainmenu", "shared", "single_player_shared"}
-PAGE = ["halo2.js", "halo2.wasm", "input.js", "audio.js", "net.js", "h2net.js"]
+PAGE = ["halo2.js", "halo2.wasm", "input.js", "audio.js", "net.js", "h2net.js", "byog.js"]
 
 
 def main():
@@ -41,13 +41,16 @@ def main():
     ap.add_argument("--site", default="D:/n64work/halo2/build/web/site_clean")
     ap.add_argument("--coi", default="D:/n64work/halo2-cleanroom/ports/wasm/coi-sw.js")
     ap.add_argument("--dry", action="store_true", help="print the layout, write nothing")
+    ap.add_argument("--byog", action="store_true",
+                    help="bring your own game: no game files and no save contents, only the save "
+                         "folders and blank disk images; the page imports the player's own disc")
     a = ap.parse_args()
     part, shard = a.part_mb << 20, a.shard_mb << 20
     want = None if a.maps == "all" else ALWAYS | set(a.maps.split(","))
 
     # what goes in: (path in the private file system, source file, size, blank)
     items, dirs = [], []
-    for top in ("game", "save"):
+    for top in (("save",) if a.byog else ("game", "save")):
         for d, sub, names in os.walk(os.path.join(a.site, top)):
             rel = os.path.relpath(d, a.site).replace(os.sep, "/")
             dirs.append(rel)
@@ -58,7 +61,10 @@ def main():
                         continue
                     if n.endswith(".map") and want is not None and n[:-4] not in want:
                         continue
-                items.append((rel + "/" + n, src, size, top == "save" and size > 4 << 20))
+                blank = top == "save" and size > 4 << 20
+                if a.byog and not blank:
+                    continue                    # title-written save contents stay out of a BYOG site
+                items.append((rel + "/" + n, src, size, blank))
 
     # the page folder first, then data folders as each fills up
     folders = [a.name]; used = [sum(os.path.getsize(os.path.join(a.site, f)) for f in PAGE)]
@@ -94,7 +100,10 @@ def main():
         shutil.copy(os.path.join(a.site, f), os.path.join(page, f))
     shutil.copy(os.path.join(a.site, "index.html"), os.path.join(page, "index.html"))
     shutil.copy(a.coi, os.path.join(page, "coi-sw.js"))
-    json.dump({"v": 2, "files": files, "dirs": dirs}, open(os.path.join(page, "manifest.json"), "w"))
+    man = {"v": 2, "files": files, "dirs": dirs}
+    if a.byog:
+        man["byog"] = True
+    json.dump(man, open(os.path.join(page, "manifest.json"), "w"))
     for k, rel, src, off, ln in plan:
         dst = os.path.join(a.out, folders[k], rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
