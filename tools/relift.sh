@@ -20,6 +20,8 @@ python -m tools.recomp "$XBE" --all --split 250 --game-name halo2 --gen-dir "$TM
 cp templates/runtime/recomp_types.h "$TMP/recomp_types.h"
 # hardware libraries get checked register access (no page faults): see h2lift/mmio_pass.py
 python /d/n64work/openhalo2/h2lift/mmio_pass.py "$TMP"
+# tiled-aperture pointers: the contiguous window in the web build (see h2lift/tiled_pass.py)
+python /d/n64work/openhalo2/h2lift/tiled_pass.py "$TMP"
 changed=0
 for f in "$TMP"/*; do
   b=$(basename "$f")

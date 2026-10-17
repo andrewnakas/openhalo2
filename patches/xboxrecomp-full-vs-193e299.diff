@@ -3164,7 +3164,7 @@ index 0000000..96b4a62
 +
 +#endif /* KERNEL_DES_H */
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
-index 42135e0..7b420a1 100644
+index 42135e0..2537393 100644
 --- a/src/kernel/kernel_file.c
 +++ b/src/kernel/kernel_file.c
 @@ -503,6 +503,37 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
@@ -3276,7 +3276,29 @@ index 42135e0..7b420a1 100644
          XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
          if (IoStatusBlock) {
              IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
-@@ -1083,7 +1137,24 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
+@@ -1038,6 +1092,21 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
+             IoStatusBlock->Status = STATUS_SUCCESS;
+             return STATUS_SUCCESS;
+         }
++        case XboxFileAllocationInformation: {
++            /* Reserve space for a file (the Windows side: FileAllocationInfo).
++             * Halo 2 calls it while it first fills a blank cache partition
++             * and on its save path; STATUS_NOT_IMPLEMENTED here left the web
++             * build presenting black frames in a loop on a fresh save disk.
++             * NT semantics: an allocation below the end of file cuts the
++             * file there; a larger one leaves the end of file alone. */
++            PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
++            struct stat st;
++            if (fstat(fd, &st) == 0 && (off_t)info->EndOfFile.QuadPart < st.st_size
++                    && ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
++                return STATUS_UNSUCCESSFUL;
++            IoStatusBlock->Status = STATUS_SUCCESS;
++            return STATUS_SUCCESS;
++        }
+         case XboxFileDispositionInformation: {
+             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
+             /* POSIX: unlinking an open file removes it on last close -- this
+@@ -1083,7 +1152,24 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
               * XBOX_SECTORS_PER_CLUSTER above. */
              info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
              info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
@@ -11701,10 +11723,104 @@ index c0dd9e0..a1c5b7c 100644
 +#endif /* x64 Windows */
  #endif /* MMIO_DECODE_H */
 diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
-index 93288d5..b3a7e21 100644
+index 93288d5..517b3b2 100644
 --- a/src/platform/win32_compat.c
 +++ b/src/platform/win32_compat.c
-@@ -1124,8 +1124,34 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
+@@ -18,6 +18,9 @@
+ #include "win32_compat.h"
+ 
+ #include <pthread.h>
++#ifdef __EMSCRIPTEN__
++#include <emscripten/heap.h>
++#endif
+ #include <stdlib.h>
+ #include <string.h>
+ #include <strings.h>
+@@ -255,7 +258,10 @@ typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
+ 
+ #define W32_MAX_APC 16
+ 
++#define W32_OBJ_MAGIC 0x4A424F57u   /* 'WOBJ' */
++
+ typedef struct w32_object {
++    uint32_t        magic;      /* W32_OBJ_MAGIC while alive (obj_is_live) */
+     w32_kind        kind;
+     LONG            refcount;
+     pthread_mutex_t lock;
+@@ -330,6 +336,7 @@ HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
+ static w32_object *obj_alloc(w32_kind kind)
+ {
+     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
++    o->magic    = W32_OBJ_MAGIC;
+     o->kind     = kind;
+     o->refcount = 1;
+     pthread_mutex_init(&o->lock, NULL);
+@@ -353,9 +360,30 @@ static void obj_release(w32_object *o)
+     pthread_mutex_destroy(&o->lock);
+     pthread_cond_destroy(&o->cond);
+     pthread_cond_destroy(&o->gate);
++    o->magic = 0;
+     free(o);
+ }
+ 
++/* A title can hand a file call a handle this layer never made: a failed
++ * open's INVALID_HANDLE_VALUE, a pseudo-handle, a dummy token. Windows fails
++ * the call; here dereferencing it read garbage or, in the web build (wasm,
++ * 2.28 GB of memory), trapped with 'memory access out of bounds' on a fresh
++ * save disk (NtSetInformationFile). */
++static int obj_is_live(HANDLE h)
++{
++    uintptr_t v = (uintptr_t)h;
++    static int told;
++    if (v >= 0x10000 && v < (uintptr_t)-0x10000
++#ifdef __EMSCRIPTEN__
++            && v + sizeof(w32_object) <= (uintptr_t)emscripten_get_heap_size()
++#endif
++            && ((w32_object *)h)->magic == W32_OBJ_MAGIC)
++        return 1;
++    if (h && h != INVALID_HANDLE_VALUE && told++ < 8)
++        fprintf(stderr, "  [W32] not a handle of this layer: %p\n", h);
++    return 0;
++}
++
+ /* ---- fd-backed file handle (for the file-I/O HLE) -------------------- */
+ HANDLE w32_open_handle(int fd, const char *host_path)
+ {
+@@ -368,13 +396,13 @@ HANDLE w32_open_handle(int fd, const char *host_path)
+ int w32_handle_fd(HANDLE h)
+ {
+     w32_object *o = (w32_object *)h;
+-    return (o && o->kind == K_FILE) ? o->fd : -1;
++    return (obj_is_live(h) && o->kind == K_FILE) ? o->fd : -1;
+ }
+ 
+ const char *w32_handle_path(HANDLE h)
+ {
+     w32_object *o = (w32_object *)h;
+-    return (o && o->kind == K_FILE) ? o->file_path : NULL;
++    return (obj_is_live(h) && o->kind == K_FILE) ? o->file_path : NULL;
+ }
+ 
+ BOOL CloseHandle(HANDLE h)
+@@ -382,6 +410,8 @@ BOOL CloseHandle(HANDLE h)
+     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
+         h == INVALID_HANDLE_VALUE)
+         return TRUE;
++    if (!obj_is_live(h))
++        return FALSE;
+     obj_release((w32_object *)h);
+     return TRUE;
+ }
+@@ -1025,7 +1055,7 @@ BOOL CancelWaitableTimer(HANDLE h)
+ /* Heap (thin wrapper over malloc; the single process heap)              */
+ /* ===================================================================== */
+ 
+-static w32_object s_process_heap = { .kind = K_HEAP };
++static w32_object s_process_heap = { .magic = W32_OBJ_MAGIC, .kind = K_HEAP };
+ 
+ HANDLE GetProcessHeap(void)                       { return (HANDLE)&s_process_heap; }
+ HANDLE HeapCreate(DWORD o, SIZE_T i, SIZE_T m)    { (void)o;(void)i;(void)m; return (HANDLE)&s_process_heap; }
+@@ -1124,8 +1154,34 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
  void view_register(void *addr, size_t len);
  size_t view_take(const void *addr);
  
@@ -11739,7 +11855,7 @@ index 93288d5..b3a7e21 100644
      int prot  = prot_from_page(protect);
      int flags = MAP_PRIVATE | MAP_ANONYMOUS;
  
-@@ -1171,6 +1197,13 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
+@@ -1171,6 +1227,13 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
  
  BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
  {
@@ -11753,7 +11869,7 @@ index 93288d5..b3a7e21 100644
      if (freeType & MEM_RELEASE) {
          /* Win32 MEM_RELEASE passes size 0 and frees the whole allocation, so
           * the length comes from the registry VirtualAlloc filled in. Returning
-@@ -1190,6 +1223,10 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
+@@ -1190,6 +1253,10 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
  BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
  {
      if (oldProtect) *oldProtect = PAGE_READWRITE;
@@ -11764,7 +11880,7 @@ index 93288d5..b3a7e21 100644
      return mprotect(address, size, prot_from_page(newProtect)) == 0;
  }
  
-@@ -1250,9 +1287,22 @@ DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
+@@ -1250,9 +1317,22 @@ DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
  
  BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
  {
@@ -11788,7 +11904,7 @@ index 93288d5..b3a7e21 100644
      return TRUE;
  }
  
-@@ -1613,9 +1663,22 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
+@@ -1613,9 +1693,22 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                            DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
  {
      (void)file; (void)sa; (void)protect;
@@ -11812,7 +11928,7 @@ index 93288d5..b3a7e21 100644
      int fd = anon_map_fd(name);
      if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
      if (ftruncate(fd, (off_t)size) != 0) {
-@@ -1641,6 +1704,13 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
+@@ -1641,6 +1734,13 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
                         SIZE_T count, LPVOID baseAddr)
  {
      w32_object *o = (w32_object *)mapping;
@@ -11826,7 +11942,7 @@ index 93288d5..b3a7e21 100644
      if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
  
      off_t  off = ((off_t)offHigh << 32) | offLow;
-@@ -1691,6 +1761,10 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
+@@ -1691,6 +1791,10 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
  
  BOOL UnmapViewOfFile(LPCVOID baseAddr)
  {
