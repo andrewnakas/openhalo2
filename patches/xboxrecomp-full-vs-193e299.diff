@@ -3887,10 +3887,10 @@ index 8abfc5f..307b818 100644
  /* One pixel. Colours are r,g,b,a in [0,1]; `fog` is (fog colour, factor).
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..7b399d6
+index 0000000..46f6dfa
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,3637 @@
+@@ -0,0 +1,3657 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -4071,6 +4071,7 @@ index 0000000..7b399d6
 +    X(void,   GenSamplers, (GLsizei, GLuint *)) \
 +    X(void,   BindSampler, (GLuint, GLuint)) \
 +    X(void,   SamplerParameteri, (GLuint, GLenum, GLint)) \
++    X(void,   GenerateMipmap, (GLenum)) \
 +    X(void,   GenQueries, (GLsizei, GLuint *)) \
 +    X(void,   BeginQuery, (GLenum, GLuint)) \
 +    X(void,   EndQuery, (GLenum)) \
@@ -5016,6 +5017,24 @@ index 0000000..7b399d6
 +        glTexImage2D(t->cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f : GL_TEXTURE_2D,
 +                     0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_BGRA,
 +                     GL_UNSIGNED_BYTE, buf);
++    }
++    /* Mip levels. Only level 0 is decoded; a texture whose format says it
++     * has levels gets a chain made from it, so distant surfaces filter
++     * instead of shimmering (the linear sampler is trilinear; a texture
++     * without levels keeps MAX_LEVEL 0 and samples as before).
++     * RECOMP_GPU_MIPS=0: level 0 only. */
++    {
++        static int mips_env = -1;
++        if (mips_env < 0) {
++            const char *e = getenv("RECOMP_GPU_MIPS");
++            mips_env = !(e && *e == '0');
++        }
++        if (mips_env && t->levels > 1) {
++            glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, (GLint)t->levels - 1);
++            glGenerateMipmap(target);
++        } else {
++            glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, 0);
++        }
 +    }
 +    s_stat.tex_uploads++;
 +    pt_add(PT_DEC, t0);
@@ -6657,7 +6676,8 @@ index 0000000..7b399d6
 +            for (k = 0; k < 2; k++) {
 +                GLuint smp;
 +                glGenSamplers(1, &smp);
-+                glSamplerParameteri(smp, GL_TEXTURE_MIN_FILTER, i ? GL_LINEAR : GL_NEAREST);
++                glSamplerParameteri(smp, GL_TEXTURE_MIN_FILTER,
++                                    i ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST);
 +                glSamplerParameteri(smp, GL_TEXTURE_MAG_FILTER, i ? GL_LINEAR : GL_NEAREST);
 +                glSamplerParameteri(smp, GL_TEXTURE_WRAP_S, j ? GL_REPEAT : GL_CLAMP_TO_EDGE);
 +                glSamplerParameteri(smp, GL_TEXTURE_WRAP_T, k ? GL_REPEAT : GL_CLAMP_TO_EDGE);
