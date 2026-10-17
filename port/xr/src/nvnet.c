@@ -483,6 +483,17 @@ static void hub_open(void)
 #ifdef OPENHALO2_NET
     {
         const char *room = getenv("RECOMP_NET_ROOM");
+        const char *ol = getenv("RECOMP_OPEN_LIVE");
+        /* Open Live (openlive.c): the transport starts with no room; the
+         * sessions the title hosts or joins add theirs (h2net_join). */
+        if (ol && *ol && *ol != '0') {
+            if (h2net_init(getenv("RECOMP_NET_RELAY")) == 0) {
+                s_online = 1;
+                fprintf(stderr, "  [NIC] Open Live: peer-to-peer transport, rooms joined per session\n");
+                if (room && *room) h2net_join(room);
+            }
+            return;
+        }
         if (room && *room) {
             if (h2net_open(room, getenv("RECOMP_NET_RELAY")) == 0) {
                 s_online = 1;

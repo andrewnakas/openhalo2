@@ -60,6 +60,7 @@ set(GAME_SOURCES
     src/byog.c
     src/openlive.c
     src/openlive_api.c
+    src/openlive_match.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/import/h2import.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
@@ -149,7 +150,8 @@ endif()
 set(H2NET_VCPKG "D:/n64work/vcpkg/installed/x64-windows-static" CACHE PATH "vcpkg tree with libdatachannel")
 option(OPENHALO2_NET "Online system link transport" ON)
 if(WIN32 AND OPENHALO2_NET AND EXISTS "${H2NET_VCPKG}/lib/datachannel.lib")
-    target_sources(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../net/h2net.c)
+    target_sources(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../net/h2net.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../net/olive.c)
     target_compile_definitions(${PROJECT_NAME} PRIVATE OPENHALO2_NET=1 RTC_STATIC=1)
     target_include_directories(${PROJECT_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../net ${H2NET_VCPKG}/include)

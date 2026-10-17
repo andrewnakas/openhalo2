@@ -236,10 +236,13 @@ static uint32_t s_logon_users;      /* MAX_LOGON user records, returned by GetLo
 
 /* ---- tasks ------------------------------------------------------------------ */
 
+/* A task handle is TASK_TAG | slot (the title only compares handles with 0
+ * and -1). A task either finishes after `need` Continue calls with `done`,
+ * or asks its poll function, which returns 0 while working and the result
+ * once finished (openlive_match.c). */
 #define TASK_TAG   0x0E5A0000u
-#define MAX_TASKS  128
 
-enum { T_FREE, T_LOGON, T_CHANGE, T_GENERIC };
+enum { T_FREE, T_LOGON, T_CHANGE, T_GENERIC, T_POLLED };
 
 typedef struct {
     int type;
@@ -248,16 +251,20 @@ typedef struct {
     uint32_t running;   /* result while working */
     uint32_t done;      /* result once done */
     uint32_t va;        /* the API that made it, for the trace */
+    xo_task_poll_fn poll;
+    int user;
+    void (*on_close)(int user);
 } task_t;
 
-static task_t s_task[MAX_TASKS];
+static task_t s_task[XO_MAX_TASKS];
 
 static uint32_t task_new(int type, uint32_t va, int need, uint32_t running, uint32_t done)
 {
     int i;
-    for (i = 1; i < MAX_TASKS; i++) {
+    for (i = 1; i < XO_MAX_TASKS; i++) {
         if (s_task[i].type == T_FREE) {
             task_t *t = &s_task[i];
+            memset(t, 0, sizeof *t);
             t->type = type; t->polls = 0; t->need = need;
             t->running = running; t->done = done; t->va = va;
             return TASK_TAG | (uint32_t)i;
@@ -267,16 +274,43 @@ static uint32_t task_new(int type, uint32_t va, int need, uint32_t running, uint
     return 0;
 }
 
+uint32_t xo_task_new(uint32_t va, int need, uint32_t done)
+{
+    return task_new(T_GENERIC, va, need, HR_TASK_RUNNING, done);
+}
+
+uint32_t xo_task_new_polled(uint32_t va, xo_task_poll_fn poll, int user, void (*on_close)(int user))
+{
+    uint32_t h = task_new(T_POLLED, va, 0, HR_TASK_RUNNING, 0);
+    if (h) {
+        s_task[h & 0xFFFF].poll = poll;
+        s_task[h & 0xFFFF].user = user;
+        s_task[h & 0xFFFF].on_close = on_close;
+    }
+    return h;
+}
+
 static task_t *task_get(uint32_t h)
 {
     uint32_t i = h & 0xFFFFu;
-    if ((h & 0xFFFF0000u) != TASK_TAG || i == 0 || i >= MAX_TASKS || s_task[i].type == T_FREE)
+    if ((h & 0xFFFF0000u) != TASK_TAG || i == 0 || i >= XO_MAX_TASKS || s_task[i].type == T_FREE)
         return NULL;
     return &s_task[i];
 }
 
+int xo_task_user(uint32_t h)
+{
+    task_t *t = task_get(h);
+    return t ? t->user : -1;
+}
+
 static uint32_t task_continue(task_t *t)
 {
+    if (t->type == T_POLLED) {
+        uint32_t r = t->poll(t->user);
+        if (r) t->polls = 1;
+        return r ? r : HR_TASK_RUNNING;
+    }
     if (t->polls < t->need) {
         t->polls++;
         return t->running;
@@ -371,6 +405,7 @@ static int h_task_close(void)             /* (task) */
 {
     task_t *t = task_get(xo_arg(0));
     if (!t) return 0;
+    if (t->on_close) t->on_close(t->user);
     t->type = T_FREE;
     xo_return(HR_OK, 1);
     return 1;
@@ -418,18 +453,20 @@ static int h_offering_new(void)           /* (title?, 0, &task) */
 #define QOS_MAX   64
 static uint32_t s_qos[QOS_MAX];
 
-static uint32_t qos_alloc(uint32_t n)
+/* n entries, then `extra` bytes for the entries' data (released together) */
+uint32_t xo_qos_alloc(uint32_t n, uint32_t extra)
 {
-    uint32_t q = xbox_HeapAlloc(8 + QOS_ENTRY * (n ? n : 1), 16);
+    uint32_t sz = 8 + QOS_ENTRY * (n ? n : 1) + extra;
+    uint32_t q = xbox_HeapAlloc(sz, 16);
     int i;
-    memset(xo_ptr(q), 0, 8 + QOS_ENTRY * (n ? n : 1));
+    memset(xo_ptr(q), 0, sz);
     xo_wr32(q, n);
     for (i = 0; i < QOS_MAX; i++)
         if (!s_qos[i]) { s_qos[i] = q; break; }
     return q;
 }
 
-static void qos_entry(uint32_t q, uint32_t i, uint8_t flags, uint16_t rtt, uint32_t up, uint32_t down,
+void xo_qos_entry(uint32_t q, uint32_t i, uint8_t flags, uint16_t rtt, uint32_t up, uint32_t down,
                       uint32_t data, uint16_t size)
 {
     uint8_t *e = xo_ptr(q + 8 + QOS_ENTRY * i);
@@ -449,8 +486,8 @@ static int h_qos_service_lookup(void)     /* (flags, event, &xnqos) */
 {
     /* the bandwidth probe the title runs once signed in (0x2BB04E): it waits
      * for this to complete. One entry: contacted, a typical home line. */
-    uint32_t q = qos_alloc(1);
-    qos_entry(q, 0, 0x01 | 0x02, 20, 1000000u, 8000000u, 0, 0);
+    uint32_t q = xo_qos_alloc(1, 0);
+    xo_qos_entry(q, 0, 0x01 | 0x02, 20, 1000000u, 8000000u, 0, 0);
     xo_wr32(xo_arg(2), q);
     xo_return(0, 3);
     return 1;
@@ -540,7 +577,7 @@ static int h_storage_path(void)   /* (facility, user lo, user hi, team lo, team 
 }
 
 typedef struct { uint32_t buf, len; } dl_t;
-static dl_t s_dl[MAX_TASKS];
+static dl_t s_dl[XO_MAX_TASKS];
 
 static int h_storage_download_mem(void)   /* (facility, pad, server path, buf, size, a, b, &task) */
 {
@@ -614,6 +651,54 @@ static int h_storage_upload_mem(void)   /* (facility, pad, server path, expires 
 static int h_storage_download_dir(void) { xo_return(HR_STORAGE_FAIL, 7); return 1; }
 static int h_storage_upload_dir(void)   { xo_return(HR_STORAGE_FAIL, 9); return 1; }
 
+/* ---- statistics ------------------------------------------------------------------
+ * The title reads six values per player and playlist before it matchmakes
+ * (0x74AA0: skill and experience, its "stat specs" are 24-byte records:
+ * player id +0 (12 bytes), leaderboard +0xC, count +0x10, values +0x14; a
+ * value is 16 bytes: id (u16) +0, type +4, value +8). There is no
+ * leaderboard server: every value reads back empty (type 0), which the
+ * title takes as 0 and clamps to its lowest rank. Writes are accepted and
+ * dropped. */
+
+static int h_stat_read(void)          /* (count, specs, event, &task) */
+{
+    put_handle(xo_arg(3), task_new(T_GENERIC, 0x3A08CB, 1, HR_TASK_RUNNING, HR_TASK_SUCCESS));
+    xo_return(HR_OK, 4);
+    return 1;
+}
+
+static int h_stat_read_result(void)   /* (task, count, specs, extra size, extra) */
+{
+    uint32_t n = xo_arg(1), specs = xo_arg(2), i, j;
+    if (!task_get(xo_arg(0))) return 0;
+    for (i = 0; specs && i < n; i++) {
+        uint32_t rec = specs + 24 * i, cnt = xo_rd32(rec + 0x10), vals = xo_rd32(rec + 0x14);
+        for (j = 0; vals && j < cnt && j < 64; j++) {
+            xo_wr32(vals + 16 * j + 4, 0);
+            xo_wr32(vals + 16 * j + 8, 0);
+        }
+    }
+    xo_return(HR_OK, 5);
+    return 1;
+}
+
+static int h_stat_write(void)         /* (count, specs, event, &task) */
+{
+    put_handle(xo_arg(3), task_new(T_GENERIC, 0x3A08C0, 1, HR_TASK_RUNNING, HR_TASK_SUCCESS));
+    xo_return(HR_OK, 4);
+    return 1;
+}
+
+static int h_stat_write_result(void)  /* (task, &handle, &references, &count) */
+{
+    if (!task_get(xo_arg(0))) return 0;
+    if (xo_arg(1)) xo_wr32(xo_arg(1), 0);
+    if (xo_arg(2)) xo_wr32(xo_arg(2), 0);
+    if (xo_arg(3)) xo_wr32(xo_arg(3), 0);
+    xo_return(HR_OK, 4);
+    return 1;
+}
+
 static int ret_value(uint32_t v, int nargs) { xo_return(v, nargs); return 1; }
 
 /* ---- the table ---------------------------------------------------------------- */
@@ -640,11 +725,18 @@ static const handler_t k_handlers[] = {
     {0x3AD176, h_storage_upload_mem},
     {0x3AB6DB, h_storage_download_dir},
     {0x3AD149, h_storage_upload_dir},
+    {0x3A08CB, h_stat_read},
+    {0x3A08D6, h_stat_read_result},
+    {0x3A08C0, h_stat_write},
+    {0x3AB6A6, h_stat_write_result},
 };
 
 int xo_live_call(uint32_t va)
 {
     size_t i;
+    xo_match_pump();
+    if (xo_match_call(va))
+        return 1;
     switch (va) {
     case 0x3A0671: return ret_value(s_logon_users, 0);          /* GetLogonUsers() */
     case 0x3A0687: return ret_value(HR_OK, 1);                  /* SaveLogonState(p) */
@@ -661,6 +753,7 @@ int xo_live_call(uint32_t va)
 void xo_live_init(void)
 {
     accounts_load();
+    xo_match_init();
     s_logon_users = xbox_HeapAlloc(USER_SIZE * MAX_LOGON, 16);
     memset(xo_ptr(s_logon_users), 0, USER_SIZE * MAX_LOGON);
     fprintf(stderr, "  [XO] Open Live: %d local account(s), first \"%s\" (%016llx), profile %s\n",
@@ -691,6 +784,13 @@ void xo_trace_detail(uint32_t va, const uint32_t *a, uint32_t eax)
         break;
     case 0x3A0671:  /* GetLogonUsers() -> users[4] */
         dump("logon users", eax, 0x70);
+        break;
+    case 0x3CD0D6:  /* XNetRegisterKey(&kid, &key) */
+        dump("kid", a[0], 8);
+        break;
+    case 0x3CD0EC:  /* XNetXnAddrToInAddr(&xnaddr, &kid, &ina) */
+        dump("xnaddr", a[0], 36);
+        dump("kid", a[1], 8);
         break;
     default:
         break;

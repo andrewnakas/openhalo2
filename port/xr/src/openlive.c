@@ -130,6 +130,38 @@ uint8_t *xo_ptr(uint32_t va) { return (uint8_t *)((uintptr_t)va + g_xbox_mem_off
 uint32_t xo_rd32(uint32_t va) { uint32_t v; memcpy(&v, xo_ptr(va), 4); return v; }
 void     xo_wr32(uint32_t va, uint32_t v) { memcpy(xo_ptr(va), &v, 4); }
 uint32_t xo_arg(int i) { return xo_rd32(g_esp + 4 + 4u * (uint32_t)i); }
+uint32_t xo_arg_addr(int i) { return g_esp + 4 + 4u * (uint32_t)i; }
+
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+void     xbox_HeapFree(uint32_t xbox_va);
+
+uint32_t xo_alloc(uint32_t size)
+{
+    uint32_t va = xbox_HeapAlloc(size, 16);
+    if (va) memset(xo_ptr(va), 0, size);
+    return va;
+}
+
+void xo_free(uint32_t va) { if (va) xbox_HeapFree(va); }
+
+/* Calls a lifted __stdcall function from a handler, on the calling guest
+ * thread: arguments and a return address on the guest stack, the callee
+ * pops them. eax is the result; ecx and edx are the callee's (the API the
+ * handler answers may clobber them too). */
+uint32_t xo_guest_call(void (*fn)(void), int nargs, const uint32_t *args)
+{
+    uint32_t sp = g_esp;
+    int i;
+    for (i = nargs - 1; i >= 0; i--) { g_esp -= 4; xo_wr32(g_esp, args[i]); }
+    g_esp -= 4;
+    xo_wr32(g_esp, 0x0E5AC0DEu);
+    fn();
+    if (g_esp != sp) {
+        fprintf(stderr, "  [XO] guest call left esp off by %d\n", (int)(g_esp - sp));
+        g_esp = sp;
+    }
+    return g_eax;
+}
 
 void xo_return(uint32_t eax, int nargs)
 {
@@ -183,7 +215,14 @@ void xo_hook(uint32_t va, void (*lifted)(void))
             && !s_unanswered[k]++)
             fprintf(stderr, "  [XO] not answered by Open Live: %s (0x%06X) from %08X, the title's library runs\n",
                     xo_name(va), va, ret);
-        lifted();
+        if (g_xo_mode & XO_MODE_LIVE) {
+            uint32_t mark = xo_match_before(va);    /* may point XNet at unmarked ids */
+            lifted();
+            xo_match_unmark_done(mark);
+            xo_match_after(va, a, g_eax);
+        } else {
+            lifted();
+        }
     }
     if ((g_xo_mode & XO_MODE_TRACE) && trace_this(va)) {
         int popped = (int)(g_esp - sp) - 4;
