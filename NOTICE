@@ -7,12 +7,11 @@ Open Halo 2 -- third-party notices
 2. halo2-decompiled  https://github.com/kirklandsig/halo2-decompiled -- CC0 1.0.
    Used as a reference for function boundaries and names; no code is compiled in.
 
-3. Audio hardware model (src/apu in the toolkit) -- derived from xemu,
-   LGPL-2.1-or-later, Copyright (c) 2012 espes, 2018-2019 Jannik Vogel,
-   2019-2025 Matt Borgerson. TEMPORARY: being replaced by an original
-   implementation before any public release (see docs/APU_CLEANROOM_DESIGN.md).
-   Files: apu_core.c, apu_vp.c, apu_dsp.c, apu_state.h, apu_regs.h, apu_debug.h,
-   fpconv.h, apu_shim.h, apu.h, nv2a/qemu_shim.h.
+3. Audio hardware model (port/xr/src/mcpxaudio) -- original clean-room
+   implementation (docs/APU_CLEANROOM_DESIGN.md, docs/APU_FACTS.md), MIT like
+   the rest of this project. The toolkit's xemu-derived audio code
+   (LGPL-2.1-or-later) is not built or linked into the release
+   (reports: linker map check).
 
 4. Network transport (net/, when built in) -- libdatachannel (MPL-2.0),
    libjuice (MPL-2.0), usrsctp (BSD-3-Clause), OpenSSL (Apache-2.0).

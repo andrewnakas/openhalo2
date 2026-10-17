@@ -47,9 +47,6 @@
 #include "d3d8_xbox.h"
 #include "dsound_xbox.h"
 #include "xinput_xbox.h"
-#include "nv2a_state.h"
-#include "nv2a_regs.h"
-#include "qemu_shim.h"
 #include "byog.h"
 
 /*
