@@ -73,6 +73,16 @@ int main(void)
     def("RECOMP_USB", "1");
     def("RECOMP_NO_MIRRORS", "1");
     def("RECOMP_NO_TILED", "1");
+    {   /* Open Live (openlive*.c): the accounts, friends and clans beside the
+         * hard disk, in the private file system, so they outlive the page */
+        static char p1[256], p2[256], p3[256];
+        snprintf(p1, sizeof p1, "%s/openlive.json", SAVE_DIR);
+        snprintf(p2, sizeof p2, "%s/openlive_friends.txt", SAVE_DIR);
+        snprintf(p3, sizeof p3, "%s/openlive_clans.txt", SAVE_DIR);
+        def("RECOMP_OL_PROFILE", p1);
+        def("RECOMP_OL_FRIENDS", p2);
+        def("RECOMP_OL_CLANS", p3);
+    }
     def("RECOMP_QUIET_PROGRESS", "1");   /* no line per 200 draws: every print crosses to the page */
     {   /* Sound: on unless ?env=RECOMP_SOUND=0 (the same switches main.c sets). */
         const char *snd = getenv("RECOMP_SOUND");
