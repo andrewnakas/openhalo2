@@ -699,6 +699,42 @@ static int h_stat_write_result(void)  /* (task, &handle, &references, &count) */
     return 1;
 }
 
+/* ---- arbitration -------------------------------------------------------------------
+ * Ranked games register their round with Live's arbitration service and
+ * report results to it (0x924E0-0x927B0); a failed registration ends the
+ * match. There is no arbitrator: rounds are accepted and reports dropped
+ * (no ranked integrity without a server; docs/OPEN_LIVE_DESIGN.md 3.7). */
+
+static int h_arb_round_id(void)       /* (&round id) */
+{
+    uint8_t r[8];
+    rand_bytes(r, 8);
+    if (xo_arg(0)) memcpy(xo_ptr(xo_arg(0)), r, 8);
+    xo_return(HR_OK, 1);
+    return 1;
+}
+
+static int h_arb_register(void)       /* (&arbitration id, seconds, flags, event, &task) */
+{
+    put_handle(xo_arg(4), task_new(T_GENERIC, 0x3AE32B, 1, HR_TASK_RUNNING, HR_TASK_SUCCESS));
+    xo_return(HR_OK, 5);
+    return 1;
+}
+
+static int h_arb_extend(void)         /* (&arbitration id, seconds, event, &task) */
+{
+    put_handle(xo_arg(3), task_new(T_GENERIC, 0x3AE33A, 1, HR_TASK_RUNNING, HR_TASK_SUCCESS));
+    xo_return(HR_OK, 4);
+    return 1;
+}
+
+static int h_arb_report(void)         /* (&arbitration id, count, procedures, ?, flags, event, &task) */
+{
+    put_handle(xo_arg(6), task_new(T_GENERIC, 0x3AE36A, 1, HR_TASK_RUNNING, HR_TASK_SUCCESS));
+    xo_return(HR_OK, 7);
+    return 1;
+}
+
 static int ret_value(uint32_t v, int nargs) { xo_return(v, nargs); return 1; }
 
 /* ---- the table ---------------------------------------------------------------- */
@@ -729,6 +765,10 @@ static const handler_t k_handlers[] = {
     {0x3A08D6, h_stat_read_result},
     {0x3A08C0, h_stat_write},
     {0x3AB6A6, h_stat_write_result},
+    {0x3ADC4C, h_arb_round_id},
+    {0x3AE32B, h_arb_register},
+    {0x3AE33A, h_arb_extend},
+    {0x3AE36A, h_arb_report},
 };
 
 int xo_live_call(uint32_t va)

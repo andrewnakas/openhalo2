@@ -122,7 +122,10 @@ def main():
     ap.add_argument('--base', default='D:/n64work/halo2/build/xr/save/CacheY/multiplayer_hopper.dat')
     ap.add_argument('--out', action='append',
                     default=None, help='storage folder(s); default build/xr and build/xr_b')
+    ap.add_argument('--first', help='put this playlist first (Quickmatch picks the first): tests')
     a = ap.parse_args()
+    if a.first:
+        PLAYLISTS.sort(key=lambda p: p[0] != a.first)
     outs = a.out or ['D:/n64work/halo2/build/xr/openlive/storage', 'D:/n64work/halo2/build/xr_b/openlive/storage']
     files = {
         'message_of_the_day.dat': package(1, motd(), True),
