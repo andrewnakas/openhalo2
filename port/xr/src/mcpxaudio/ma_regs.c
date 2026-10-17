@@ -79,8 +79,31 @@ void ma_lock(ma_state *s)
 }
 void ma_unlock(ma_state *s) { (void)s; LeaveCriticalSection(&s_cs); }
 #else
-void ma_lock(ma_state *s) { (void)s; }
-void ma_unlock(ma_state *s) { (void)s; }
+/* The web build (and any POSIX host): the same lock, as a recursive pthread
+ * mutex. It was a no-op here once, and the title's method writes then landed
+ * in the middle of the frame thread's work: a VOICE_ON issued while a frame
+ * was between its list walk and its sweep of unreachable voices was swept at
+ * once (the voice was linked after the walk passed), with no end report.
+ * DSOUND then waited forever for that stream's notifies, stopped feeding the
+ * APU, and the page went silent while the game ran on. */
+#include <pthread.h>
+static pthread_mutex_t s_mx;
+static pthread_once_t s_mx_once = PTHREAD_ONCE_INIT;
+static void mx_init(void)
+{
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s_mx, &a);
+    pthread_mutexattr_destroy(&a);
+}
+void ma_lock(ma_state *s)
+{
+    (void)s;
+    pthread_once(&s_mx_once, mx_init);
+    pthread_mutex_lock(&s_mx);
+}
+void ma_unlock(ma_state *s) { (void)s; pthread_mutex_unlock(&s_mx); }
 #endif
 
 /* ---- notifiers and traps ------------------------------------------------- */
@@ -109,6 +132,9 @@ void ma_voice_ended(ma_state *s, int v)
 {
     unsigned n = (s->trap_tail - s->trap_head) & 511u;
     s->st_traps++;
+    if (s->report_feed > 1)
+        fprintf(stderr, "[MA] end v%d fmt %08X state %08X frame %llu %s\n", v, ma_desc(s, v, D_FORMAT),
+                s->v[v].state, (unsigned long long)s->frames, s->in_frame ? "in-frame" : "");
     if (n < 511) {
         s->trapq[s->trap_tail & 511u] = (uint32_t)v;
         s->trap_tail++;
@@ -243,6 +269,11 @@ ma_state *ma_create_cfg(int mode, const char *cfg, int index)
     s->only = (e && !strcmp(e, "hrtf")) ? 1 : (e && !strcmp(e, "nohrtf")) ? 2 : (e && !strcmp(e, "list0")) ? 3 : (e && !strcmp(e, "mpdirect")) ? 4 : 0;
     s->report_bins = env_int("RECOMP_APU_BINS", 0);
     s->report_voices = env_int("RECOMP_APU_VOICES", 0);
+#if defined(__EMSCRIPTEN__)
+    s->report_feed = env_int("RECOMP_MA_FEED", 1);
+#else
+    s->report_feed = env_int("RECOMP_MA_FEED", 0);
+#endif
     e = ma_getenv(s, "RECOMP_APU_DSP_ACK_GPS");
     s->gps_ack = e ? (uint32_t)strtoul(e, NULL, 0) : 0x810;
     e = ma_getenv(s, "RECOMP_APU_DSP_SENTINEL");
@@ -320,6 +351,7 @@ static void method(ma_state *s, uint32_t m, uint32_t val)
         case M_SSL_A:
         case M_SSL_B: {
             int k = m == M_SSL_B;
+            s->st_ssl_writes++;
             s->v[v].ssl[k] = val;
             s->v[v].ssl_valid[k] = (val & 0xFF) != 0;
             if (val & 0xFF)
@@ -376,7 +408,12 @@ static void method(ma_state *s, uint32_t m, uint32_t val)
             s->v[v].locked = val & 1;
         break;
     case M_ANTECEDENT:   s->antecedent = val; break;
-    case M_VOICE_ON:     voice_on(s, val); break;
+    case M_VOICE_ON:
+        voice_on(s, val);
+        if (s->report_feed > 1 && (val & 0xFFFF) < MA_VOICES && (ma_desc(s, (int)(val & 0xFFFF), D_FORMAT) & F_STREAM))
+            fprintf(stderr, "[MA] stream on v%d frame %llu %s\n", (int)(val & 0xFFFF),
+                    (unsigned long long)s->frames, s->in_frame ? "in-frame" : "");
+        break;
     case M_VOICE_OFF:    voice_off(s, val); break;
     case M_VOICE_RELEASE: {
         /* state -> 0x66xxxxxx; +0x34 holds the release count (rate x 16,
@@ -423,6 +460,9 @@ void ma_write(ma_state *s, uint32_t off, uint32_t val, int size)
         val = (s->reg[a / 4] & ~mask) | ((val << sh) & mask);
     }
     ma_lock(s);
+    s->st_writes++;
+    if (s->in_frame)
+        s->st_overlap++;            /* a write landing inside the frame thread's work */
     if (a >= 0x20000) {
         s->reg[a / 4] = val;
         method(s, a, val);

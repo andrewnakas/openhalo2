@@ -195,7 +195,7 @@ struct ma_state {
     float     dump_acc[MA_BINS];
     int       dump_frames;
     uint32_t  bin_energy_n;
-    int       report_bins, report_voices;
+    int       report_bins, report_voices, report_feed;
     uint32_t  irq_pending;      /* status bits to raise from the thread    */
     uint32_t  gps_ack, sentinel_ptr, sentinel_val;
     uint64_t  st_doorbell;
@@ -220,6 +220,9 @@ struct ma_state {
     uint64_t  st_pause_frames;
     uint64_t  st_sets, st_sets_equal, st_vmis;   /* shadow: active-voice sets per block */
     uint32_t  st_vmis_v[MA_VOICES][2];            /* per voice: live-only, new-only blocks */
+    /* diagnostics of the title's stream feed ([MA] feed lines) */
+    uint64_t  st_ssl_writes, st_writes, st_overlap;
+    volatile int in_frame;      /* the frame thread is inside ma_lock'd work */
 };
 
 /* ma_regs.c */

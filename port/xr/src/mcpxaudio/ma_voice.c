@@ -687,8 +687,12 @@ void ma_process_frame(ma_state *s)
         int v;
         uint32_t g = s->gen;
         for (v = 0; v < MA_VOICES; v++)
-            if ((s->v[v].state & ST_ACTIVE) && s->stamp[v] != g && s->stamp[v] + 8 < g)
+            if ((s->v[v].state & ST_ACTIVE) && s->stamp[v] != g && s->stamp[v] + 8 < g) {
                 s->v[v].state &= ~ST_ACTIVE;
+                if (s->report_feed > 1)
+                    fprintf(stderr, "[MA] unlinked v%d fmt %08X frame %llu\n", v, ma_desc(s, v, D_FORMAT),
+                            (unsigned long long)s->frames);
+            }
     }
     if (s->sat == 2) {
         int b, n;

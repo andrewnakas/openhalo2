@@ -126,7 +126,13 @@ static void deliver(ma_state *s)
             return;                     /* try again after the next block */
         held = 0;
         s->st_irqs++;
-        xbox_DeviceRaiseInterrupt(MA_VECTOR);
+        {
+            /* an ISR that is not connected (-1) or does not claim (0) */
+            static unsigned nc;
+            int c = xbox_DeviceRaiseInterrupt(MA_VECTOR);
+            if (c <= 0 && s->report_feed && nc++ < 20)
+                fprintf(stderr, "[MA] ISR returned %d (irq %llu)\n", c, (unsigned long long)s->st_irqs);
+        }
         xbox_TimerThreadWake();
         ma_lock(s);
         post_trap(s);
@@ -260,6 +266,24 @@ static void report(ma_state *s, double elapsed, uint64_t blocks)
             }
             fprintf(stderr, "\n");
         }
+    }
+    if (s->mode == MA_LIVE && s->report_feed) {
+        /* the stream feed: SSL posts by the title, writes that overlapped the
+         * frame thread, and every active stream voice's list state */
+        char line[1024];
+        int n = 0;
+        n += snprintf(line + n, sizeof line - (size_t)n, "[MA] feed: writes %llu, ssl %llu, overlap %llu, pend %X st %X en %X fe %X traps queued %u posted-to %u;",
+                      (unsigned long long)s->st_writes, (unsigned long long)s->st_ssl_writes,
+                      (unsigned long long)s->st_overlap, s->irq_pending, s->reg[R_IRQ_STATUS / 4], s->reg[R_IRQ_ENABLE / 4], s->reg[R_FE_CONTROL / 4], s->trap_tail, s->trap_head);
+        for (v = 0; v < MA_VOICES && n < (int)sizeof line - 80; v++) {
+            ma_voice *vc = &s->v[v];
+            if (!(vc->state & ST_ACTIVE) || !(ma_desc(s, v, D_FORMAT) & F_STREAM))
+                continue;
+            n += snprintf(line + n, sizeof line - (size_t)n, " v%d c%d L%d s%u/%u V%d%d g%u/%u f%llu", v, vc->ssl_cur,
+                          vc->list_live, (unsigned)vc->seg, (unsigned)vc->list_count, vc->ssl_valid[0], vc->ssl_valid[1],
+                          vc->ssl_gen[0], vc->ssl_gen[1], (unsigned long long)vc->frames_played);
+        }
+        fprintf(stderr, "%s\n", line);
     }
     if (s->report_bins && s->bin_energy_n) {
         char line[1024];
@@ -442,6 +466,7 @@ static DWORD WINAPI frame_thread(LPVOID arg)
         }
         for (k = 0; k < n * step; k++) {
             ma_lock(s);
+            s->in_frame = 1;
             if (vp_running(s)) {
                 ma_process_frame(s);
                 ma_mix_frame(s, lr + 2 * MA_FRAME * fi);
@@ -450,6 +475,7 @@ static DWORD WINAPI frame_thread(LPVOID arg)
                 ma_mix_frame(s, lr + 2 * MA_FRAME * fi);
                 s->st_pause_frames++;
             }
+            s->in_frame = 0;
             ma_unlock(s);
             if (step == 1)
                 deliver(s);
