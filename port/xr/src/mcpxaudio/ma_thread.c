@@ -133,7 +133,25 @@ static void shadow_check(ma_state *s, uint64_t block)
     uint32_t base = s->reg[R_DESC_BASE / 4];
     int v;
 
-    if (s->mode != MA_SHADOW || !base || lines > 400 || s->index)
+    if (s->mode != MA_SHADOW || !base || s->index)
+        return;
+    {
+        /* is the set of active voices the same in both models this block? */
+        int mis = 0;
+        for (v = 0; v < MA_VOICES; v++) {
+            int oa = (ma_rd32(s, base + (uint32_t)v * 0x80u + D_STATE) & ST_ACTIVE) != 0;
+            int na = (s->v[v].state & ST_ACTIVE) != 0;
+            if (oa != na) {
+                mis++;
+                s->st_vmis_v[v][na]++;
+            }
+        }
+        s->st_sets++;
+        if (!mis)
+            s->st_sets_equal++;
+        s->st_vmis += (uint64_t)mis;
+    }
+    if (lines > 400)
         return;
     if (getenv("RECOMP_MA_WATCHRAM")) {
         /* which descriptor words change between blocks while no voice
@@ -200,6 +218,36 @@ static void report(ma_state *s, double elapsed, uint64_t blocks)
             (unsigned long long)s->st_irqs, (unsigned long long)s->st_traps,
             (unsigned long long)s->st_notifies, (unsigned long long)s->st_doorbell,
             (unsigned long long)s->st_clipped, (unsigned long long)s->st_pause_frames);
+    {
+        /* the title's own counters of DSP re-initialisations: 0x386AD8 is
+         * bumped by the sentinel path (0x37E9AB), 0x386AFC by the IRQ bit-3
+         * path (0x37E93D) */
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        uint32_t a, b;
+        memcpy(&a, mem + 0x386AD8, 4);
+        memcpy(&b, mem + 0x386AFC, 4);
+        fprintf(stderr, "[MA] DSP resets by the title: sentinel %u, irq %u\n", a, b);
+        if (s->mode == MA_SHADOW && s->st_sets)
+            fprintf(stderr, "[MA] shadow: active-voice set equal to the live model's in %.3f%% of %llu blocks (%llu voice mismatches)\n",
+                    100.0 * (double)s->st_sets_equal / (double)s->st_sets,
+                    (unsigned long long)s->st_sets, (unsigned long long)s->st_vmis);
+        if (s->mode == MA_SHADOW && s->st_vmis) {
+            int k, v2;
+            fprintf(stderr, "[MA] shadow: most mismatched voices (blocks active only live / only new):");
+            for (k = 0; k < 6; k++) {
+                int best = -1;
+                uint32_t bn = 0;
+                for (v2 = 0; v2 < MA_VOICES; v2++) {
+                    uint32_t t = s->st_vmis_v[v2][0] + s->st_vmis_v[v2][1];
+                    if (t > bn) { bn = t; best = v2; }
+                }
+                if (best < 0) break;
+                fprintf(stderr, " v%d %u/%u", best, s->st_vmis_v[best][0], s->st_vmis_v[best][1]);
+                s->st_vmis_v[best][0] = s->st_vmis_v[best][1] = 0;
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     if (s->report_bins && s->bin_energy_n) {
         char line[1024];
         int b, n = 0;
@@ -219,11 +267,12 @@ static void report(ma_state *s, double elapsed, uint64_t blocks)
             ma_voice *vc = &s->v[v];
             if (!(vc->state & ST_ACTIVE))
                 continue;
-            fprintf(stderr, "[MAV] v%d fmt %08X state %08X pos %06X rate %.4f consumed %llu out %llu env %.2f\n",
+            fprintf(stderr, "[MAV] v%d fmt %08X state %08X pos %06X rate %.4f consumed %llu out %llu env %.2f e %.4g\n",
                     v, ma_desc(s, v, D_FORMAT), vc->state, vc->pos_word & 0xFFFFFF,
                     vc->out_rendered ? (double)vc->src_consumed / vc->out_rendered : 0.0,
                     (unsigned long long)vc->src_consumed, (unsigned long long)vc->out_rendered,
-                    vc->aenv_level);
+                    vc->aenv_level, vc->energy * 32768.0 * 32768.0 / 1000.0 / (elapsed * MA_RATE));
+            vc->energy = 0;
         }
     }
     fflush(stderr);

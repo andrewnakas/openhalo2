@@ -277,13 +277,8 @@ again:
         break;
     }
     case 5: vc->aenv_level = sus; break;
-    case 6: {                                   /* release, linear to 0 */
-        int t = (int)rel * 16;
-        if (vc->aenv_count >= t) { vc->aenv_level = 0; break; }
-        vc->aenv_level *= 1.0f - 1.0f / (float)(t - vc->aenv_count);
-        vc->aenv_count++;
+    case 6:                                     /* release: see ma_render_voice */
         break;
-    }
     default: break;
     }
     vc->state = (vc->state & ~0x70000000u) | ((uint32_t)vc->aenv_state << 28);
@@ -307,7 +302,7 @@ static void hrtf_coefs(ma_state *s, int entry, float c[2][31], int *itd)
         for (ch = 0; ch < 2; ch++) {
             uint8_t b = p[2 * k + ch];
             float x = (float)(b & 0x7F) / 128.0f;
-            c[ch][k] = (b & 0x80) ? -x : x;
+            c[ch][s->hrtf_rev ? 30 - k : k] = (b & 0x80) ? -x : x;
         }
     /* byte 63: interaural delay, signed, in half samples (matched against
      * the oracle's [APUH] "itd" print: 42 -> 21.0, 252 -> -2.0) */
@@ -344,6 +339,12 @@ static void hrtf_coefs(ma_state *s, int entry, float c[2][31], int *itd)
           : s->hrtf_norm == 4 ? sqrt(e[0] + e[1])
           : sqrt((e[0] + e[1]) / 2.0);
     }
+    /* the previous model's HRTF path is 1.34 dB below unit energy over both
+     * ears: fitted, oracle ~ g x this model's HRTF output, over 123 one-second
+     * windows of Ivory Tower fire with a residual of 0.2% of the energy
+     * (docs/APU_FACTS.md 9) */
+    if (n > 1e-6)
+        n /= s->hrtf_trim;
     if (n > 1e-6)
         for (ch = 0; ch < 2; ch++)
             for (k = 0; k < 31; k++)
@@ -406,7 +407,10 @@ void ma_voice_start(ma_state *s, int v)
     vc->aenv_state = (int)((vc->state >> 28) & 7);
     vc->aenv_count = 0;
     vc->aenv_level = vc->aenv_state == 0 || vc->aenv_state >= 3 ? 1.0f : 0.0f;
+    vc->rel_count = vc->rel_total = 0;
     memset(vc->fir_hist, 0, sizeof vc->fir_hist);
+    memset(vc->svf, 0, sizeof vc->svf);
+    memset(vc->i3, 0, sizeof vc->i3);
     vc->fir_pos = 0;
     vc->frames_played = 0;
 }
@@ -428,6 +432,20 @@ void ma_render_voice(ma_state *s, int v, int list)
     (void)list;
     aenv_frame(s, v);
     env = vc->aenv_level;
+    if (vc->aenv_state == 6) {
+        /* output = level x count / (rate x 16), count down per frame
+         * (XboxDevWiki APU, Release) */
+        if (vc->rel_count <= 0) {
+            vc->state = (vc->state & ~(ST_ACTIVE | 0x77000000u)) | 0x77000000u;
+            ma_desc_set(s, v, D_STATE, vc->state);
+            ma_notify(s, v, vc->ssl_cur);
+            ma_voice_ended(s, v);
+            return;
+        }
+        env *= (float)vc->rel_count / (float)vc->rel_total;
+        vc->rel_count--;
+        ma_wr32(s, s->reg[R_DESC_BASE / 4] + (uint32_t)v * 0x80u + 0x34, (uint32_t)vc->rel_count);
+    }
     vols(s, v, g, sel);
 
     if (fmt & F_MULTIPASS) {
@@ -486,6 +504,72 @@ void ma_render_voice(ma_state *s, int v, int list)
         }
     }
 
+    if (s->only) {
+        int is_hrtf = s->hrtf_on && (vc->snap[D_HRTF / 4] & 0xFFFF) != 0xFFFF && (fmt & F_MULTIPASS);
+        if ((s->only == 1 && !is_hrtf) || (s->only == 2 && is_hrtf) || (s->only == 3 && list != 0) || (s->only == 4 && (list == 0 || is_hrtf))) {
+            /* keep the source's writes into the bin the HRTF voice reads */
+            for (i = 0; i < 8; i++)
+                if (sel[i] == 31 && g[i] != 0.0f)
+                    for (n = 0; n < MA_FRAME; n++)
+                        s->bin[31][n] += g[i] * env * src[n][fi.ch > 1 ? (i & 1) : 0];
+            goto done;
+        }
+    }
+    /* Filters (SetFilter: +0x18 bits 16-17 mode, +0x74 coefficients 0/1,
+     * +0x78 coefficients 2/3). Coefficients are in DSOUND's hardware form
+     * (XboxDevWiki APU, DLS2): a cutoff as 4096 x log2(2 sin(pi f / 48000)),
+     * i.e. log2 of the frequency coefficient of a state-variable filter, and
+     * a damping in 1.15. Mode 1 (DLS2) runs a resonant two-pole low-pass;
+     * a 3D (HRTF) voice also runs a one-pole low-pass with coefficient 3
+     * (the I3DL2 direct path). */
+    {
+        uint32_t c18 = vc->snap[D_MENV_C / 4], c74 = vc->snap[0x74 / 4], c78 = vc->snap[0x78 / 4];
+        int mode = (int)((c18 >> 16) & 3);
+        int is3d = (vc->snap[D_HRTF / 4] & 0xFFFF) != 0xFFFF;
+        int nch = fi.ch > 1 ? 2 : 1, c;
+        if ((s->filt & 1) && (mode == 1 || mode == 3)) {
+            /* cutoff from F = 2 sin(pi f / 48000); resonance from the 1.15
+             * damping (0x8000 = 0 dB); a biquad, so it cannot run away */
+            double F = pow(2.0, (int16_t)(c74 & 0xFFFF) / 4096.0);
+            double q = (double)((c74 >> 16) & 0xFFFF) / 32768.0;
+            if (F < 2.0 && F > 0.0 && (s->filt & 4 || !(F >= 0.999 && q >= 0.999))) {
+                double f = asin(F / 2.0) / 3.14159265358979;    /* f / fs */
+                double w0 = 2 * 3.14159265358979 * (f > 0.45 ? 0.45 : f);
+                double Q = 0.70710678 / (q < 0.1 ? 0.1 : q);
+                double al = sin(w0) / (2 * Q), cw = cos(w0), a0 = 1 + al;
+                float b0 = (float)((1 - cw) / 2 / a0), b1 = (float)((1 - cw) / a0);
+                float a1 = (float)(-2 * cw / a0), a2 = (float)((1 - al) / a0);
+                for (c = 0; c < nch; c++) {
+                    float z1 = vc->svf[c][0], z2 = vc->svf[c][1];
+                    for (n = 0; n < MA_FRAME; n++) {
+                        float x = src[n][c];
+                        float y = b0 * x + z1;
+                        z1 = b1 * x - a1 * y + z2;
+                        z2 = b0 * x - a2 * y;
+                        src[n][c] = y;
+                    }
+                    vc->svf[c][0] = z1; vc->svf[c][1] = z2;
+                }
+            }
+        }
+        if ((s->filt & 2) && is3d && (fmt & F_MULTIPASS)) {
+            float F = (float)pow(2.0, (int16_t)(c78 >> 16) / 4096.0);
+            float gdb = (float)(int16_t)(c78 & 0xFFFF);
+            float gain = gdb < 0 ? (float)pow(2.0, gdb / 4096.0) : 1.0f;
+            if (F > 1.0f) F = 1.0f;
+            for (c = 0; c < nch; c++) {
+                float y = vc->i3[c];
+                for (n = 0; n < MA_FRAME; n++) {
+                    y += F * (src[n][c] - y);
+                    src[n][c] = y * gain;
+                }
+                vc->i3[c] = y;
+            }
+        }
+        if (nch == 1)
+            for (n = 0; n < MA_FRAME; n++)
+                src[n][1] = src[n][0];
+    }
     /* HRTF voices: left FIR to slots 0/1, right FIR to slots 2/3, the dry
      * mono signal to the rest */
     if (s->hrtf_on && (vc->snap[D_HRTF / 4] & 0xFFFF) != 0xFFFF) {
@@ -512,8 +596,11 @@ void ma_render_voice(ma_state *s, int v, int list)
             if (gg == 0.0f)
                 continue;
             dst = s->bin[sel[i]];
-            for (n = 0; n < MA_FRAME; n++)
-                dst[n] += gg * (i < 2 ? out[0][n] : i < 4 ? out[1][n] : src[n][0]);
+            for (n = 0; n < MA_FRAME; n++) {
+                float y = gg * (i < 2 ? out[0][n] : i < 4 ? out[1][n] : src[n][0]);
+                dst[n] += y;
+                vc->energy += (double)y * y;
+            }
         }
     } else {
         for (i = 0; i < 8; i++) {
@@ -523,11 +610,21 @@ void ma_render_voice(ma_state *s, int v, int list)
             if (gg == 0.0f)
                 continue;
             dst = s->bin[sel[i]];
-            for (n = 0; n < MA_FRAME; n++)
+            for (n = 0; n < MA_FRAME; n++) {
                 dst[n] += gg * src[n][ch];
+                vc->energy += (double)(gg * src[n][ch]) * (gg * src[n][ch]);
+            }
         }
     }
 
+    if (s->sat == 1) {
+        for (i = 0; i < 8; i++) {
+            float *dst = s->bin[sel[i]];
+            for (n = 0; n < MA_FRAME; n++)
+                dst[n] = dst[n] > 0.99999988f ? 0.99999988f : dst[n] < -1.0f ? -1.0f : dst[n];
+        }
+    }
+done:
     vc->frames_played++;
     if (ended) {
         vc->state &= ~ST_ACTIVE;
@@ -575,6 +672,21 @@ void ma_process_frame(ma_state *s)
         walk(s, 2);
     } else {
         walk(s, 0);
+    }
+    {
+        /* an active voice no list reaches any more cannot play: the title
+         * unlinked it (in a shadow, after the live model's end report) */
+        int v;
+        uint32_t g = s->gen;
+        for (v = 0; v < MA_VOICES; v++)
+            if ((s->v[v].state & ST_ACTIVE) && s->stamp[v] != g && s->stamp[v] + 8 < g)
+                s->v[v].state &= ~ST_ACTIVE;
+    }
+    if (s->sat == 2) {
+        int b, n;
+        for (b = 0; b < MA_BINS; b++)
+            for (n = 0; n < MA_FRAME; n++)
+                s->bin[b][n] = s->bin[b][n] > 0.99999988f ? 0.99999988f : s->bin[b][n] < -1.0f ? -1.0f : s->bin[b][n];
     }
     s->frames++;
     s->sample_count += MA_FRAME;

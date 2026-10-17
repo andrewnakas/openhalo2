@@ -38,6 +38,7 @@
 #define M_VOICE_ON     0x20124
 #define M_VOICE_OFF    0x20128
 #define M_VOICE_PAUSE  0x20140
+#define M_VOICE_RELEASE 0x2012C     /* both envelopes to release (trace armory1, 97.198 s) */
 #define M_HRTF_SELECT  0x20160
 #define M_SEG_WINDOW   0x20190
 #define M_BIN_HEADROOM 0x20200      /* + 4 x bin */
@@ -113,8 +114,11 @@ typedef struct ma_voice {
     int      aenv_state;
     int      aenv_count;
     float    aenv_level;        /* 0..1                                     */
+    int      rel_count, rel_total;  /* release: frames left / at the start  */
     /* HRTF FIR history (mono in) */
     float    fir_hist[128];
+    float    svf[2][2];         /* DLS2 low-pass state (low, band) per channel */
+    float    i3[2];             /* I3DL2 direct-path low-pass state          */
     int      fir_pos;
     /* bookkeeping */
     uint32_t frames_played;
@@ -125,6 +129,7 @@ typedef struct ma_voice {
     uint32_t snap[32];
     uint64_t src_consumed;      /* source frames consumed (pitch check)    */
     uint64_t out_rendered;
+    double   energy;            /* sum of squares this voice put into bins (report) */
 } ma_voice;
 
 typedef struct ma_limiter {
@@ -191,11 +196,20 @@ struct ma_state {
     int       interp;           /* 0 linear, 1 hermite                     */
     int       hrtf_norm;        /* 0 raw, 1 l1, 2 rms                      */
     int       hrtf_on;
+    int       only;             /* RECOMP_MA_ONLY diagnostics: 1 HRTF voices' outputs only,
+                                 * 2 everything but them */
+    int       filt;             /* RECOMP_MA_FILTER bits: 1 DLS2 low-pass, 2 I3DL2 */
+    int       sat;              /* RECOMP_MA_SAT: mixbins are 24-bit: 0 float, 1 saturate after
+                                 * every voice, 2 saturate once per frame */
+    float     hrtf_trim;        /* RECOMP_MA_HRTF_TRIM, default 0.857 */
+    int       hrtf_rev;         /* RECOMP_MA_HRTF_REV: taps in reverse order (diagnostics) */
     int       mp_mode;          /* RECOMP_MA_MP_MODE: 0 in list order, a read empties the bin;
                                  * 1 all other voices first, reads keep the bin; 2 list order, keep */
     int       hrtf_itd;         /* RECOMP_MA_HRTF_ITD: 1 left on +, -1 right on +, 0 off */
     double    t0;
     uint64_t  st_pause_frames;
+    uint64_t  st_sets, st_sets_equal, st_vmis;   /* shadow: active-voice sets per block */
+    uint32_t  st_vmis_v[MA_VOICES][2];            /* per voice: live-only, new-only blocks */
 };
 
 /* ma_regs.c */

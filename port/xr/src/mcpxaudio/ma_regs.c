@@ -225,8 +225,15 @@ ma_state *ma_create_cfg(int mode, const char *cfg, int index)
                  : (e && !strcmp(e, "max")) ? 3 : (e && !strcmp(e, "sum")) ? 4
                  : (e && !strcmp(e, "ear")) ? 5 : (e && !strcmp(e, "rms")) ? 2 : 4;
     s->hrtf_on = env_int("RECOMP_APU_HRTF", 1);
-    s->hrtf_itd = env_int("RECOMP_MA_HRTF_ITD", -1);
+    s->hrtf_itd = env_int("RECOMP_MA_HRTF_ITD", 1);
     s->mp_mode = env_int("RECOMP_MA_MP_MODE", 0);
+    s->hrtf_rev = env_int("RECOMP_MA_HRTF_REV", 0);
+    e = ma_getenv(s, "RECOMP_MA_HRTF_TRIM");
+    s->hrtf_trim = (e && *e) ? (float)atof(e) : 0.875f;
+    s->sat = env_int("RECOMP_MA_SAT", 0);
+    s->filt = env_int("RECOMP_MA_FILTER", 1);
+    e = ma_getenv(s, "RECOMP_MA_ONLY");
+    s->only = (e && !strcmp(e, "hrtf")) ? 1 : (e && !strcmp(e, "nohrtf")) ? 2 : (e && !strcmp(e, "list0")) ? 3 : (e && !strcmp(e, "mpdirect")) ? 4 : 0;
     s->report_bins = env_int("RECOMP_APU_BINS", 0);
     s->report_voices = env_int("RECOMP_APU_VOICES", 0);
     e = ma_getenv(s, "RECOMP_APU_DSP_ACK_GPS");
@@ -364,6 +371,21 @@ static void method(ma_state *s, uint32_t m, uint32_t val)
     case M_ANTECEDENT:   s->antecedent = val; break;
     case M_VOICE_ON:     voice_on(s, val); break;
     case M_VOICE_OFF:    voice_off(s, val); break;
+    case M_VOICE_RELEASE: {
+        /* state -> 0x66xxxxxx; +0x34 holds the release count (rate x 16,
+         * counted down once per frame); at 0 the voice ends (0x77000000) */
+        int rv = (int)(val & 0xFFFF);
+        if (rv < MA_VOICES && (s->v[rv].state & ST_ACTIVE)) {
+            ma_voice *vc = &s->v[rv];
+            uint32_t rel = ma_desc(s, rv, D_AENV_REL) & 0xFFF;
+            vc->state = (vc->state & ~0x77000000u) | 0x66000000u;
+            vc->aenv_state = 6;
+            vc->rel_total = vc->rel_count = (int)rel * 16;
+            ma_desc_set(s, rv, D_STATE, vc->state);
+            ma_wr32(s, s->reg[R_DESC_BASE / 4] + (uint32_t)rv * 0x80u + 0x34, (uint32_t)vc->rel_count);
+        }
+        break;
+    }
     case M_VOICE_PAUSE:
         if ((val & 0xFFFF) < MA_VOICES)
             s->v[val & 0xFFFF].paused = (val >> 18) & 1;
