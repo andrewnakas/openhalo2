@@ -576,22 +576,28 @@ all-or-nothing stretch (DNS, Kerberos, SG, xmatch) before the first menu reacts.
 
 ---
 
-## Implementation status (2026-10-17, native build)
+## Implementation status (2026-10-17, native and web builds)
 
-Switches: `RECOMP_OPEN_LIVE=1` (ini `open_live = 1`) answers the API; off, the wrappers call
-the title's own library (no behaviour change). `RECOMP_XO_TRACE=1` traces either path.
-`RECOMP_OL_GAMERTAG` / ini `gamertag` names the first local account (`openlive.json`).
+Switches: `RECOMP_OPEN_LIVE=1` (ini `open_live = 1`; web: `?link=openlive&env=RECOMP_OPEN_LIVE=1`)
+answers the API; off (the default everywhere), the wrappers call the title's own library (no
+behaviour change). `RECOMP_XO_TRACE=1` traces either path. `RECOMP_OL_GAMERTAG` / ini `gamertag`
+names the first local account (`openlive.json`; web: in the save folder of the private file
+system, so it survives page loads).
 
 | Part | Where | State |
 |---|---|---|
-| Hooks (111 entry points) | `h2lift/xo_hle_pass.py` (run by `tools/relift.sh`), `port/xr/src/openlive.c` | done; the web build keeps the direct calls until it links openlive*.c |
+| Hooks (111 entry points) | `h2lift/xo_hle_pass.py` (run by `tools/relift.sh`), `port/xr/src/openlive.c` | done, native and web (`-DOPENHALO2_OPEN_LIVE` in `port/web/build_web.sh`) |
 | Sign-in, tasks, stats (empty), arbitration (accepted) | `openlive_api.c` | done |
-| Title storage (our MOTD, our playlists) | `openlive_api.c`, `tools/ol_storage.py` | done; network configuration and bungienet user file not served (title defaults) |
-| Facilitator (hold/visit rooms on the relay) | `net/olive.c` | done, native only (no `olive.js`) |
-| Multi-room mesh | `net/h2net.c` (`h2net_init/join/leave`) | done |
-| Matchmaking, QoS, session mesh | `openlive_match.c` | done: Quickmatch/Optimatch find, join and start a match |
-| Friends, presence, requests, invites, join friend, custom games | `openlive_friends.c` | done except the invite icon/accept path (joining works through presence) |
-| Clans, messages | `openlive_friends.c` | no service: clans none (create is a silent no-op), messages dropped |
+| Title storage (our MOTD, our playlists) | `openlive_api.c`, `tools/ol_storage.py` | done; web fetches `openlive/storage/...` from the site; network configuration and bungienet user file not served (title defaults) |
+| Facilitator (hold/visit rooms on the relay) | `net/olive.c` (+ `net/olive_ws_web.h` on the web) | done; holds the relay drops are reopened; a visit asks every member and takes the first reply (the relay keeps a killed process's member for a while) |
+| Multi-room mesh | `net/h2net.c` (native), `net/h2net_web.c` + `port/web/net.js` (web: one `h2net.js` mesh per room) | done |
+| Matchmaking, QoS, session mesh | `openlive_match.c` | done: Quickmatch/Optimatch, solo and as a party (squad) |
+| Sessions past a relay room (more than 10) | `openlive_match.c` (inbox signaling), `h2net_join_ext` | done natively; the web build stays in the room (no external rooms there yet) |
+| Host migration | the title's own (`network_session`) over the full mesh | works (host's process killed mid-match) |
+| Friends, presence, requests, join friend, custom games | `openlive_friends.c` | done |
+| Game/party invites | `openlive_friends.c` (messages) | done: the invite is a type-3 message (Msg column icon, message screen, Accept joins the party) |
+| Clans | `openlive_clans.c` | done: create, invite (type-4 message), accept, members and ranks; the record lives with the founder |
+| Messages | `openlive_friends.c` | invites and clan invites only; "Send Message" text/voice messages are dropped |
 
 Differences from the design above, found by measurement:
 * Discovery uses private bucket rooms `h2q9809-<playlist>-<shard>` that every advertising host
@@ -602,12 +608,35 @@ Differences from the design above, found by measurement:
   refuses the plain address (WSAEINVAL). The hooks hand the title's XNet unmarked copies.
 * Matchmaking needs stats (six values per playlist, 0x74AA0) and a successful arbitration
   registration (or the match ends); both are answered locally.
+* Halo 2 (this XDK) carries game invites and clan invites as Live *messages*, not friend-state
+  bits: `XOnlineMessageEnumerate` summaries (0x40 bytes, 0x8EBD0: sender +0, type +0xC, context
+  +0x10, time +0x18, id +0x20, title +0x28, gamertag +0x30), details property 0x581 = the
+  session id, `XOnlineGetNotificationEx` for the toast. The context of a clan invite is the clan.
+* Playlist minimums come from the title's hopper rules: Free For All 4 players and solo only,
+  Team Slayer 6, Training Ground 4, Duel 2.
+* Sessions over 10 players: a station the mesh room turns away joins an external h2net room;
+  its signaling goes through inboxes ('M' member -> host roster, 'R' roster, 'N' batched SDP and
+  candidates, in order per member); the outside station offers, room members answer. The host
+  of a registered key is the remote whose QoS data carries it (bit 7 aside), else the host last
+  measured.
+* Emscripten runs WebSocket callbacks on the page's main thread whatever thread is asked for;
+  the web facilitator therefore never waits for the main thread (requests and events are posted).
 
-Evidence: `D:/n64work/halo2/reports/openlive/` (M1_signin_sheet, M2_storage_sheet,
-M4_duel_match_started, M4_postrelift_joined, M5_friend_request, M5_friends_presence,
-M5_party_joined, M5_custom_game_started). Rigs: `tools/ol_boot.sh`, `ol_pair.sh`,
-`ol_tolive.sh`, `ol_keys.sh`, `ol_mainrow.sh`, `ol_kill.sh`.
+Evidence: `D:/n64work/halo2/reports/openlive/` (M1-M5) and `D:/n64work/halo2/reports/openlive2/`:
+`inv_icon_B.png`, `inv_message_B.png`, `inv_accepted_lobby.png` (invites);
+`M6_party_formed.png`, `M6_squad_party_ffa_too_large.png`, `M6_squad_matchmaking_3of4.png`,
+`M6_four_matched.png`, `M6_four_player_match.png`, `M6_host_migration_after_kill.png` +
+`M6_host_migration_log.txt`; `M6_overflow_join_via_inboxes.png`,
+`M6_overflow_four_player_match.png`, `M6_overflow_status_D.txt`; `M7_clan_created.png`,
+`M7_clan_invite_received.png`, `M7_clan_two_members.png`; `M8_native_vs_browser_duel.png`,
+`M8_native_vs_browser_postgame.png`, `M8_native_log.txt`, `M8_browser_log.txt`.
 
-Not done: M6 (squad matchmaking, more than 10 players per session room, host migration
-test), the rest of M7 (Content Download launches the downloader and was not pressed), M8
-(web parity, NAT test, two real networks).
+Rigs: native `tools/ol_boot.sh`, `ol_trio.sh` (up to four copies: build/xr, xr_b, xr_c, xr_d;
+`XENV_d=...` per copy), `ol_drive.py` (reads the screen: `tolive`, `optimatch<row>`, `state`),
+`ol_keys.sh` (`wait@N`), `ol_sheet.sh`, `ol_kill.sh`, `ol_visit.py` (probe a relay room);
+web `ol_wboot.sh`, `ol_wdrive.py`, `ol_wkeys.sh`, `ol_wkill.sh`, `ol_wstack.py`.
+`RECOMP_NO_HOST_PAD=1` (runtime) keeps a controller in use elsewhere out of headless copies.
+
+Not done: Content Download (skipped), text/voice messages, sessions past 10 in the browser (it
+cannot take an external room yet), a test across two real home networks (all tests ran on one
+machine), NAT-type reporting, and the optional owner items of 3.9 (relay changes, registry).
