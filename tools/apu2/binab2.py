@@ -16,11 +16,11 @@ log = open(os.path.join(d, 'out.log'), errors='replace').read().split('\n')
 periods = []          # (blocks in period, {bin: energy})
 pend = None
 for ln in log:
-    m = re.match(r'\[APU\] out: .* (\d+) of (\d+) blocks', ln)
+    m = re.search(r'\[APU\] out: .* (\d+) of (\d+) blocks', ln)
     if m:
         pend = int(m.group(2))
         continue
-    m = re.match(r'\[APU\] mixbin energy:(.*)', ln)
+    m = re.search(r'\[APU\] mixbin energy:(.*)', ln)
     if m and pend is not None:
         e = {int(b): float(x) for b, x in re.findall(r' (\d+):([0-9.]+(?:e[+-]?\d+)?)', m.group(1))}
         periods.append((pend, e))

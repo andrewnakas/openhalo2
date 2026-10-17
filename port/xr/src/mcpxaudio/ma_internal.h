@@ -126,6 +126,10 @@ typedef struct ma_voice {
     /* the descriptor as of the last frame the title was not editing it:
      * DSOUND brackets a multi-word edit with VOICE_LOCK 1 / 0 (0x202FC) */
     int      locked;
+    /* shadow: wait for the live model to start the voice before rendering it,
+     * so both start it in corresponding blocks (RECOMP_MA_SYNC_ON=0 off) */
+    int      wait_live;
+    uint32_t wait_state, wait_pos;
     uint32_t snap[32];
     uint64_t src_consumed;      /* source frames consumed (pitch check)    */
     uint64_t out_rendered;
@@ -208,6 +212,7 @@ struct ma_state {
     int       hrtf_rev;
     int       hrtf_dry;         /* RECOMP_MA_HRTF_DRY: what an HRTF voice sends to slots 4-7
                                  * (default 4: the filtered left/right by slot parity) */
+    int       sync_on;
     int       mp_mode;          /* RECOMP_MA_MP_MODE: 0 in list order, a read empties the bin;
                                  * 1 all other voices first, reads keep the bin; 2 list order, keep */
     int       hrtf_itd;         /* RECOMP_MA_HRTF_ITD: 1 left on +, -1 right on +, 0 off */

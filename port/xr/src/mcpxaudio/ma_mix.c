@@ -54,7 +54,7 @@ void ma_mix_init(ma_state *s)
     s->limit_mode = !e ? 1 : !strcmp(e, "0") ? 0 : !strcmp(e, "tanh") ? 2 : 1;
     s->lim.gain = 1.0f;
     e = ma_getenv(s, "RECOMP_APU_REVERB");
-    s->reverb_on = e ? atoi(e) : 0;
+    s->reverb_on = e ? atoi(e) : s->mode == MA_LIVE;   /* an addition: on when live, off in a shadow (dry comparison) */
     if (s->reverb_on)
         s->rv = ma_reverb_create();
 }

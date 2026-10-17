@@ -152,6 +152,11 @@ static void voice_on(ma_state *s, uint32_t val)
     ma_wr32(s, desc_pa(s, v, D_STATE), s->v[v].state);
     s->v[v].paused = 0;
     ma_voice_start(s, v);
+    if (s->mode == MA_SHADOW && s->sync_on) {
+        s->v[v].wait_live = 24;             /* frames, at most */
+        s->v[v].wait_state = s->v[v].state;
+        s->v[v].wait_pos = s->v[v].pos_word;
+    }
 }
 
 static void voice_off(ma_state *s, uint32_t val)
@@ -227,6 +232,7 @@ ma_state *ma_create_cfg(int mode, const char *cfg, int index)
     s->hrtf_on = env_int("RECOMP_APU_HRTF", 1);
     s->hrtf_itd = env_int("RECOMP_MA_HRTF_ITD", 1);
     s->mp_mode = env_int("RECOMP_MA_MP_MODE", 0);
+    s->sync_on = env_int("RECOMP_MA_SYNC_ON", 0);
     s->hrtf_rev = env_int("RECOMP_MA_HRTF_REV", 0);
     s->hrtf_dry = env_int("RECOMP_MA_HRTF_DRY", 4);
     e = ma_getenv(s, "RECOMP_MA_HRTF_TRIM");

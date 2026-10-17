@@ -421,6 +421,14 @@ void ma_render_voice(ma_state *s, int v, int list)
     uint32_t fmt;
     fmtinfo fi;
 
+    if (vc->wait_live > 0) {
+        uint32_t pa = s->reg[R_DESC_BASE / 4] + (uint32_t)v * 0x80u;
+        if (ma_rd32(s, pa + D_STATE) == vc->wait_state && ma_rd32(s, pa + D_POS) == vc->wait_pos
+                && --vc->wait_live > 0)
+            return;                         /* the live model has not run it yet */
+        vc->wait_live = 0;
+    }
+
     if (!vc->locked || !vc->snap[D_FORMAT / 4])
         memcpy(vc->snap, ma_pa(s, s->reg[R_DESC_BASE / 4] + (uint32_t)v * 0x80u), 0x80);
     fmt = vc->snap[D_FORMAT / 4];

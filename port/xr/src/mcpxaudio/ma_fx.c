@@ -151,6 +151,14 @@ void ma_reverb_params_from_title(ma_state *s)
     if (g < 0x10000 || g >= 0x84000000u)
         return;
     memcpy(p, mem + g + 0x2950 + 8, sizeof p);
+    {
+        static int shown;
+        if (!shown && getenv("RECOMP_MA_REVERB_DEBUG")) {
+            shown = 1;
+            fprintf(stderr, "[MA] reverb globals at 0x%08X: %g %g %g %g %g %g %g %g %g %g %g %g\n", g,
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]);
+        }
+    }
     if (!sane(p[0], -10000, 0) || !sane(p[3], 0.1f, 20) || !sane(p[4], 0.1f, 2)
             || !sane(p[11], 20, 20000) || !sane(p[6], 0, 0.3f) || !sane(p[8], 0, 0.1f))
         return;
@@ -159,15 +167,21 @@ void ma_reverb_params_from_title(ma_state *s)
     if (!changed)
         return;
     memcpy(last, p, sizeof p);
-    r->room = powf(10.0f, p[0] / 2000.0f);
-    r->wet_er = powf(10.0f, (p[5] < -10000 ? -10000 : p[5]) / 2000.0f);
-    r->wet_late = powf(10.0f, (p[7] < -10000 ? -10000 : p[7]) / 2000.0f);
+    {
+        /* the title keeps the levels in dB (measured: -100 = off, then -12,
+         * -12, +4 in the Armory), not the mB of the I3DL2 guideline */
+        float div = (p[0] >= -100.5f && p[5] >= -100.5f && p[7] >= -100.5f) ? 20.0f : 2000.0f;
+        float floor_ = div == 20.0f ? -100.0f : -10000.0f;
+        r->room = p[0] <= floor_ ? 0.0f : powf(10.0f, p[0] / div);
+        r->wet_er = p[5] <= floor_ ? 0.0f : powf(10.0f, p[5] / div);
+        r->wet_late = p[7] <= floor_ ? 0.0f : powf(10.0f, p[7] / div);
+    }
     r->pre = (int)((p[6] + p[8]) * MA_RATE);
     if (r->pre > 4000) r->pre = 4000;
     r->diffusion = sane(p[9], 0, 100) ? 0.5f + 0.5f * p[9] / 100.0f : 1.0f;
     set_decay(r, p[3], p[4], p[11]);
-    fprintf(stderr, "[MA] reverb from the title: room %.0f mB, decay %.2f s x%.2f HF, "
-            "reflections %.0f mB @%.3f s, reverb %.0f mB @%.3f s\n",
+    fprintf(stderr, "[MA] reverb from the title: room %.0f, decay %.2f s x%.2f HF, "
+            "reflections %.0f @%.3f s, reverb %.0f @%.3f s (dB)\n",
             p[0], p[3], p[4], p[5], p[6], p[7], p[8]);
 }
 
