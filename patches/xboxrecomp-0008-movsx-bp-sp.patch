@@ -1,0 +1,52 @@
+xboxrecomp: movsx from bp/sp sign-extends (Bink IDCT specks in Halo 2)
+
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -1883,6 +1883,6 @@
+             r = ops[1].reg
+             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
+                 src = f"SX8({src})"
+-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
++            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
+                 src = f"SX16({src})"
+         return [_fmt_operand_write(ops[0], src)]
+diff --git a/tools/recomp/test_lifter_movsx_bp.py b/tools/recomp/test_lifter_movsx_bp.py
+new file mode 100644
+index 0000000..b5bbe30
+--- /dev/null
++++ b/tools/recomp/test_lifter_movsx_bp.py
+@@ -0,0 +1,33 @@
++"""`movsx r32, bp` / `movsx r32, sp` must sign-extend.
++
++_lift_movsx listed the 16-bit sources it wraps in SX16 as ax, bx, cx, dx, si,
++di -- bp and sp were missing, so `movsx ebx, bp` lifted to `ebx = LO16(ebp)`,
++a zero extension. Halo 2's Bink IDCT (0x3EBAD0) keeps one row coefficient in
++bp: every negative coefficient there became +65536-ish, the block came out
++wrong and the error was carried forward by motion compensation -- the
++"coloured specks" in every Bink movie. 132 sites in Halo 2 changed.
++"""
++
++import unittest
++
++from .disasm import Instruction, Operand
++from .lifter import Lifter
++
++
++def _lift(dst, src):
++    insn = Instruction(0, 3, "movsx", "", "00")
++    insn.operands = [Operand(type="reg", reg=dst), Operand(type="reg", reg=src)]
++    return " ".join(Lifter().lift_instruction(insn))
++
++
++class MovsxSixteenBitSources(unittest.TestCase):
++    def test_every_16_bit_register_is_sign_extended(self):
++        for src in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
++            self.assertIn("SX16(", _lift("ebx" if src != "bx" else "eax", src), src)
++
++    def test_8_bit_still_sign_extended(self):
++        self.assertIn("SX8(", _lift("eax", "bl"))
++
++
++if __name__ == "__main__":
++    unittest.main()
