@@ -4,10 +4,12 @@
 # the last one. Each key waits `wait` seconds after it (default 3), e.g.
 #   bash tools/ol_keys.sh $O quick a@8          (A, wait 8 s, shot)
 #   bash tools/ol_keys.sh $O row down down a@6
+#   bash tools/ol_keys.sh $O later wait@30        (no key, a shot 30 s on)
 O=${1:?outdir}; L=${2:?label}; shift 2
 for k in "$@"; do
   w=3; case "$k" in *@*) w=${k#*@}; k=${k%@*};; esac
   case "$k" in *:*) ;; *) k=$k:${HOLD:-500};; esac
-  echo "$k" >> "$O/pad.txt"; sleep "$w"
+  case "$k" in wait:*) ;; *) echo "$k" >> "$O/pad.txt";; esac   # wait@N: only the pause
+  sleep "$w"
 done
 bash /d/n64work/openhalo2/tools/shot.sh "$O" "$L"

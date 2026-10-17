@@ -33,6 +33,8 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <wincrypt.h>
+#else
+#include <unistd.h>
 #endif
 
 #include "openlive.h"
@@ -92,6 +94,9 @@ static void rand_bytes(uint8_t *b, int n)
         CryptReleaseContext(p, 0);
         return;
     }
+#else
+    if (getentropy(b, (size_t)n) == 0)    /* the browser's crypto random */
+        return;
 #endif
     {
         static uint64_t x;
@@ -605,21 +610,58 @@ static int h_storage_path(void)   /* (facility, user lo, user hi, team lo, team 
 typedef struct { uint32_t buf, len; } dl_t;
 static dl_t s_dl[XO_MAX_TASKS];
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+/* The web build fetches the title-storage files from the site, beside the
+ * page (openlive/storage/...), with a synchronous request: this runs on a
+ * worker thread, where those are allowed. Returns the bytes copied, -1 if
+ * the file is not there. */
+EM_JS(int, ol_fetch_sync, (const char *url, uint8_t *out, int cap), {
+    try {
+        const x = new XMLHttpRequest();
+        x.open('GET', UTF8ToString(url), false);
+        x.responseType = 'arraybuffer';
+        x.send();
+        if (x.status !== 200 || !x.response) return -1;
+        const b = new Uint8Array(x.response);
+        const n = Math.min(b.length, cap);
+        HEAPU8.set(b.subarray(0, n), out);
+        return n;
+    } catch (e) { return -1; }
+});
+#endif
+
+/* the file behind a server path: from openlive/storage/ (the web build: the site) */
+static long storage_read(const char *local, uint8_t *out, size_t cap)
+{
+    FILE *f = fopen(local, "rb");
+    size_t n;
+    if (f) {
+        n = fread(out, 1, cap, f);
+        fclose(f);
+        return (long)n;
+    }
+#ifdef __EMSCRIPTEN__
+    return ol_fetch_sync(local, out, (int)cap);
+#else
+    return -1;
+#endif
+}
+
 static int h_storage_download_mem(void)   /* (facility, pad, server path, buf, size, a, b, &task) */
 {
     static uint8_t tmp[1 << 20];
     char server[600], local[700];
     uint32_t buf = xo_arg(3), cap = xo_arg(4), h;
-    FILE *f;
+    long got;
     size_t n;
     guest_wstr(xo_arg(2), server, sizeof server);
-    if (!storage_local(server, local, sizeof local) || (f = fopen(local, "rb")) == NULL) {
+    if (!storage_local(server, local, sizeof local) || (got = storage_read(local, tmp, sizeof tmp)) < 0) {
         fprintf(stderr, "  [XO] storage: %s not served\n", server);
         xo_return(HR_STORAGE_FAIL, 8);
         return 1;
     }
-    n = fread(tmp, 1, sizeof tmp, f);
-    fclose(f);
+    n = (size_t)got;
     if (n > cap) n = cap;
     memcpy(xo_ptr(buf), tmp, n);
     h = task_new(T_GENERIC, 0x3AB6EA, 2, HR_TASK_RUNNING, HR_TASK_SUCCESS);

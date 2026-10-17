@@ -15,6 +15,11 @@
 //                          included (net/h2net.js; the skatemods relay only
 //                          introduces the peers). RTCPeerConnection exists only
 //                          on the page, so the worker hands frames across.
+//   ?link=openlive         Open Live (with ?env=RECOMP_OPEN_LIVE=1~...): no room
+//                          at first; the program joins and leaves session rooms
+//                          as the title hosts and joins games (net/h2net_web.c
+//                          calls window.h2rooms), one h2net.js mesh per room,
+//                          all of them one segment.
 // Without ?link the game has a cable with nothing on the other end.
 // The game tells stations apart by Ethernet address only (its packets all
 // carry the address 0.0.0.1), so a hub that floods is all it needs.
@@ -57,7 +62,7 @@
       size = head[4]; mask = size - 1;
       tx = new Uint8Array(m.sab, m.ptr + 32, size);
       rx = new Uint8Array(m.sab, m.ptr + 32 + size, size);
-      if (m.link.startsWith('room:')) {
+      if (m.link.startsWith('room:') || m.link === 'openlive') {
         send = (f) => postMessage({ tx: f.buffer }, [f.buffer]);
       } else if (m.link.startsWith('ws')) {
         let ws = null;
@@ -90,7 +95,38 @@
     started = true;
     const w = new Worker(URL.createObjectURL(new Blob([WORKER], { type: 'text/javascript' })));
     let mesh = null;
-    if (link.startsWith('room:')) {
+    if (link === 'openlive') {
+      // one mesh per room; a frame from the game goes to every room (each
+      // mesh sends unicast to the peer that MAC was last seen behind)
+      import('./h2net.js').then(({ H2Net }) => {
+        const rooms = new Map();
+        const toGame = (f) => { const c = f.slice(); w.postMessage({ rx: c.buffer }, [c.buffer]); };
+        mesh = { send: (f) => { for (const r of rooms.values()) r.send(f); } };
+        window.h2rooms = {
+          join(code) {
+            if (rooms.has(code)) return;
+            const r = new H2Net();
+            r.onframe = toGame;
+            try { r.open(code); rooms.set(code, r); console.log('openlive: room ' + code + ' joined'); }
+            catch (err) { console.log('openlive: room ' + code + ': ' + err); }
+          },
+          leave(code) {
+            const r = rooms.get(code);
+            if (r) { r.close(); rooms.delete(code); console.log('openlive: room ' + code + ' left'); }
+          },
+          full(code) { const r = rooms.get(code); return !!(r && r.err === 'room full'); },
+          peers(code) {
+            let n = 0;
+            for (const [k, r] of rooms) if (!code || k === code) n += r.peers();
+            return n;
+          },
+          status() { return [...rooms].map(([k, r]) => k + ': ' + r.status()).join(' | '); },
+        };
+        for (const [op, code] of (window.h2roomq || [])) window.h2rooms[op](code);
+        window.h2roomq = [];
+        console.log('link: Open Live, rooms joined per session');
+      }).catch((err) => console.log('link: h2net.js failed: ' + err));
+    } else if (link.startsWith('room:')) {
       import('./h2net.js').then(({ H2Net }) => {
         mesh = new H2Net();
         mesh.onframe = (f) => { const c = f.slice(); w.postMessage({ rx: c.buffer }, [c.buffer]); };

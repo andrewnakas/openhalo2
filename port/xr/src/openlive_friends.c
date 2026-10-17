@@ -41,6 +41,8 @@
 #include "olive.h"
 #endif
 
+static int ret(uint32_t v, int nargs);    /* xo_return, then "answered" */
+
 #define TITLE_ID        0x4D530064u
 #define MAX_FRIENDS     100
 #define FRIEND_SIZE     0x56u
@@ -107,9 +109,17 @@ static void lock(void)   { AcquireSRWLockExclusive(&s_lk); }
 static void unlock(void) { ReleaseSRWLockExclusive(&s_lk); }
 static uint64_t now_ms(void) { return GetTickCount64(); }
 #else
-static void lock(void) {}
-static void unlock(void) {}
-static uint64_t now_ms(void) { return 0; }
+#include <pthread.h>
+#include <time.h>
+static pthread_mutex_t s_lk = PTHREAD_MUTEX_INITIALIZER;
+static void lock(void)   { pthread_mutex_lock(&s_lk); }
+static void unlock(void) { pthread_mutex_unlock(&s_lk); }
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 #endif
 
 /* ---- names ----------------------------------------------------------------------- */
@@ -259,7 +269,9 @@ static uint64_t filetime_now(void)
     GetSystemTimeAsFileTime(&t);
     return (uint64_t)t.dwHighDateTime << 32 | t.dwLowDateTime;
 #else
-    return 0;
+    struct timespec ts;     /* 100 ns units since 1601 */
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ((uint64_t)ts.tv_sec + 11644473600ull) * 10000000u + (uint64_t)ts.tv_nsec / 100u;
 #endif
 }
 

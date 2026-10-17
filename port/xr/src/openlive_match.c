@@ -108,8 +108,11 @@ static SRWLOCK s_lk = SRWLOCK_INIT;
 static void lock(void)   { AcquireSRWLockExclusive(&s_lk); }
 static void unlock(void) { ReleaseSRWLockExclusive(&s_lk); }
 #else
-static void lock(void) {}
-static void unlock(void) {}
+#include <pthread.h>
+#include <time.h>
+static pthread_mutex_t s_lk = PTHREAD_MUTEX_INITIALIZER;
+static void lock(void)   { pthread_mutex_lock(&s_lk); }
+static void unlock(void) { pthread_mutex_unlock(&s_lk); }
 #endif
 
 /* ---- helpers ------------------------------------------------------------------ */
@@ -828,11 +831,15 @@ static void mesh_untrack(const uint8_t *kid)
 #ifdef OPENHALO2_NET
 static void go_outside(mesh_t *m)
 {
-    char room[32];
+    char room[32], ext[32];
+    ext_name(ext, sizeof ext, m->kid);
+    if (h2net_join_ext(ext, ext_send, (void *)(intptr_t)(m - s_mesh)) < 0) {
+        m->outside = -1;        /* no external rooms here (the web build): stay */
+        return;
+    }
     mesh_name(room, sizeof room, m->kid);
     if (h2net_find(room) >= 0) h2net_leave(room);
-    ext_name(room, sizeof room, m->kid);
-    h2net_join_ext(room, ext_send, (void *)(intptr_t)(m - s_mesh));
+    memcpy(room, ext, sizeof room);
     m->outside = 1;
     m->sent_m = 0;          /* tell the host again, flagged */
     m->next_r = 0;
@@ -856,7 +863,7 @@ static void roster_take(mesh_t *m, const uint8_t *r, int n)
         if (x == xo_self_xuid()) continue;
         /* one side offers: an outside station to everyone in the room; of
          * two outside stations, the lower id. Room members only answer. */
-        if (!m->outside) continue;
+        if (m->outside <= 0) continue;
         if (outside && x < xo_self_xuid()) continue;
         if (h2net_find(room) < 0) h2net_join_ext(room, ext_send, (void *)(intptr_t)(m - s_mesh));
         id = xid_of(x);
@@ -882,7 +889,7 @@ static void overflow_pump(void)
             fprintf(stderr, "  [XO] mesh: session key %s is hosted by %016llx\n", k, (unsigned long long)m->host);
         }
         mesh_name(room, sizeof room, m->kid);
-        if (!m->outside && m->host && m->host != xo_self_xuid()
+        if (m->outside == 0 && m->host && m->host != xo_self_xuid()
             && (s_force_overflow > 0 || h2net_room_full(room)))
             go_outside(m);
         if (!m->host || m->host == xo_self_xuid()) continue;
@@ -890,7 +897,7 @@ static void overflow_pump(void)
             uint8_t msg[40];
             int n = head(msg, 'M');
             memcpy(msg + n, m->kid, 8); n += 8;
-            msg[n++] = (uint8_t)m->outside;
+            msg[n++] = (uint8_t)(m->outside > 0);
             inbox_of(room, sizeof room, m->host);
             m->visit_m = olive_visit(room, msg, n, OLIVE_ONE, 4000);
         } else if (m->visit_m > 0 && olive_visit_poll(m->visit_m, &cnt)) {

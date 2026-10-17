@@ -46,6 +46,13 @@ var Module = {
       g = Module.nv2aView = c.getContext('bitmaprenderer');
       say('page: first WebGL frame ' + bmp.width + 'x' + bmp.height);
     }
+    // a test rig's picture (tools/ol_wdrive.py): a canvas fed ImageBitmaps reads back empty
+    if (Module.snapWanted) {
+      Module.snapWanted = false;
+      const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height;
+      c.getContext('2d').drawImage(bmp, 0, 0);
+      Module.snapURL = c.toDataURL('image/png');
+    }
     g.transferFromImageBitmap(bmp);
     Module.h2frames = (Module.h2frames || 0) + 1;
   },

@@ -48,8 +48,11 @@ static SRWLOCK s_lk = SRWLOCK_INIT;
 static void lock(void)   { AcquireSRWLockExclusive(&s_lk); }
 static void unlock(void) { ReleaseSRWLockExclusive(&s_lk); }
 #else
-static void lock(void) {}
-static void unlock(void) {}
+#include <pthread.h>
+#include <time.h>
+static pthread_mutex_t s_lk = PTHREAD_MUTEX_INITIALIZER;
+static void lock(void)   { pthread_mutex_lock(&s_lk); }
+static void unlock(void) { pthread_mutex_unlock(&s_lk); }
 #endif
 
 #include "openlive.h"
@@ -394,7 +397,11 @@ static int h_create(void)    /* (pad, &properties, &member properties, 100, even
 #if defined(_WIN32)
     r = (uint64_t)GetTickCount64() * 0x9E3779B97F4A7C15ull ^ xo_self_xuid();
 #else
-    r = xo_self_xuid() * 0x9E3779B97F4A7C15ull;
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        r = ((uint64_t)ts.tv_nsec + (uint64_t)ts.tv_sec * 1000000007ull) * 0x9E3779B97F4A7C15ull ^ xo_self_xuid();
+    }
 #endif
     s_clan.id = TEAM_FLAG | (r & 0x0000FFFFFFFFFFFFull);
     s_clan.founder = xo_self_xuid();

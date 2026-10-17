@@ -2,7 +2,11 @@
  * libdatachannel's WebSocket client (the same library h2net uses). */
 #include "olive.h"
 
+#ifdef __EMSCRIPTEN__
+#include "olive_ws_web.h"     /* the browser's WebSockets */
+#else
 #include <rtc/rtc.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>

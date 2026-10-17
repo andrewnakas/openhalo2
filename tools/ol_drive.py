@@ -56,9 +56,36 @@ def refs():
     return _refs
 
 
+# A browser copy: a folder that halo2-cleanroom/ports/wasm/cdp_pair.py drives
+# (cmd.txt; tab a), instead of a native copy's pad.txt.
+WEBKEYS = {'a': 'Space', 'b': 'Backspace', 'x': 'KeyE', 'y': 'Tab', 'start': 'Enter',
+           'up': 'ArrowUp', 'down': 'ArrowDown', 'left': 'ArrowLeft', 'right': 'ArrowRight'}
+
+
+def is_web(d):
+    w = winpath(d)
+    return os.path.exists(os.path.join(w, 'cmd.txt')) and not os.path.exists(os.path.join(w, 'pad.txt'))
+
+
 def shot(d, label='drv'):
+    w = winpath(d)
+    if is_web(d):
+        p = os.path.join(w, label + '_a.png')
+        if os.path.exists(p):
+            os.remove(p)
+        with open(os.path.join(w, 'cmd.txt'), 'a') as f:
+            f.write('shot %s\n' % label)
+        for _ in range(40):
+            time.sleep(0.25)
+            if os.path.exists(p):
+                time.sleep(0.3)
+                try:
+                    return Image.open(p).convert('RGB').resize((640, 480))
+                except OSError:
+                    pass
+        return None
     subprocess.run(['bash', TOOLS + '/shot.sh', bashpath(d), label], capture_output=True)
-    p = os.path.join(winpath(d), label + '.png')
+    p = os.path.join(w, label + '.png')
     return Image.open(p) if os.path.exists(p) else None
 
 
@@ -94,8 +121,13 @@ def press(d, *keys, wait=3.0):
     for k in keys:
         if ':' not in k:
             k += ':400'
-        with open(os.path.join(winpath(d), 'pad.txt'), 'a') as f:
-            f.write(k + '\n')
+        if is_web(d):
+            name, ms = k.split(':')
+            with open(os.path.join(winpath(d), 'cmd.txt'), 'a') as f:
+                f.write('a key %s %s\n' % (WEBKEYS.get(name, name), ms))
+        else:
+            with open(os.path.join(winpath(d), 'pad.txt'), 'a') as f:
+                f.write(k + '\n')
         time.sleep(wait)
 
 

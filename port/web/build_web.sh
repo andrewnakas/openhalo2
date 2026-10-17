@@ -19,7 +19,13 @@ if [ "$COMPACT" = 1 ]; then CDEF="-DXBOX_WEB_COMPACT=1 -fwrapv-pointer"; MEM=228
 # default: the fast link (-O2, no assertions, function names kept for profiles).
 LOPT=${LOPT:--O2}; if [ "$LOPT" = "-O1" ]; then LD=lift; else LD=lift_${LOPT#-}; fi; mkdir -p $OUT/$LD
 if [ "$DEV" = 1 ]; then LINK="-O1 -g -sASSERTIONS=1"; else LINK="${LINKOPT:--O2} --profiling-funcs -sASSERTIONS=0 -sGL_ASSERTIONS=0"; fi
-CF="$CDEF -pthread -msse2 -mssse3 -msimd128 -fdeclspec -sUSE_SDL=2 -I$G -I$G/recomp -I$G/recomp/gen -I$X/include -I$X/src -I$X/src/kernel -I$X/src/platform -Wno-everything -ferror-limit=5"
+# Open Live (docs/OPEN_LIVE_DESIGN.md): the lifted XOnline entry points call the
+# hooks (h2lift/xo_hle_pass.py) and port/xr/src/openlive*.c answer them when the
+# page sets RECOMP_OPEN_LIVE=1 (otherwise the title's own library runs, as
+# before). After changing these defines, delete the lifted objects that hold
+# hooks (grep -l xo_hook port/xr/src/recomp/gen/*.c).
+N=/d/n64work/openhalo2/net
+CF="-DOPENHALO2_OPEN_LIVE=1 -DOPENHALO2_NET=1 -I$N $CDEF -pthread -msse2 -mssse3 -msimd128 -fdeclspec -sUSE_SDL=2 -I$G -I$G/recomp -I$G/recomp/gen -I$X/include -I$X/src -I$X/src/kernel -I$X/src/platform -Wno-everything -ferror-limit=5"
 cc() { src=$1; obj=$2
   [ -e "$obj" ] && [ "$obj" -nt "$src" ] && return 0
   # the runtime: line numbers (tools/websym.sh) and full optimisation (the pixel
@@ -28,7 +34,7 @@ cc() { src=$1; obj=$2
   # the clean-room APU defines the contract symbols itself (as MA_CONTRACT natively)
   case "$obj" in */rt/ma_*) dbg="$dbg -DMA_CONTRACT=1 -I$G/mcpxaudio";; esac
   emcc -c $CF $dbg "$src" -o "$obj" > "${obj%.o}.log" 2>&1 && rm -f "${obj%.o}.log" || echo "FAIL $src"; }
-export -f cc; export CF LOPT G
+export -f cc; export CF LOPT G N
 if [ "$1" != "link-only" ]; then
   { for f in $G/recomp/gen/*.c $G/recomp_manual.c $G/mmio_direct.c $G/nvnet.c; do echo "$f $OUT/$LD/$(basename ${f%.c}).o"; done
     # The toolkit, as the native build links it (port/xr/CMakeLists.txt): not d3d
@@ -40,6 +46,8 @@ if [ "$1" != "link-only" ]; then
       b=$(echo ${f#$X/src/} | tr '/' '_'); echo "$f $OUT/rt/${b%.c}.o"; done
     for f in $G/mcpxaudio/*.c $G/apu_select.c; do echo "$f $OUT/rt/ma_$(basename ${f%.c}).o"; done
     echo "$W/main_web.c $OUT/rt/main_web.o"; echo "$W/compat_web.c $OUT/rt/compat_web.o"; echo "$W/present_web.c $OUT/rt/present_web.o"
+    for f in $G/openlive.c $G/openlive_api.c $G/openlive_match.c $G/openlive_friends.c $G/openlive_clans.c $N/olive.c $N/h2net_web.c; do
+      echo "$f $OUT/rt/ol_$(basename ${f%.c}).o"; done
   } | xargs -P 3 -L 1 bash -c 'cc $0 $1'
 fi
 # Memory: 4 GB, guest address + 4 KB = linear address (no wrap anywhere). Guest
@@ -49,7 +57,7 @@ fi
 emcc $LINK -pthread -sUSE_SDL=2 -sPROXY_TO_PTHREAD -sALLOW_MEMORY_GROWTH=0 \
      -sGLOBAL_BASE=134217728 -sINITIAL_MEMORY=$MEM -sMAXIMUM_MEMORY=$MEM -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=4194304 \
      -sPTHREAD_POOL_SIZE=24 -sERROR_ON_UNDEFINED_SYMBOLS=1 -sEXIT_RUNTIME=0 -sWASMFS -sFORCE_FILESYSTEM=1 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
-     -sEXPORTED_RUNTIME_METHODS=ENV \
+     -sEXPORTED_RUNTIME_METHODS=ENV -lwebsocket.js \
      $LD/*.o rt/*.o -o site/halo2.js > link.log 2>&1
 echo "LINK_EXIT=$? undefined=$(grep -c 'undefined symbol' link.log) duplicate=$(grep -c 'duplicate symbol' link.log)"
 grep -o 'undefined symbol: [A-Za-z0-9_@]*' link.log | sort | uniq -c | sort -rn | head -60
