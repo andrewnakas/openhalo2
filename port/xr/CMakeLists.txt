@@ -62,6 +62,7 @@ set(GAME_SOURCES
     src/openlive_api.c
     src/openlive_match.c
     src/openlive_friends.c
+    src/openlive_clans.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/import/h2import.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c

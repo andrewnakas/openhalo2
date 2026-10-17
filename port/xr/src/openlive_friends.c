@@ -97,7 +97,7 @@ static int s_lookup_done, s_lookup_ok;
  * Received invites are kept here until answered. */
 #define MAX_MSG 16
 typedef struct { int used; uint32_t id; uint64_t xuid; char tag[16]; uint8_t type; uint8_t kid[8];
-                 uint64_t ft; int read; } msg_t;
+                 uint64_t ft; int read; uint64_t ctx; } msg_t;
 static msg_t s_msg[MAX_MSG];
 static uint32_t s_msg_next = 1;
 
@@ -294,6 +294,24 @@ static msg_t *msg_by_id(uint32_t id)
     return NULL;
 }
 
+/* a message from elsewhere (a clan recruit: the recruiter, the clan as its context) */
+void xo_friends_message(uint64_t from, const char *name, uint8_t type, uint64_t ctx)
+{
+    int i;
+    lock();
+    msg_add(from, name, type, NULL);
+    for (i = 0; i < MAX_MSG; i++)
+        if (s_msg[i].used && s_msg[i].xuid == from && s_msg[i].type == type) s_msg[i].ctx = ctx;
+    unlock();
+}
+
+void xo_friends_message_drop(uint64_t from, uint8_t type)
+{
+    lock();
+    msg_drop(from, type);
+    unlock();
+}
+
 /* an inbox visitor (transport thread) */
 static int on_inbox(void *ctx, int from, const uint8_t *m, int len, uint8_t *reply, int cap)
 {
@@ -361,6 +379,9 @@ static int on_inbox(void *ctx, int from, const uint8_t *m, int len, uint8_t *rep
         }
         n = msg_head(reply, 'k');
         break;
+    case 'C': case 'T': case 'U': case 'V':   /* clans (openlive_clans.c) */
+        unlock();
+        return xo_clans_inbox((char)m[0], x, tag, m + 25, len - 25, reply, cap);
     case 'M': case 'R': case 'N':
         unlock();
         return xo_match_inbox((char)m[0], x, m + 25, len - 25, reply, cap);
@@ -851,6 +872,7 @@ static int h_msg_enumerate(void)
         memset(p, 0, 0x40);
         memcpy(p, &m->xuid, 8);
         p[0xC] = m->type;
+        memcpy(p + 0x10, &m->ctx, 8);      /* the message's context (a recruit: the clan) */
         memcpy(p + 0x18, &m->ft, 8);
         memcpy(p + 0x20, &m->id, 4);
         memcpy(p + 0x28, &title, 4);

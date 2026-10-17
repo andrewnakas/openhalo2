@@ -71,6 +71,12 @@ void xo_friends_reap_pump(void);
 void xo_friends_signin(uint64_t xuid, const char *tag);
 void xo_friends_set_state(uint32_t flags, const uint8_t *kid, const uint8_t *data, int len);
 int  xo_friends_inbox_for_kid(const uint8_t *kid, char *room, size_t n);
+void xo_friends_message(uint64_t from, const char *name, uint8_t type, uint64_t ctx);
+void xo_friends_message_drop(uint64_t from, uint8_t type);
+
+/* openlive_clans.c: clans (teams) */
+int  xo_clans_call(uint32_t va);
+int  xo_clans_inbox(char type, uint64_t from, const char *tag, const uint8_t *p, int len, uint8_t *reply, int cap);
 
 /* openlive_api.c */
 void xo_live_init(void);

@@ -803,7 +803,7 @@ int xo_live_call(uint32_t va)
     xo_match_pump();
     xo_friends_pump();
     xo_friends_reap_pump();
-    if (xo_match_call(va) || xo_friends_call(va))
+    if (xo_match_call(va) || xo_clans_call(va) || xo_friends_call(va))
         return 1;
     switch (va) {
     case 0x3A0671: return ret_value(s_logon_users, 0);          /* GetLogonUsers() */
