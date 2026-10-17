@@ -3,6 +3,7 @@
 #ifndef OPENLIVE_H
 #define OPENLIVE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define XO_MODE_TRACE 1
@@ -31,6 +32,7 @@ const char *xo_name(uint32_t va);
 #define XO_MAX_TASKS 128
 typedef uint32_t (*xo_task_poll_fn)(int user);   /* 0 = working, else the final result */
 uint32_t xo_task_new(uint32_t va, int need, uint32_t done);
+uint32_t xo_task_new_results(uint32_t va);      /* runs on, results available */
 uint32_t xo_task_new_polled(uint32_t va, xo_task_poll_fn poll, int user, void (*on_close)(int user));
 int      xo_task_user(uint32_t handle);           /* -1 when not ours */
 
@@ -54,6 +56,18 @@ uint32_t xo_arg_addr(int i);                     /* guest address of the i-th ar
 void xo_qos_entry(uint32_t q, uint32_t i, uint8_t flags, uint16_t rtt, uint32_t up, uint32_t down,
                   uint32_t data, uint16_t size);
 uint32_t xo_qos_alloc(uint32_t n, uint32_t extra);   /* n entries + data bytes */
+
+/* the record of a session we host, as sent to a joiner ('q'); 0 if not ours */
+int  xo_match_record_for_kid(const uint8_t *kid, uint8_t *out, int cap);
+
+/* openlive_friends.c: friends, presence, requests, invites */
+int  xo_friends_call(uint32_t va);
+void xo_friends_pump(void);
+void xo_friends_reap(int visit);
+void xo_friends_reap_pump(void);
+void xo_friends_signin(uint64_t xuid, const char *tag);
+void xo_friends_set_state(uint32_t flags, const uint8_t *kid, const uint8_t *data, int len);
+int  xo_friends_inbox_for_kid(const uint8_t *kid, char *room, size_t n);
 
 /* openlive_api.c */
 void xo_live_init(void);

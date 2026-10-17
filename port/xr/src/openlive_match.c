@@ -557,6 +557,57 @@ static int h_search_results(void)   /* (task, &results, &count) */
     return 1;
 }
 
+/* Joining a friend's or an inviter's session by its id (0x900E0; the title
+ * then reads it with XOnlineMatchSearchGetResults): ask the friend whose
+ * presence or invite carries that id, at their inbox ('S'). */
+static int h_find_from_id(void)   /* (kid lo, kid hi, event, &task) */
+{
+    uint8_t kid[8];
+    uint32_t lo = xo_arg(0), hi = xo_arg(1), hdl;
+    char room[32], kh[20];
+    int i, idx = -1;
+    search_t *s;
+    memcpy(kid, &lo, 4); memcpy(kid + 4, &hi, 4);
+    for (i = 0; i < MAX_SEARCH && idx < 0; i++)
+        if (!s_search[i].used) idx = i;
+    if (idx < 0) { xo_return(XO_HR_FAIL, 4); return 1; }
+    s = &s_search[idx];
+    memset(s, 0, sizeof *s);
+    s->used = 1;
+    s->max = 1;
+    hexkid(kh, kid);
+#ifdef OPENHALO2_NET
+    if (s_net && xo_friends_inbox_for_kid(kid, room, sizeof room)) {
+        uint8_t m[40];
+        memset(m, 0, sizeof m);
+        m[0] = 'S';
+        memcpy(m + 25, kid, 8);
+        s->visit[0] = olive_visit(room, m, 33, OLIVE_ONE, 4000);
+        if (s->visit[0] > 0) s->nvisit = 1;
+        fprintf(stderr, "  [XO] finding session %s: asking %s\n", kh, room);
+    } else {
+        fprintf(stderr, "  [XO] finding session %s: no friend is in it\n", kh);
+    }
+#else
+    (void)room;
+#endif
+    hdl = xo_task_new_polled(0x3A0710, poll_search, idx, close_search);
+    if (xo_arg(3)) xo_wr32(xo_arg(3), hdl);
+    xo_return(XO_HR_OK, 4);
+    return 1;
+}
+
+int xo_match_record_for_kid(const uint8_t *kid, uint8_t *out, int cap)
+{
+    hosted_t *h;
+    int n = 0;
+    lock();
+    h = hosted_by_kid(kid);
+    if (h) n = record_build(h, out, cap);
+    unlock();
+    return n;
+}
+
 static int h_search_parse(void)   /* (result, n, specs, values out) */
 {
     uint32_t r = xo_arg(0), n = xo_arg(1), out = xo_arg(3);
@@ -612,6 +663,7 @@ int xo_match_call(uint32_t va)
     case 0x3A0753: return h_search_len();
     case 0x3A073D: return h_search_results();
     case 0x3A0748: return h_search_parse();
+    case 0x3A0710: return h_find_from_id();
     case 0x3CD156: return h_qos_lookup();
     default: return 0;
     }

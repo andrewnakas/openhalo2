@@ -279,6 +279,13 @@ uint32_t xo_task_new(uint32_t va, int need, uint32_t done)
     return task_new(T_GENERIC, va, need, HR_TASK_RUNNING, done);
 }
 
+/* a task that keeps running with results available (friends, presence:
+ * the title reads them while the task is "running", 0x6C450 / 0x6B5D0) */
+uint32_t xo_task_new_results(uint32_t va)
+{
+    return task_new(T_GENERIC, va, 0x7FFFFFFF, HR_TASK_RESULTS, HR_TASK_SUCCESS);
+}
+
 uint32_t xo_task_new_polled(uint32_t va, xo_task_poll_fn poll, int user, void (*on_close)(int user))
 {
     uint32_t h = task_new(T_POLLED, va, 0, HR_TASK_RUNNING, 0);
@@ -354,9 +361,28 @@ static void logon_users_set(uint32_t users)
             memset(dst + USER_HR, 0, 4);     /* signed in */
         else
             memset(dst, 0, USER_SIZE);
-        if (memcmp(dst, "\0\0\0\0\0\0\0\0", 8))
-            fprintf(stderr, "  [XO] pad %d signed in as \"%.15s\"\n", i, (const char *)dst + USER_GAMERTAG);
+        if (memcmp(dst, "\0\0\0\0\0\0\0\0", 8)) {
+            uint64_t x;
+            char tag[16];
+            memcpy(&x, dst + USER_XUID, 8);
+            memcpy(tag, dst + USER_GAMERTAG, 15);
+            tag[15] = 0;
+            fprintf(stderr, "  [XO] pad %d signed in as \"%s\"\n", i, tag);
+            xo_friends_signin(x, tag);   /* the first signed-in player is the one friends see */
+        }
     }
+}
+
+static int h_set_state(void)              /* (pad, flags, kid lo, kid hi, size, data) */
+{
+    uint8_t kid[8], data[32];
+    uint32_t lo = xo_arg(2), hi = xo_arg(3), n = xo_arg(4);
+    memcpy(kid, &lo, 4); memcpy(kid + 4, &hi, 4);
+    if (n > 32) n = 32;
+    if (n && xo_arg(5)) memcpy(data, xo_ptr(xo_arg(5)), n);
+    xo_friends_set_state(xo_arg(1), kid, data, (int)n);
+    xo_return(HR_OK, 6);
+    return 1;
 }
 
 static int h_logon(void)                  /* (users[4], services, count, event, &task) */
@@ -775,12 +801,14 @@ int xo_live_call(uint32_t va)
 {
     size_t i;
     xo_match_pump();
-    if (xo_match_call(va))
+    xo_friends_pump();
+    xo_friends_reap_pump();
+    if (xo_match_call(va) || xo_friends_call(va))
         return 1;
     switch (va) {
     case 0x3A0671: return ret_value(s_logon_users, 0);          /* GetLogonUsers() */
     case 0x3A0687: return ret_value(HR_OK, 1);                  /* SaveLogonState(p) */
-    case 0x3A0774: return ret_value(HR_OK, 6);                  /* NotificationSetState */
+    case 0x3A0774: return h_set_state();                        /* NotificationSetState */
     case 0x3A0798: return ret_value(0, 3);                      /* GetNotificationEx: none */
     default: break;
     }
