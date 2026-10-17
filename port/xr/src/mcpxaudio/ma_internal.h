@@ -187,6 +187,9 @@ struct ma_state {
     /* stats */
     uint64_t  st_blocks, st_irqs, st_traps, st_notifies, st_clipped;
     double    bin_energy[MA_BINS];
+    FILE     *bindump;
+    float     dump_acc[MA_BINS];
+    int       dump_frames;
     uint32_t  bin_energy_n;
     int       report_bins, report_voices;
     uint32_t  irq_pending;      /* status bits to raise from the thread    */
@@ -202,7 +205,9 @@ struct ma_state {
     int       sat;              /* RECOMP_MA_SAT: mixbins are 24-bit: 0 float, 1 saturate after
                                  * every voice, 2 saturate once per frame */
     float     hrtf_trim;        /* RECOMP_MA_HRTF_TRIM, default 0.857 */
-    int       hrtf_rev;         /* RECOMP_MA_HRTF_REV: taps in reverse order (diagnostics) */
+    int       hrtf_rev;
+    int       hrtf_dry;         /* RECOMP_MA_HRTF_DRY: what an HRTF voice sends to slots 4-7
+                                 * (default 4: the filtered left/right by slot parity) */
     int       mp_mode;          /* RECOMP_MA_MP_MODE: 0 in list order, a read empties the bin;
                                  * 1 all other voices first, reads keep the bin; 2 list order, keep */
     int       hrtf_itd;         /* RECOMP_MA_HRTF_ITD: 1 left on +, -1 right on +, 0 off */

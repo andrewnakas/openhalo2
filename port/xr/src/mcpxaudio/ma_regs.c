@@ -228,6 +228,7 @@ ma_state *ma_create_cfg(int mode, const char *cfg, int index)
     s->hrtf_itd = env_int("RECOMP_MA_HRTF_ITD", 1);
     s->mp_mode = env_int("RECOMP_MA_MP_MODE", 0);
     s->hrtf_rev = env_int("RECOMP_MA_HRTF_REV", 0);
+    s->hrtf_dry = env_int("RECOMP_MA_HRTF_DRY", 4);
     e = ma_getenv(s, "RECOMP_MA_HRTF_TRIM");
     s->hrtf_trim = (e && *e) ? (float)atof(e) : 0.875f;
     s->sat = env_int("RECOMP_MA_SAT", 0);

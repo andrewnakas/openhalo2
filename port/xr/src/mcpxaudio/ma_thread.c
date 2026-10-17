@@ -433,7 +433,8 @@ static DWORD WINAPI frame_thread(LPVOID arg)
                 ma_process_frame(s);
                 ma_mix_frame(s, lr + 2 * MA_FRAME * fi);
             } else {
-                memset(lr + 2 * MA_FRAME * fi, 0, sizeof(float) * 2 * MA_FRAME);
+                memset(s->bin, 0, sizeof s->bin);
+                ma_mix_frame(s, lr + 2 * MA_FRAME * fi);
                 s->st_pause_frames++;
             }
             ma_unlock(s);

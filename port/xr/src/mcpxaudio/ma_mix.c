@@ -47,6 +47,9 @@ void ma_mix_init(ma_state *s)
         if (e) e++;
     }
     s->gain = (float)pow(10.0, env_float("RECOMP_APU_GAIN_DB", 0.0f) / 20.0);
+    e = ma_getenv(s, "RECOMP_MA_BINDUMP");
+    if (e && *e)
+        s->bindump = fopen(e, "wb");
     e = ma_getenv(s, "RECOMP_APU_LIMIT");
     s->limit_mode = !e ? 1 : !strcmp(e, "0") ? 0 : !strcmp(e, "tanh") ? 2 : 1;
     s->lim.gain = 1.0f;
@@ -64,11 +67,12 @@ void ma_mix_frame(ma_state *s, float *lr)
     for (b = 0; b < MA_BINS; b++) {
         float gl = s->fold[b][0], gr = s->fold[b][1];
         const float *x = s->bin[b];
-        if (s->report_bins) {
+        if (s->report_bins || s->bindump) {
             double e = 0;
             for (n = 0; n < MA_FRAME; n++)
                 e += (double)x[n] * x[n];
             s->bin_energy[b] += e;
+            s->dump_acc[b] += (float)e;
         }
         if (gl == 0.0f && gr == 0.0f)
             continue;
@@ -80,6 +84,13 @@ void ma_mix_frame(ma_state *s, float *lr)
     if (s->rv)
         ma_reverb_process(s->rv, s->bin[10], lr, MA_FRAME);
     s->bin_energy_n += MA_FRAME;
+    /* RECOMP_MA_BINDUMP=<file>: per 256-sample block, 32 floats = each bin's
+     * sum of squares (1.0 = 16-bit full scale), for tools/apu2/binab2.py */
+    if (s->bindump && ++s->dump_frames == MA_BLOCK / MA_FRAME) {
+        fwrite(s->dump_acc, sizeof(float), MA_BINS, s->bindump);
+        memset(s->dump_acc, 0, sizeof s->dump_acc);
+        s->dump_frames = 0;
+    }
 }
 
 /* ---- WAV tap ---------------------------------------------------------------- */

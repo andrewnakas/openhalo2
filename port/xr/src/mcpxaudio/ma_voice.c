@@ -597,7 +597,7 @@ void ma_render_voice(ma_state *s, int v, int list)
                 continue;
             dst = s->bin[sel[i]];
             for (n = 0; n < MA_FRAME; n++) {
-                float y = gg * (i < 2 ? out[0][n] : i < 4 ? out[1][n] : src[n][0]);
+                float y = gg * (i < 2 ? out[0][n] : i < 4 ? out[1][n] : s->hrtf_dry == 1 ? out[0][n] : s->hrtf_dry == 4 ? out[i & 1][n] : s->hrtf_dry == 2 ? 0.5f * (out[0][n] + out[1][n]) : s->hrtf_dry == 3 ? src[n][0] * s->hrtf_trim : src[n][0]);
                 dst[n] += y;
                 vc->energy += (double)y * y;
             }

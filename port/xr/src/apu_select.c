@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <tlhelp32.h>
+#include <dbghelp.h>
 #include "mcpxaudio/mcpx_audio.h"
 
 #ifndef APU_DEFAULT_IMPL
@@ -39,11 +41,64 @@ static ma_state *s_more[4];     /* extra shadows (RECOMP_MA_SHADOWS, RECOMP_MA_C
 ma_state *ma_create_cfg(int mode, const char *cfg, int index);
 volatile int recomp_apu_on;
 
+/* RECOMP_APU_CPU=1: every 10 s, the CPU time of each thread whose start
+ * routine is in an APU model (the previous model's or ours), by symbol, so
+ * the two can be compared ([APUCPU] lines). */
+typedef LONG (WINAPI *nqit_fn)(HANDLE, int, PVOID, ULONG, PULONG);
+static DWORD WINAPI cpu_reporter(LPVOID arg)
+{
+    nqit_fn nqit = (nqit_fn)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    (void)arg;
+    for (;;) {
+        HANDLE snap;
+        THREADENTRY32 te;
+        Sleep(10000);
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE)
+            continue;
+        te.dwSize = sizeof te;
+        if (Thread32First(snap, &te)) do {
+            HANDLE h;
+            PVOID start = NULL;
+            FILETIME c, e, k, u;
+            char buf[sizeof(SYMBOL_INFO) + 128];
+            SYMBOL_INFO *si = (SYMBOL_INFO *)buf;
+            DWORD64 disp = 0;
+            if (te.th32OwnerProcessID != GetCurrentProcessId())
+                continue;
+            h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (!h)
+                continue;
+            if (nqit)
+                nqit(h, 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof start, NULL);
+            memset(buf, 0, sizeof buf);
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 127;
+            if (start && GetThreadTimes(h, &c, &e, &k, &u)) {
+                double secs = ((double)(((ULONGLONG)u.dwHighDateTime << 32) | u.dwLowDateTime)
+                             + (double)(((ULONGLONG)k.dwHighDateTime << 32) | k.dwLowDateTime)) / 1e7;
+                uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+                int named = SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)start, &disp, si);
+                if (secs >= 0.5 || getenv("RECOMP_APU_CPU")[0] == '2')
+                    fprintf(stderr, "[APUCPU] thread %lu start %s+0x%llX (%s): %.2f s CPU\n", te.th32ThreadID,
+                            (uintptr_t)start > base && (uintptr_t)start < base + 0x10000000 ? "exe" : "other",
+                            (unsigned long long)((uintptr_t)start - base), named ? si->Name : "?", secs);
+            }
+            CloseHandle(h);
+        } while (Thread32Next(snap, &te));
+        CloseHandle(snap);
+    }
+    return 0;
+}
+
 /* Called once, where main.c used to call mcpx_apu_init_standalone. */
 int recomp_apu_start(uint8_t *ram_ptr)
 {
     const char *e = getenv("RECOMP_APU_IMPL");
     const char *impl = (e && *e) ? e : APU_DEFAULT_IMPL;
+
+    if (getenv("RECOMP_APU_CPU"))
+        CreateThread(NULL, 0, cpu_reporter, NULL, 0, NULL);
 
 #ifdef OPENHALO2_OLD_APU
     if (!strcmp(impl, "old") || !strcmp(impl, "shadow")) {
