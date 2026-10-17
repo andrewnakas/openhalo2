@@ -809,7 +809,6 @@ int xo_live_call(uint32_t va)
     case 0x3A0671: return ret_value(s_logon_users, 0);          /* GetLogonUsers() */
     case 0x3A0687: return ret_value(HR_OK, 1);                  /* SaveLogonState(p) */
     case 0x3A0774: return h_set_state();                        /* NotificationSetState */
-    case 0x3A0798: return ret_value(0, 3);                      /* GetNotificationEx: none */
     default: break;
     }
     for (i = 0; i < sizeof k_handlers / sizeof k_handlers[0]; i++)

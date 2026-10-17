@@ -1530,7 +1530,7 @@ index 83e652d..a413366 100644
 +
  #endif /* APU_XAUDIO2_H */
 diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
-index a91edbe..0c134ec 100644
+index a91edbe..1ab4774 100644
 --- a/src/input/xinput_device.c
 +++ b/src/input/xinput_device.c
 @@ -13,6 +13,7 @@
@@ -1766,11 +1766,23 @@ index a91edbe..0c134ec 100644
  
      /* The title's input layer looks for button edges, so the packet number
       * has to move whenever the state does or a press is never noticed. */
-@@ -141,7 +218,19 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+@@ -141,7 +218,31 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
      if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
          return ERROR_DEVICE_NOT_CONNECTED;
  
 -    result = XInputGetState(dwPort, &xi_state);
++    /* RECOMP_NO_HOST_PAD=1: ignore the host's pads (headless test rigs that
++     * drive the title by script, while someone uses a controller elsewhere) */
++    {
++        static int no_host = -1;
++        if (no_host < 0) {
++            const char *e = getenv("RECOMP_NO_HOST_PAD");
++            no_host = (e && *e && *e != '0') ? 1 : 0;
++        }
++        if (no_host)
++            return ERROR_DEVICE_NOT_CONNECTED;
++    }
++
 +    /* An empty XInput slot is slow to ask (the call enumerates devices), and
 +     * this runs at the pad's report rate: ask an empty slot once a second. */
 +    {
@@ -1787,7 +1799,7 @@ index a91edbe..0c134ec 100644
      if (result != ERROR_SUCCESS) {
          g_controller_connected[dwPort] = FALSE;
          if (dwPort == 0 && keyboard_enabled()) {
-@@ -166,9 +255,11 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+@@ -166,9 +267,11 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
          (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
      pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
          (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
@@ -1801,7 +1813,7 @@ index a91edbe..0c134ec 100644
          (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
      pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
      pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
-@@ -247,6 +338,80 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
+@@ -247,6 +350,80 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
  }
  
  /* ======================================================================== */

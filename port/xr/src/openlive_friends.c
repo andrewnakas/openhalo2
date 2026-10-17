@@ -91,6 +91,16 @@ static int s_lookup_visit;          /* a request by gamertag in flight */
 static char s_lookup_tag[16];
 static int s_lookup_done, s_lookup_ok;
 
+/* Messages (the title's message list, 0x8E750): Halo 2 shows a game invite
+ * as a message of type 3 from the inviter (the Msg column of the friends
+ * list, the message screen 0x2C788A, the notification channel 0x6D080).
+ * Received invites are kept here until answered. */
+#define MAX_MSG 16
+typedef struct { int used; uint32_t id; uint64_t xuid; char tag[16]; uint8_t type; uint8_t kid[8];
+                 uint64_t ft; int read; } msg_t;
+static msg_t s_msg[MAX_MSG];
+static uint32_t s_msg_next = 1;
+
 #if defined(_WIN32)
 static SRWLOCK s_lk = SRWLOCK_INIT;
 static void lock(void)   { AcquireSRWLockExclusive(&s_lk); }
@@ -242,6 +252,48 @@ static void presence_take(friend_t *f, const uint8_t *m, int len)
     f->seen = now_ms();
 }
 
+static uint64_t filetime_now(void)
+{
+#if defined(_WIN32)
+    FILETIME t;
+    GetSystemTimeAsFileTime(&t);
+    return (uint64_t)t.dwHighDateTime << 32 | t.dwLowDateTime;
+#else
+    return 0;
+#endif
+}
+
+/* one message per sender and type: a newer invite replaces the older (locked) */
+static void msg_add(uint64_t xuid, const char *tag, uint8_t type, const uint8_t *kid)
+{
+    msg_t *m = NULL;
+    int i;
+    for (i = 0; i < MAX_MSG && !m; i++) if (s_msg[i].used && s_msg[i].xuid == xuid && s_msg[i].type == type) m = &s_msg[i];
+    for (i = 0; i < MAX_MSG && !m; i++) if (!s_msg[i].used) m = &s_msg[i];
+    if (!m) m = &s_msg[0];
+    memset(m, 0, sizeof *m);
+    m->used = 1;
+    m->id = s_msg_next++;
+    m->xuid = xuid;
+    memcpy(m->tag, tag, 15);
+    m->type = type;
+    if (kid) memcpy(m->kid, kid, 8);
+    m->ft = filetime_now();
+}
+
+static void msg_drop(uint64_t xuid, uint8_t type)
+{
+    int i;
+    for (i = 0; i < MAX_MSG; i++) if (s_msg[i].used && s_msg[i].xuid == xuid && s_msg[i].type == type) s_msg[i].used = 0;
+}
+
+static msg_t *msg_by_id(uint32_t id)
+{
+    int i;
+    for (i = 0; i < MAX_MSG; i++) if (s_msg[i].used && s_msg[i].id == id) return &s_msg[i];
+    return NULL;
+}
+
 /* an inbox visitor (transport thread) */
 static int on_inbox(void *ctx, int from, const uint8_t *m, int len, uint8_t *reply, int cap)
 {
@@ -297,6 +349,7 @@ static int on_inbox(void *ctx, int from, const uint8_t *m, int len, uint8_t *rep
             f->invite_in = 1;
             memcpy(f->invite_kid, m + 25, 8);
             fprintf(stderr, "  [XO] friends: game invite from \"%s\"\n", f->tag);
+            msg_add(f->xuid, f->tag, 3, f->invite_kid);
         }
         n = msg_head(reply, 'k');
         break;
@@ -737,6 +790,7 @@ static void answer_invite(uint64_t x, int yes)
         f->invite_in = yes;          /* accepted: kept until joined (FindFromID uses it) */
         fprintf(stderr, "  [XO] friends: invite from \"%s\" %s\n", f->tag, yes ? "accepted" : "declined");
     }
+    msg_drop(x, 3);
     unlock();
 #ifdef OPENHALO2_NET
     {
@@ -774,6 +828,102 @@ static int h_title_name(void)   /* (title id, language, length, name out) */
     for (i = 0; i + 1 < len && n[i]; i++) { uint16_t c = (uint8_t)n[i]; memcpy(xo_ptr(out + 2 * i), &c, 2); }
     memset(xo_ptr(out + 2 * i), 0, 2);
     return ret(XO_HR_OK, 4);
+}
+
+/* MessageEnumerate(pad, summaries, &count): summaries of 0x40 bytes, as the
+ * title converts them (0x8EBD0): sender id +0 (12), type +0xC, time +0x18
+ * (compared as a FILETIME, 0x2359CE), message id +0x20, flags +0x24, title
+ * id +0x28 (the invite's title, 0x2C788A), sender gamertag +0x30 (16) */
+static int h_msg_enumerate(void)
+{
+    uint32_t out = xo_arg(1), n = 0, title = TITLE_ID;
+    int i;
+    lock();
+    for (i = 0; i < MAX_MSG && n < 125; i++) {
+        msg_t *m = &s_msg[i];
+        uint8_t *p;
+        if (!m->used) continue;
+        p = xo_ptr(out + 0x40 * n);
+        memset(p, 0, 0x40);
+        memcpy(p, &m->xuid, 8);
+        p[0xC] = m->type;
+        memcpy(p + 0x18, &m->ft, 8);
+        memcpy(p + 0x20, &m->id, 4);
+        memcpy(p + 0x28, &title, 4);
+        memcpy(p + 0x30, m->tag, 15);
+        n++;
+    }
+    unlock();
+    if (xo_arg(2)) xo_wr32(xo_arg(2), n);
+    return ret(XO_HR_OK, 3);
+}
+
+static int h_msg_delete(void)        /* (pad, id, block) */
+{
+    msg_t *m;
+    lock();
+    m = msg_by_id(xo_arg(1));
+    if (m) m->used = 0;
+    unlock();
+    return ret(XO_HR_OK, 3);
+}
+
+static uint32_t poll_now(int user) { (void)user; return XO_TASK_SUCCESS; }
+
+static int h_msg_details(void)       /* (pad, id, flags (read), 0, 0, &task) */
+{
+    msg_t *m;
+    uint32_t id = xo_arg(1);
+    lock();
+    m = msg_by_id(id);
+    if (m) m->read = 1;
+    unlock();
+    if (!m) return ret(XO_HR_FAIL, 6);
+    if (xo_arg(5)) xo_wr32(xo_arg(5), xo_task_new_polled(0x3AB2A6, poll_now, (int)id, NULL));
+    return ret(XO_HR_OK, 6);
+}
+
+/* MessageDetailsGetResultsProperty(task, property, size, buffer, &size, 0):
+ * the title asks by the ids of 0x8EDA0; an invite answers the session id
+ * (0x581, 8 bytes, read by the message screen) and has no text, voice or
+ * attachment */
+static int h_msg_property(void)
+{
+    msg_t *m;
+    uint32_t prop = xo_arg(1) & 0xFFFF, size = xo_arg(2), buf = xo_arg(3);
+    int id = xo_task_user(xo_arg(0));
+    uint8_t kid[8];
+    lock();
+    m = id > 0 ? msg_by_id((uint32_t)id) : NULL;
+    if (m) memcpy(kid, m->kid, 8);
+    unlock();
+    if (!m || prop != 0x581) return ret(XO_HR_FAIL, 6);
+    if (size < 8) { if (xo_arg(4)) xo_wr32(xo_arg(4), 8); return ret(0x80155A02u, 6); }
+    memcpy(xo_ptr(buf), kid, 8);
+    if (xo_arg(4)) xo_wr32(xo_arg(4), 8);
+    return ret(XO_HR_OK, 6);
+}
+
+/* GetNotificationEx(pad, &info, &state): TRUE while an unread message
+ * waits; info is packed: type (1 byte), message id (4), notify flags (4)
+ * (0x6D080 reads it) */
+static int h_notification(void)
+{
+    uint32_t info = xo_arg(1), z = 0;
+    msg_t *best = NULL;
+    int i;
+    lock();
+    for (i = 0; i < MAX_MSG; i++)
+        if (s_msg[i].used && !s_msg[i].read && (!best || s_msg[i].ft > best->ft)) best = &s_msg[i];
+    if (best && info) {
+        uint8_t *p = xo_ptr(info);
+        p[0] = best->type;
+        memcpy(p + 1, &best->id, 4);
+        memcpy(p + 5, &z, 4);
+    }
+    unlock();
+    if (xo_arg(2)) xo_wr32(xo_arg(2), 0);
+    return ret(best ? 1u : 0u, 3);
 }
 
 int xo_friends_call(uint32_t va)
@@ -827,10 +977,12 @@ int xo_friends_call(uint32_t va)
     case 0x3AB060:   /* MessageSend(pad, message, n, recipients, event, &task) */
         if (xo_arg(5)) xo_wr32(xo_arg(5), xo_task_new(va, 1, XO_TASK_SUCCESS));
         return ret(XO_HR_OK, 6);
-    case 0x3AB04A:   /* MessageEnumerate(pad, summaries, &count) */
-        if (xo_arg(2)) xo_wr32(xo_arg(2), 0);
-        return ret(XO_HR_OK, 3);
-    case 0x3AB055: return ret(XO_HR_OK, 3);            /* MessageDelete(pad, id, block) */
+    case 0x3AB04A: return h_msg_enumerate();
+    case 0x3AB055: return h_msg_delete();
+    case 0x3AB2A6: return h_msg_details();
+    case 0x3A9D65: return h_msg_property();
+    case 0x3A0798: return h_notification();
+    case 0x3A0827: return ret(1, 1);                   /* FriendsGetAcceptedGameInvite: none (S_FALSE) */
     /* clans (teams): there is no clan service. Lookups finish with no
      * clans; the result readers (12 bytes of arguments: task, &count,
      * list) return none, the detail readers (20: task, id, out) fail;
