@@ -38,6 +38,9 @@ typedef struct {
     int self, nmem, mem[MAX_MEMBERS];
     olive_handler h;
     void *ctx;
+    char code[64];                  /* to open it again when the relay drops it */
+    uint64_t retry_at;
+    int drops;
 } hold_t;
 
 typedef struct {
@@ -134,7 +137,12 @@ static void RTC_API on_closed(int ws, void *ptr)
     int k = UP_KIND(ptr), g = UP_GEN(ptr), i = UP_SLOT(ptr);
     (void)ws;
     lock();
-    if (k == UP_HOLD && i < MAX_HOLDS && s_hold[i].used && s_hold[i].gen == g) s_hold[i].state = 2;
+    if (k == UP_HOLD && i < MAX_HOLDS && s_hold[i].used && s_hold[i].gen == g && s_hold[i].state != 2) {
+        s_hold[i].state = 2;
+        s_hold[i].retry_at = now_ms() + 2000u;
+        s_hold[i].drops++;
+        fprintf(stderr, "  [OLIVE] hold %s dropped by the relay (%d); reopening\n", s_hold[i].code, s_hold[i].drops);
+    }
     if (k == UP_VISIT && i < MAX_VISITS && s_visit[i].used && s_visit[i].gen == g) s_visit[i].done = 1;
     unlock();
 }
@@ -276,6 +284,7 @@ int olive_hold(const char *code, olive_handler h, void *ctx)
         s_hold[slot].ws = -1;
         s_hold[slot].h = h;
         s_hold[slot].ctx = ctx;
+        strncpy(s_hold[slot].code, code, sizeof s_hold[slot].code - 1);
     }
     unlock();
     if (slot < 0) return -1;
@@ -295,6 +304,38 @@ void olive_release(int handle)
     if (s_hold[i].used) { ws = s_hold[i].ws; memset(&s_hold[i], 0, sizeof s_hold[i]); }
     unlock();
     if (ws >= 0) rtcDeleteWebSocket(ws);
+}
+
+/* Holds the relay dropped (an idle timeout, a network blip, a relay
+ * restart) are opened again, under a new generation so a late callback of
+ * the old socket is ignored. Called from the users' pumps. */
+void olive_pump(void)
+{
+    int i, old[MAX_HOLDS], nold = 0;
+    uint64_t t = now_ms();
+    for (i = 0; i < MAX_HOLDS; i++) {
+        int ws, gen;
+        char code[64];
+        lock();
+        if (!s_hold[i].used || s_hold[i].state != 2 || t < s_hold[i].retry_at) { unlock(); continue; }
+        old[nold++] = s_hold[i].ws;
+        s_hold[i].gen = ++s_gen & 0xFFF;
+        s_hold[i].state = 0;
+        s_hold[i].nmem = 0;
+        s_hold[i].ws = -1;
+        s_hold[i].retry_at = t + 10000u;     /* if this one fails too */
+        gen = s_hold[i].gen;
+        memcpy(code, s_hold[i].code, sizeof code);
+        unlock();
+        ws = open_ws(code, UP_HOLD, gen, i);
+        lock();
+        if (s_hold[i].used && s_hold[i].gen == gen) {
+            s_hold[i].ws = ws;
+            if (ws < 0) s_hold[i].state = 2;
+        }
+        unlock();
+    }
+    for (i = 0; i < nold; i++) if (old[i] >= 0) rtcDeleteWebSocket(old[i]);
 }
 
 int olive_hold_members(int handle, int *oldest)

@@ -442,6 +442,7 @@ void xo_friends_pump(void)
 #ifdef OPENHALO2_NET
     int i, busy = 0;
     uint64_t t = now_ms();
+    olive_pump();
     if (!s_signed_in) return;
     pres_pump();
     for (i = 0; i < MAX_FRIENDS; i++) {

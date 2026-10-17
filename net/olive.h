@@ -44,6 +44,8 @@ void olive_release(int handle);
 /* -1 connecting or failed, else the members in the room besides us, and
  * (through oldest) whether we are its oldest member */
 int  olive_hold_members(int handle, int *oldest);
+/* opens dropped holds again; call it now and then (every pump) */
+void olive_pump(void);
 
 /* Visits room `code` with one message (type byte first); returns an id (> 0)
  * or -1. */
