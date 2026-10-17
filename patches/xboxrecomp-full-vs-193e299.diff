@@ -1928,7 +1928,7 @@ index b9a02bc..930e1e6 100644
  /* Total crossings of the DISPATCH boundary, and who is holding it up.
   * A depth that is non-zero while this stops moving is stuck, not busy. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..a5ebe02 100644
+index c65ba43..7974fab 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -784,6 +784,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
@@ -1978,36 +1978,17 @@ index c65ba43..a5ebe02 100644
  }
  
  /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
-@@ -2004,6 +2018,20 @@ static void bridge_HalReadSMCTrayState(void)
+@@ -2004,6 +2018,9 @@ static void bridge_HalReadSMCTrayState(void)
   *
   * Returns 1 if the routine was found and called.
   */
 +static int guest_cpu_borrow(void);          /* the guest CPU lock, below */
 +static void guest_cpu_return(int borrowed);
 +
-+/* DPCDIAG (temporary): per-DPC insert / reject / run counters. */
-+static struct { uint32_t dpc, routine; unsigned ins, rej, runs; unsigned long long last_ins, last_run; } g_dpcst[48];
-+static int dpcst_i(uint32_t dpc)
-+{
-+    int i;
-+    for (i = 0; i < 48; i++) {
-+        if (g_dpcst[i].dpc == dpc) return i;
-+        if (!g_dpcst[i].dpc) { g_dpcst[i].dpc = dpc; return i; }
-+    }
-+    return -1;
-+}
  static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
  {
      uint32_t routine, context;
-@@ -2011,6 +2039,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
- 
-     if (!dpc_va)
-         return 0;
-+    { int k = dpcst_i(dpc_va); if (k >= 0) { g_dpcst[k].runs++; g_dpcst[k].last_run = GetTickCount64(); g_dpcst[k].routine = BRIDGE_MEM32(dpc_va + 12); } }
-     routine = BRIDGE_MEM32(dpc_va + 12);
-     context = BRIDGE_MEM32(dpc_va + 16);
-     if (!routine)
-@@ -2033,7 +2062,15 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+@@ -2033,7 +2050,15 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
      g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
      g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
      g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
@@ -2024,7 +2005,7 @@ index c65ba43..a5ebe02 100644
      return 1;
  }
  
-@@ -2105,7 +2142,7 @@ static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
+@@ -2105,7 +2130,7 @@ static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
   * DPC ordering beyond "after the ISR".
   */
  #define XBOX_MAX_PENDING_DPC 64
@@ -2033,15 +2014,7 @@ index c65ba43..a5ebe02 100644
  static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
  static volatile LONG g_dpc_head, g_dpc_tail;
  
-@@ -2146,6 +2183,7 @@ static void bridge_KeInsertQueueDpc(void)
-     if (!dpc) { g_eax = 0; return; }
- 
-     dpc_lock();
-+    { int k = dpcst_i(dpc); if (k >= 0) { if (BRIDGE_MEM8(dpc + 2)) g_dpcst[k].rej++; else { g_dpcst[k].ins++; g_dpcst[k].last_ins = GetTickCount64(); } } }
-     if (BRIDGE_MEM8(dpc + 2)) {                 /* already queued */
-         LeaveCriticalSection(&g_dpc_lock);
-         g_eax = 0;
-@@ -2163,12 +2201,31 @@ static void bridge_KeInsertQueueDpc(void)
+@@ -2163,9 +2188,17 @@ static void bridge_KeInsertQueueDpc(void)
      g_dpc_queue[tail].dpc  = dpc;
      g_dpc_queue[tail].arg1 = arg1;
      g_dpc_queue[tail].arg2 = arg2;
@@ -2059,21 +2032,7 @@ index c65ba43..a5ebe02 100644
      g_eax = 1;
  }
  
-+void xbox_DpcReport(void)
-+{
-+    int i;
-+    unsigned long long now = GetTickCount64();
-+    fprintf(stderr, "[DPCDIAG] queue head %ld tail %ld\n", (long)g_dpc_head, (long)g_dpc_tail);
-+    for (i = 0; i < 48 && g_dpcst[i].dpc; i++)
-+        fprintf(stderr, "[DPCDIAG] dpc %08X routine %08X flag %u ins %u rej %u runs %u last ins %llu ms ago, last run %llu ms ago\n",
-+                g_dpcst[i].dpc, g_dpcst[i].routine, (unsigned)BRIDGE_MEM8(g_dpcst[i].dpc + 2), g_dpcst[i].ins, g_dpcst[i].rej, g_dpcst[i].runs,
-+                g_dpcst[i].last_ins ? now - g_dpcst[i].last_ins : 0ULL, g_dpcst[i].last_run ? now - g_dpcst[i].last_run : 0ULL);
-+}
-+
- /* Cancel a queued DPC: take it out of the queue if it is still there. */
- static void bridge_KeRemoveQueueDpc(void)
- {
-@@ -2251,6 +2308,8 @@ static int kernel_raise_interrupt(uint32_t vector)
+@@ -2251,6 +2284,8 @@ static int kernel_raise_interrupt(uint32_t vector)
  #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
  #define NV2A_VECTOR            3u
  
@@ -2082,7 +2041,7 @@ index c65ba43..a5ebe02 100644
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
-@@ -2262,16 +2321,34 @@ static void kernel_vblank_tick(void)
+@@ -2262,16 +2297,34 @@ static void kernel_vblank_tick(void)
      if (!enabled)
          return;
  
@@ -2123,7 +2082,7 @@ index c65ba43..a5ebe02 100644
  
      {
          static unsigned n;
-@@ -2284,6 +2361,68 @@ static void kernel_vblank_tick(void)
+@@ -2284,6 +2337,68 @@ static void kernel_vblank_tick(void)
      }
  }
  
@@ -2192,7 +2151,7 @@ index c65ba43..a5ebe02 100644
  /* Run whatever is queued. Called from the timer thread, which has the guest
   * stack and TIB that a deferred routine needs. */
  static void kernel_drain_dpcs(void)
-@@ -2302,8 +2441,35 @@ static void kernel_drain_dpcs(void)
+@@ -2302,8 +2417,35 @@ static void kernel_drain_dpcs(void)
          if (d.dpc)
              BRIDGE_MEM8(d.dpc + 2) = 0;
          LeaveCriticalSection(&g_dpc_lock);
@@ -2229,7 +2188,7 @@ index c65ba43..a5ebe02 100644
      }
  }
  
-@@ -2566,12 +2732,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2566,12 +2708,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          g_fs_base = tib;
      }
  
@@ -2262,7 +2221,7 @@ index c65ba43..a5ebe02 100644
          kernel_drain_dpcs();   /* deferred work, before due timers */
          now = (long long)GetTickCount64();
  
-@@ -2619,6 +2804,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -2619,6 +2780,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      if (!g_timer_started) {
          InitializeCriticalSection(&g_timer_lock);
          g_timer_started = 1;
@@ -2270,7 +2229,7 @@ index c65ba43..a5ebe02 100644
          CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
      }
  
-@@ -3399,6 +3585,164 @@ static int bridge_async_io_enabled(void)
+@@ -3399,6 +3561,164 @@ static int bridge_async_io_enabled(void)
      return on;
  }
  
@@ -2435,7 +2394,7 @@ index c65ba43..a5ebe02 100644
  /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
  static void bridge_NtReadFile(void)
  {
-@@ -3422,8 +3766,10 @@ static void bridge_NtReadFile(void)
+@@ -3422,13 +3742,21 @@ static void bridge_NtReadFile(void)
          off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
          poff = &off;
      }
@@ -2446,7 +2405,20 @@ index c65ba43..a5ebe02 100644
  
      /* What a read actually delivered. A decoder that rejects its input cannot
       * say whether the bytes were wrong or the read was, and the two look
-@@ -3451,6 +3797,18 @@ static void bridge_NtReadFile(void)
+-     * identical from inside the title -- the first bytes settle it. */
+-    {
++     * identical from inside the title -- the first bytes settle it.
++     * Off unless RECOMP_READ_LOG=1: one line per read was most of the log. */
++    static int read_log = -1;
++    if (read_log < 0) {
++        const char *e = getenv("RECOMP_READ_LOG");
++        read_log = e && *e && *e != '0';
++    }
++    if (read_log) {
+         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
+         uint32_t got = (uint32_t)ios.Information;
+         /* The offset matters as much as the length. A title streaming a pack
+@@ -3451,6 +3779,18 @@ static void bridge_NtReadFile(void)
                      got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
          fflush(stderr);
      }
@@ -2465,7 +2437,7 @@ index c65ba43..a5ebe02 100644
      bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
      bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                              iostatus);
-@@ -3880,6 +4238,16 @@ static void bridge_NtFsControlFile(void)
+@@ -3880,6 +4220,16 @@ static void bridge_NtFsControlFile(void)
  {
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
@@ -2482,7 +2454,7 @@ index c65ba43..a5ebe02 100644
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
-@@ -9353,7 +9721,17 @@ static void kernel_thunk_dispatch_body(void);
+@@ -9353,7 +9703,17 @@ static void kernel_thunk_dispatch_body(void);
   * thread sets, with no kernel call in the loop, deadlocks here. The console
   * would preempt it on its quantum; the upgrade is a periodic yield point in
   * the lifted code's backward branches. */
@@ -2501,7 +2473,7 @@ index c65ba43..a5ebe02 100644
  static int g_guest_cpu_on = -1;
  static RECOMP_TLS int t_guest_thread;     /* this host thread runs a guest thread */
  static RECOMP_TLS int t_guest_held;       /* and holds the guest CPU */
-@@ -9363,52 +9741,189 @@ static int guest_cpu_enabled(void)
+@@ -9363,52 +9723,189 @@ static int guest_cpu_enabled(void)
  {
      if (g_guest_cpu_on < 0) {
          const char *e = getenv("RECOMP_GUEST_LOCK");
@@ -2703,7 +2675,7 @@ index c65ba43..a5ebe02 100644
      }
      (void)held;
  }
-@@ -9473,6 +9988,44 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9473,6 +9970,44 @@ static void kernel_thunk_dispatch_body(void)
                      fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
                              (unsigned long long)g_ordinal_calls[best]);
                  }
@@ -12791,7 +12763,7 @@ index 37542d8..16fcc4d 100644
      def _pass_indirect_call_slots(self) -> None:
          """
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index e7ab880..c3d7efb 100644
+index e7ab880..33e014c 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
 @@ -127,6 +127,11 @@ def _fmt_reg(name, size=4):
@@ -12880,6 +12852,15 @@ index e7ab880..c3d7efb 100644
          if m == "rdtsc":
              return [
                  "{ uint64_t _tsc = xbox_ReadTimeStampCounter();",
+@@ -1825,7 +1883,7 @@ class Lifter:
+             r = ops[1].reg
+             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
+                 src = f"SX8({src})"
+-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
++            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
+                 src = f"SX16({src})"
+         return [_fmt_operand_write(ops[0], src)]
+ 
 @@ -1838,6 +1896,19 @@ class Lifter:
      def _lift_xchg(self, insn, ops):
          if len(ops) < 2:
@@ -13044,6 +13025,45 @@ index e7ab880..c3d7efb 100644
          if m == "fscale":
              return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
          if m == "frndint":
+diff --git a/tools/recomp/test_lifter_movsx_bp.py b/tools/recomp/test_lifter_movsx_bp.py
+new file mode 100644
+index 0000000..b5bbe30
+--- /dev/null
++++ b/tools/recomp/test_lifter_movsx_bp.py
+@@ -0,0 +1,33 @@
++"""`movsx r32, bp` / `movsx r32, sp` must sign-extend.
++
++_lift_movsx listed the 16-bit sources it wraps in SX16 as ax, bx, cx, dx, si,
++di -- bp and sp were missing, so `movsx ebx, bp` lifted to `ebx = LO16(ebp)`,
++a zero extension. Halo 2's Bink IDCT (0x3EBAD0) keeps one row coefficient in
++bp: every negative coefficient there became +65536-ish, the block came out
++wrong and the error was carried forward by motion compensation -- the
++"coloured specks" in every Bink movie. 132 sites in Halo 2 changed.
++"""
++
++import unittest
++
++from .disasm import Instruction, Operand
++from .lifter import Lifter
++
++
++def _lift(dst, src):
++    insn = Instruction(0, 3, "movsx", "", "00")
++    insn.operands = [Operand(type="reg", reg=dst), Operand(type="reg", reg=src)]
++    return " ".join(Lifter().lift_instruction(insn))
++
++
++class MovsxSixteenBitSources(unittest.TestCase):
++    def test_every_16_bit_register_is_sign_extended(self):
++        for src in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
++            self.assertIn("SX16(", _lift("ebx" if src != "bx" else "eax", src), src)
++
++    def test_8_bit_still_sign_extended(self):
++        self.assertIn("SX8(", _lift("eax", "bl"))
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/tools/recomp/test_rep_movs_mmio.py b/tools/recomp/test_rep_movs_mmio.py
 index 0aca1c5..492a93f 100644
 --- a/tools/recomp/test_rep_movs_mmio.py
