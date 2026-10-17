@@ -14,6 +14,7 @@ cd "$X"
 env RECOMP_OPEN_LIVE=1 RECOMP_XO_TRACE=${XOT:-1} "$@" RECOMP_APU_MUTE=1 RECOMP_WATCHDOG_SECS=${WD:-1500} \
     RECOMP_PB_REPORT_MS=5000 RECOMP_PAD_LIVE=$O/pad.txt RECOMP_FB_DUMP_FLIPS=$O/dumpflag \
     RECOMP_FB_DUMP=$O/fb ./halo2_recomp.exe > "$O/out.log" 2>&1 &
+cat /proc/$!/winpid > "$O/winpid" 2>/dev/null   # tools/ol_kill.sh <outdir> stops this copy only
 sleep 5
 until [ "$(grep -a 'fps (' "$O/out.log" | tail -1 | sed 's/.*(\([0-9]*\) flips).*/\1/')" -ge 1100 ] 2>/dev/null; do sleep 2; done
 sleep 4

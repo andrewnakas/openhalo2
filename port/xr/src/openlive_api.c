@@ -471,6 +471,149 @@ static int h_qos_release(void)            /* (xnqos) */
     return 0;   /* the title's own XNet made it (system link) */
 }
 
+/* ---- title storage ---------------------------------------------------------------
+ * The title names a file by facility (4 = title files, folder "9809/";
+ * 5 = the user's own; 3 = a team's: 0xB4120), asks CreateServerPath for a
+ * server path, then downloads it into its own buffer. We serve files from
+ * openlive/storage/ beside the program:
+ *     facility 4 -> title/<path>          facility 5 -> user/<xuid>/<path>
+ *     facility 3 -> team/<team id>/<path>
+ * The server path we hand out is "<facility>|<owner id hex>|<path>". The
+ * files are ours (tools/ol_storage.py); a missing file fails the download
+ * the way the title's library does offline (0x80150002), and the title
+ * falls back to its defaults (the request's retry callback). */
+
+#define HR_STORAGE_FAIL 0x80150002u
+
+static void guest_wstr(uint32_t va, char *out, size_t n)
+{
+    size_t i = 0;
+    if (va) {
+        for (; i + 1 < n; i++) {
+            uint16_t c;
+            memcpy(&c, xo_ptr(va + 2u * (uint32_t)i), 2);
+            if (!c) break;
+            out[i] = (c < 0x80 && c >= 0x20) ? (char)c : '_';
+        }
+    }
+    out[i] = 0;
+}
+
+static void guest_put_wstr(uint32_t va, const char *s, uint32_t cap)
+{
+    uint32_t i;
+    for (i = 0; i + 1 < cap && s[i]; i++) {
+        uint16_t c = (uint8_t)s[i];
+        memcpy(xo_ptr(va + 2 * i), &c, 2);
+    }
+    memset(xo_ptr(va + 2 * i), 0, 2);
+}
+
+static int storage_local(const char *server, char *out, size_t n)
+{
+    unsigned fac = 0;
+    char owner[32] = "", path[512] = "", *p;
+    if (sscanf(server, "%u|%31[^|]|%511[^\n]", &fac, owner, path) != 3)
+        return 0;
+    for (p = path; *p; p++) {
+        if (*p == '\\') *p = '/';
+        if (p[0] == '.' && p[1] == '.') return 0;     /* stay inside storage/ */
+    }
+    if (fac == 4) snprintf(out, n, "openlive/storage/title/%s", path);
+    else if (fac == 5) snprintf(out, n, "openlive/storage/user/%s/%s", owner, path);
+    else snprintf(out, n, "openlive/storage/team/%s/%s", owner, path);
+    return 1;
+}
+
+static int h_storage_path(void)   /* (facility, user lo, user hi, team lo, team hi, path, out, &chars) */
+{
+    uint32_t fac = xo_arg(0), out = xo_arg(6), pn = xo_arg(7), cap = pn ? xo_rd32(pn) : 0x100;
+    uint64_t owner = fac == 3 ? ((uint64_t)xo_arg(4) << 32 | xo_arg(3)) : ((uint64_t)xo_arg(2) << 32 | xo_arg(1));
+    char path[512], server[600];
+    guest_wstr(xo_arg(5), path, sizeof path);
+    snprintf(server, sizeof server, "%u|%016llx|%s", fac, (unsigned long long)owner, path);
+    if (strlen(server) + 1 > cap) { xo_return(0x8007007Au, 8); return 1; }   /* buffer too small */
+    guest_put_wstr(out, server, cap);
+    if (pn) xo_wr32(pn, (uint32_t)strlen(server) + 1);
+    xo_return(HR_OK, 8);
+    return 1;
+}
+
+typedef struct { uint32_t buf, len; } dl_t;
+static dl_t s_dl[MAX_TASKS];
+
+static int h_storage_download_mem(void)   /* (facility, pad, server path, buf, size, a, b, &task) */
+{
+    static uint8_t tmp[1 << 20];
+    char server[600], local[700];
+    uint32_t buf = xo_arg(3), cap = xo_arg(4), h;
+    FILE *f;
+    size_t n;
+    guest_wstr(xo_arg(2), server, sizeof server);
+    if (!storage_local(server, local, sizeof local) || (f = fopen(local, "rb")) == NULL) {
+        fprintf(stderr, "  [XO] storage: %s not served\n", server);
+        xo_return(HR_STORAGE_FAIL, 8);
+        return 1;
+    }
+    n = fread(tmp, 1, sizeof tmp, f);
+    fclose(f);
+    if (n > cap) n = cap;
+    memcpy(xo_ptr(buf), tmp, n);
+    h = task_new(T_GENERIC, 0x3AB6EA, 2, HR_TASK_RUNNING, HR_TASK_SUCCESS);
+    s_dl[h & 0xFFFF].buf = buf;
+    s_dl[h & 0xFFFF].len = (uint32_t)n;
+    put_handle(xo_arg(7), h);
+    fprintf(stderr, "  [XO] storage: %s -> %u bytes from %s\n", server, (unsigned)n, local);
+    xo_return(HR_OK, 8);
+    return 1;
+}
+
+static int h_storage_download_results(void)   /* (task, &buf, &received, &total, &owner, &created) */
+{
+    uint32_t h = xo_arg(0);
+    dl_t *d;
+    if (!task_get(h)) return 0;
+    d = &s_dl[h & 0xFFFF];
+    if (xo_arg(1)) xo_wr32(xo_arg(1), d->buf);
+    if (xo_arg(2)) xo_wr32(xo_arg(2), d->len);
+    if (xo_arg(3)) xo_wr32(xo_arg(3), d->len);
+    if (xo_arg(4)) memset(xo_ptr(xo_arg(4)), 0, 8);
+    if (xo_arg(5)) memset(xo_ptr(xo_arg(5)), 0, 8);
+    xo_return(HR_OK, 6);
+    return 1;
+}
+
+static int h_storage_upload_mem(void)   /* (facility, pad, server path, expires lo, hi, buf, size, a, b, &task) */
+{
+    char server[600], local[700];
+    FILE *f;
+    guest_wstr(xo_arg(2), server, sizeof server);
+    if (storage_local(server, local, sizeof local)) {
+        /* a player's own files are kept locally; folders made on demand */
+        char dir[700], *s;
+        strcpy(dir, local);
+        for (s = dir; *s; s++) {
+            if (*s != '/') continue;
+            *s = 0;
+#if defined(_WIN32)
+            CreateDirectoryA(dir, NULL);
+#endif
+            *s = '/';
+        }
+        if ((f = fopen(local, "wb")) != NULL) {
+            fwrite(xo_ptr(xo_arg(5)), 1, xo_arg(6), f);
+            fclose(f);
+        }
+    }
+    put_handle(xo_arg(9), task_new(T_GENERIC, 0x3AD176, 1, HR_TASK_RUNNING, HR_TASK_SUCCESS));
+    xo_return(HR_OK, 10);
+    return 1;
+}
+
+/* to and from a directory on the cache drive: not used by the files above */
+static int h_storage_download_dir(void) { xo_return(HR_STORAGE_FAIL, 7); return 1; }
+static int h_storage_upload_dir(void)   { xo_return(HR_STORAGE_FAIL, 9); return 1; }
+
 static int ret_value(uint32_t v, int nargs) { xo_return(v, nargs); return 1; }
 
 /* ---- the table ---------------------------------------------------------------- */
@@ -491,6 +634,12 @@ static const handler_t k_handlers[] = {
     {0x3A069D, h_offering_new},
     {0x3CD365, h_qos_service_lookup},
     {0x3CD172, h_qos_release},
+    {0x3AB6B1, h_storage_path},
+    {0x3AB6EA, h_storage_download_mem},
+    {0x3AB6F9, h_storage_download_results},
+    {0x3AD176, h_storage_upload_mem},
+    {0x3AB6DB, h_storage_download_dir},
+    {0x3AD149, h_storage_upload_dir},
 };
 
 int xo_live_call(uint32_t va)
