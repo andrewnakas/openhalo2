@@ -27,6 +27,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern uint32_t  xbox_AllocThreadTib(void);
 extern int       xbox_DeviceRaiseInterrupt(uint32_t vector);
+extern int       xbox_DeviceRaiseInterruptBeside(uint32_t vector);
 extern uint32_t  xbox_GetConnectedInterrupt(uint32_t vector);
 extern int       xbox_IrqlBlocksInterrupts(void);
 extern void      xbox_TimerThreadWake(void);
@@ -97,10 +98,27 @@ static void post_trap(ma_state *s)
     s->reg[R_IRQ_STATUS / 4] |= 0x11;
 }
 
+/* While a guest thread is at raised IRQL the interrupt is held back, as the
+ * single-CPU console could not have taken it -- but not for long: DSOUND
+ * itself spins at DISPATCH_LEVEL waiting for its ISR to see a voice stop
+ * (0x381E19: while voice flags & 0x8000, with a 500 ms KeQuerySystemTime
+ * timeout at 0x3811CF), and on the console the interrupt preempts that loop.
+ * Held back for 20 blocks and then delivered under the dispatch lock that the
+ * spinning thread holds, the ISR only ran once the timeout had passed: the
+ * whole title stopped ~500 ms (every timer DPC waits for that lock too), once
+ * or more a second in Cairo with sound on. Now held back 2 blocks, then
+ * delivered beside the raised thread (xbox_DeviceRaiseInterruptBeside).
+ * RECOMP_APU_ISR_BESIDE=0 = the old way. */
 static void deliver(ma_state *s)
 {
     int i;
-    static int held;
+    static int held, beside = -1, hold;
+
+    if (beside < 0) {
+        const char *e = ma_getenv(s, "RECOMP_APU_ISR_BESIDE");
+        beside = !(e && *e == '0');
+        hold = beside ? 2 : 20;
+    }
 
     ma_lock(s);
     if (s->irq_pending) {
@@ -122,14 +140,15 @@ static void deliver(ma_state *s)
         uint32_t st = s->reg[R_IRQ_STATUS / 4], en = s->reg[R_IRQ_ENABLE / 4];
         if (!(st & en & 0xFE) || !(en & 1))
             return;
-        if (xbox_IrqlBlocksInterrupts() && ++held < 20)
+        if (xbox_IrqlBlocksInterrupts() && ++held < hold)
             return;                     /* try again after the next block */
         held = 0;
         s->st_irqs++;
         {
             /* an ISR that is not connected (-1) or does not claim (0) */
             static unsigned nc;
-            int c = xbox_DeviceRaiseInterrupt(MA_VECTOR);
+            int c = beside ? xbox_DeviceRaiseInterruptBeside(MA_VECTOR)
+                           : xbox_DeviceRaiseInterrupt(MA_VECTOR);
             if (c <= 0 && s->report_feed && nc++ < 20)
                 fprintf(stderr, "[MA] ISR returned %d (irq %llu)\n", c, (unsigned long long)s->st_irqs);
         }
