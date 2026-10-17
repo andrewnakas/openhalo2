@@ -4030,10 +4030,10 @@ index 8abfc5f..307b818 100644
  /* One pixel. Colours are r,g,b,a in [0,1]; `fog` is (fog colour, factor).
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..f8d7848
+index 0000000..95b932c
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,4189 @@
+@@ -0,0 +1,4413 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -4533,11 +4533,11 @@ index 0000000..f8d7848
 +    ProgKey key;
 +    int     used;
 +    GLuint  prog;
-+    GLint   u_scale, u_c0, u_c1, u_fc0, u_fc1, u_fogc, u_aref, u_zcut, u_zlo;
++    GLint   u_scale, u_c0, u_c1, u_fc0, u_fc1, u_fogc, u_aref, u_zcut, u_zlo, u_zcutw;
 +    GLint   u_stipon, u_stip, u_wdepth;
 +    GLint   u_tsc, u_tsz, u_taf;
 +    struct {                            /* what the program was last given */
-+        float scale[3], c0[32], c1[32], fc0[4], fc1[4], fogc[3], wdepth[2], zcut, zlo, tsc[16], taf[4];
++        float scale[3], c0[32], c1[32], fc0[4], fc1[4], fogc[3], wdepth[2], zcut, zlo, zcutw, tsc[16], taf[4];
 +        int   aref, stipon, tsz[16];
 +        unsigned stip[32];
 +        int   init;
@@ -4581,6 +4581,8 @@ index 0000000..f8d7848
 +static int        s_ab_nomips;          /* RECOMP_GPU_AB file nomips      */
 +static int        s_ab_nozcut;          /* RECOMP_GPU_AB file nozcut      */
 +static int        s_ab_nonearcut;       /* RECOMP_GPU_AB file nonearcut   */
++static int        s_ab_oldfar;          /* RECOMP_GPU_AB file oldfar      */
++static int        s_ab_zrelax;          /* RECOMP_GPU_AB file zrelax (F10) */
 +static uint32_t  *s_buf;                /* scratch pixels */
 +static size_t     s_buf_px;
 +static int        s_stage_touched[4] = {1, 1, 1, 1};
@@ -4591,7 +4593,10 @@ index 0000000..f8d7848
 +    uint64_t draws, tris, tex_uploads, tex_hashed, downloads, uploads;
 +    uint32_t programs;
 +    uint64_t near_draws, near_tris, clamped_draws;   /* see u_zlo */
++    uint64_t zfar_draws, zfar_tris;                  /* see u_zcutw */
 +} s_stat;
++static uint64_t   s_tie[3];             /* RECOMP_GPU_EQCHECK: draws, L, L within 1 unit */
++static uint64_t   s_eqc[6];             /* RECOMP_GPU_EQCHECK: E, L, G samples, draws, Lp, w draws */
 +
 +/* ---- Small helpers ------------------------------------------------------ */
 +
@@ -5801,6 +5806,7 @@ index 0000000..f8d7848
 +    "uniform int u_aref;\n"
 +    "uniform float u_zcut;\n"
 +    "uniform float u_zlo;\n"
++    "uniform float u_zcutw;\n"
 +    "uniform int u_stipon;\n"
 +    "uniform vec2 u_wdepth;\n"
 +    "uniform uint u_stip[32];\n"
@@ -5811,6 +5817,9 @@ index 0000000..f8d7848
 +     * is the perspective-interpolated one. */
 +    "bool cut() {\n"
 +    "  if (v_z > u_zcut || v_z < u_zlo) return true;\n"
++    "#ifdef ZPERSP\n"
++    "  if ((1.0 / gl_FragCoord.w + u_wdepth.y) * u_wdepth.x > u_zcutw) return true;\n"
++    "#endif\n"
 +    "  if (u_stipon != 0) {\n"
 +    "    ivec2 p = ivec2(gl_FragCoord.xy) & 31;\n"
 +    "    if (((u_stip[p.y] >> uint(p.x)) & 1u) == 0u) return true;\n"
@@ -6228,6 +6237,7 @@ index 0000000..f8d7848
 +    p->u_aref = glGetUniformLocation(p->prog, "u_aref");
 +    p->u_zcut = glGetUniformLocation(p->prog, "u_zcut");
 +    p->u_zlo = glGetUniformLocation(p->prog, "u_zlo");
++    p->u_zcutw = glGetUniformLocation(p->prog, "u_zcutw");
 +    p->u_stipon = glGetUniformLocation(p->prog, "u_stipon");
 +    p->u_stip = glGetUniformLocation(p->prog, "u_stip");
 +    p->u_wdepth = glGetUniformLocation(p->prog, "u_wdepth");
@@ -7665,7 +7675,7 @@ index 0000000..f8d7848
 +        if (st->depth_test) {
 +            GLenum f = st->depth_func >= 0x200 && st->depth_func <= 0x207
 +                     ? (GLenum)st->depth_func : GL_ALWAYS;
-+            if (nv2a_win_zrelax && (f == GL_EQUAL || f == GL_LESS))
++            if ((nv2a_win_zrelax || s_ab_zrelax) && (f == GL_EQUAL || f == GL_LESS))
 +                f = GL_LEQUAL;                  /* F10 A/B switch */
 +            glDepthFunc(f);
 +            glDepthMask(st->depth_mask != 0);
@@ -7745,12 +7755,97 @@ index 0000000..f8d7848
 +     * clamp on that is the whole story; with it off the software path's
 +     * unclamped depth simply fails a LESS/LEQUAL test against anything in
 +     * the buffer, so those fragments are dropped. */
++    /* The far cut (2026-10-17). Halo 2 puts what it shows at the far plane
++     * -- the sky's planet and moon, distant ships and lights -- right on
++     * it: screen z and w both 16,777,215 exactly, or within 1e-6 of it as
++     * the camera moves. The cut compared the interpolated screen z with
++     * 1.0 exactly, so whether such a draw survived came down to float
++     * rounding in the interpolation and changed with the view: Cairo
++     * Station's Earth blinked in and out. Now:
++     * - with the w-buffer on (ZPERSP) it tests the pixel's w, the depth the
++     *   console tests (and clips: xemu does the same), not screen z, which
++     *   reaches the far plane long before w does (1.6774e7 at w 1.4e6);
++     * - with a margin of 1e-6 (17 depth units) for the float noise.
++     * RECOMP_GPU_FARCUT=0 or the A/B file oldfar: screen z above 1.0 cut
++     * exactly, as before. */
 +    {
-+        float zcut = depth && st->depth_test && !st->depth_clamp && !s_ab_nozcut
-+                     && (st->depth_func == 0x201 || st->depth_func == 0x203)
-+                     ? 1.0f : 3.0e38f;
++        static int farcut = -1;
++        const int base = depth && st->depth_test && !st->depth_clamp && !s_ab_nozcut
++                         && (st->depth_func == 0x201 || st->depth_func == 0x203);
++        int newrule;
++        float zcut = base ? 1.0f : 3.0e38f;
++        float zcutw = 3.0e38f;
++        if (farcut < 0) {
++            const char *e = getenv("RECOMP_GPU_FARCUT");
++            farcut = !(e && *e == '0');
++        }
++        newrule = farcut && !s_ab_oldfar;
++        if (base && st->zmax > 0.0f && st->mode != NV2A_GL_MODE_2D) {
++            /* Triangles the old rule cut (a corner beyond the far plane in
++             * screen z) that the new one keeps whole (GPU report). */
++            int t, k, cnt = 0;
++            const float lim = st->zmax * 1.000001f;
++            float zmx = -3.0e38f;
++            for (t = 0; t < n; t++)
++                if (s_q[t].pos[2] > zmx)
++                    zmx = s_q[t].pos[2];
++            if (zmx > st->zmax) {
++                for (t = 0; t + 2 < n; t += 3) {
++                    int out = 0, keep = 1;
++                    for (k = 0; k < 3; k++) {
++                        const float *v = s_q[t + k].pos;
++                        if (v[2] > st->zmax) out = 1;
++                        if ((p->key.zpersp ? v[3] + st->zbias : v[2]) > lim) keep = 0;
++                    }
++                    cnt += out && keep;
++                }
++                if (cnt) {
++                    s_stat.zfar_draws++;
++                    s_stat.zfar_tris += (uint64_t)cnt;
++                }
++            }
++            {
++                /* RECOMP_GPU_ZFAR_LOG=<lines>: draws within 1e-6 of the far plane. */
++                static int budget = -1;
++                if (budget < 0) {
++                    const char *e = getenv("RECOMP_GPU_ZFAR_LOG");
++                    budget = e ? atoi(e) : 0;
++                }
++                if (budget > 0 && zmx > 0.999999f * st->zmax) {
++                    float zmn = 3e38f, wmn = 3e38f, wmx = -3e38f, xmn = 3e38f, xmx = -3e38f, ymn = 3e38f, ymx = -3e38f;
++                    int q;
++                    for (q = 0; q < n; q++) {
++                        if (s_q[q].pos[2] < zmn) zmn = s_q[q].pos[2];
++                        if (s_q[q].pos[3] < wmn) wmn = s_q[q].pos[3];
++                        if (s_q[q].pos[3] > wmx) wmx = s_q[q].pos[3];
++                        if (s_q[q].pos[0] < xmn) xmn = s_q[q].pos[0];
++                        if (s_q[q].pos[0] > xmx) xmx = s_q[q].pos[0];
++                        if (s_q[q].pos[1] < ymn) ymn = s_q[q].pos[1];
++                        if (s_q[q].pos[1] > ymx) ymx = s_q[q].pos[1];
++                    }
++                    budget--;
++                    fprintf(stderr, "[GL] zfar draw %llu flip %u: %d tris | z/zmax %.7f..%.7f"
++                            " w %.6g..%.6g | tex0 %08X %ux%u func %X mask %u blend %u cull %d zp %u | xy %.0f..%.0f %.0f..%.0f%c",
++                            (unsigned long long)s_draw_seq, s_flip, n / 3, zmn / st->zmax,
++                            zmx / st->zmax, wmn, wmx,
++                            st->tex[0].valid ? st->tex[0].offset : 0u,
++                            st->tex[0].width, st->tex[0].height, st->depth_func,
++                            st->depth_mask, st->blend_enable, st->depth_cull,
++                            p->key.zpersp, xmn, xmx, ymn, ymx, 10);
++                }
++            }
++        }
++        if (base && newrule) {
++            if (p->key.zpersp && p->u_zcutw >= 0) {
++                zcutw = 1.000001f;
++                zcut = 3.0e38f;
++            } else
++                zcut = 1.000001f;
++        }
 +        if (uni_changed(&p->last.zcut, &zcut, sizeof zcut))
 +            glUniform1f(p->u_zcut, zcut);
++        if (p->u_zcutw >= 0 && uni_changed(&p->last.zcutw, &zcutw, sizeof zcutw))
++            glUniform1f(p->u_zcutw, zcutw);
 +    }
 +    /* The near plane. The console clips what is in front of it (screen z
 +     * below 0) unless the title clamps depth (ZMIN_MAX_CONTROL bit 4); here
@@ -7779,6 +7874,25 @@ index 0000000..f8d7848
 +                    || s_q[t + 2].pos[2] < 0.0f)
 +                    cnt++;
 +            if (cnt) {
++                static int budget = -1;
++                if (budget < 0) {
++                    const char *e = getenv("RECOMP_GPU_ZNEAR_LOG");
++                    budget = e ? atoi(e) : 0;
++                }
++                if (budget > 0) {
++                    /* RECOMP_GPU_ZNEAR_LOG=<lines>: where screen z crosses 0 in w. */
++                    float zmn = 3e38f, wz = 0.0f, wmn = 3e38f;
++                    int q;
++                    budget--;
++                    for (q = 0; q < n; q++) {
++                        if (s_q[q].pos[2] < zmn) { zmn = s_q[q].pos[2]; wz = s_q[q].pos[3]; }
++                        if (s_q[q].pos[3] < wmn) wmn = s_q[q].pos[3];
++                    }
++                    fprintf(stderr, "[GL] znear draw %llu flip %u: %d of %d tris | min z %g at w %g, min w %g"
++                            " | zp %u cull %d func %X tex0 %08X%c", (unsigned long long)s_draw_seq,
++                            s_flip, cnt, n / 3, zmn, wz, wmn, p->key.zpersp, st->depth_cull,
++                            st->depth_func, st->tex[0].valid ? st->tex[0].offset : 0u, 10);
++                }
 +                s_stat.near_draws++;
 +                s_stat.near_tris += (uint64_t)cnt;
 +            }
@@ -7843,6 +7957,93 @@ index 0000000..f8d7848
 +    }
 +    pt_add(PT_VBO, t_part);
 +    t_part = pt_now();
++#if !NV2A_GLES
++    /* RECOMP_GPU_EQCHECK (diagnostic): before each depth-EQUAL draw, count
++     * its samples under EQUAL, LEQUAL and GEQUAL with nothing written. A
++     * multipass surface whose later pass lands on the first pass's depth
++     * exactly has E = L = G; L - E and G - E are pixels it misses. */
++    {
++        static int eqc = -1;
++        if (eqc < 0)
++            eqc = getenv("RECOMP_GPU_EQCHECK") != NULL;
++        if (eqc && depth && st->depth_test && st->depth_func == 0x202
++            && st->mode != NV2A_GL_MODE_2D) {
++            static const GLenum fn[3] = { GL_EQUAL, GL_LEQUAL, GL_GEQUAL };
++            GLboolean cm[4], dm;
++            GLint df = GL_EQUAL, sm = 0;
++            GLuint r;
++            int k;
++            glGetBooleanv(GL_COLOR_WRITEMASK, cm);
++            glGetBooleanv(GL_DEPTH_WRITEMASK, &dm);
++            glGetIntegerv(GL_DEPTH_FUNC, &df);
++            glGetIntegerv(GL_STENCIL_WRITEMASK, &sm);
++            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
++            glDepthMask(GL_FALSE);
++            glStencilMask(0);
++            for (k = 0; k < 3; k++) {
++                r = 0;
++                glDepthFunc(fn[k]);
++                glBeginQuery(GL_SAMPLES_PASSED, s_query);
++                glDrawArrays(GL_TRIANGLES, vfirst, n);
++                glEndQuery(GL_SAMPLES_PASSED);
++                glGetQueryObjectuiv(s_query, GL_QUERY_RESULT, &r);
++                s_eqc[k] += r;
++            }
++            s_eqc[3]++;
++            if (p->key.zpersp && p->u_wdepth >= 0) {
++                /* LEQUAL with the depth moved 4 units nearer: Lp - L are
++                 * samples just behind the stored depth (EQUAL misses them). */
++                r = 0;
++                glUniform2f(p->u_wdepth, p->last.wdepth[0], p->last.wdepth[1] - 4.0f);
++                glDepthFunc(GL_LEQUAL);
++                glBeginQuery(GL_SAMPLES_PASSED, s_query);
++                glDrawArrays(GL_TRIANGLES, vfirst, n);
++                glEndQuery(GL_SAMPLES_PASSED);
++                glGetQueryObjectuiv(s_query, GL_QUERY_RESULT, &r);
++                glUniform2f(p->u_wdepth, p->last.wdepth[0], p->last.wdepth[1]);
++                s_eqc[4] += r;
++                s_eqc[5]++;
++            }
++            glColorMask(cm[0], cm[1], cm[2], cm[3]);
++            glDepthMask(dm);
++            glDepthFunc((GLenum)df);
++            glStencilMask((GLuint)sm);
++        }
++        /* RECOMP_GPU_EQCHECK, second part: w-buffered draws that test
++         * LESS/LEQUAL and write depth. Lt - L are samples that lose by less
++         * than one depth unit -- a coplanar surface the console's integer
++         * w-buffer stores level with the one before it. */
++        if (eqc && depth && st->depth_test && st->depth_mask && p->key.zpersp
++            && p->u_wdepth >= 0 && (st->depth_func == 0x201 || st->depth_func == 0x203)
++            && st->mode != NV2A_GL_MODE_2D) {
++            GLboolean cm[4];
++            GLint df = GL_LEQUAL, sm = 0;
++            GLuint r;
++            int k;
++            glGetBooleanv(GL_COLOR_WRITEMASK, cm);
++            glGetIntegerv(GL_DEPTH_FUNC, &df);
++            glGetIntegerv(GL_STENCIL_WRITEMASK, &sm);
++            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
++            glDepthMask(GL_FALSE);
++            glStencilMask(0);
++            for (k = 0; k < 2; k++) {
++                r = 0;
++                glUniform2f(p->u_wdepth, p->last.wdepth[0], p->last.wdepth[1] - (k ? 1.0f : 0.0f));
++                glBeginQuery(GL_SAMPLES_PASSED, s_query);
++                glDrawArrays(GL_TRIANGLES, vfirst, n);
++                glEndQuery(GL_SAMPLES_PASSED);
++                glGetQueryObjectuiv(s_query, GL_QUERY_RESULT, &r);
++                s_tie[1 + k] += r;
++            }
++            s_tie[0]++;
++            glUniform2f(p->u_wdepth, p->last.wdepth[0], p->last.wdepth[1]);
++            glColorMask(cm[0], cm[1], cm[2], cm[3]);
++            glDepthMask(GL_TRUE);
++            glDepthFunc((GLenum)df);
++            glStencilMask((GLuint)sm);
++        }
++    }
++#endif
 +    if (st->zpass_enable && zpass) {
 +        GLuint r = 0;
 +        double tq = pt_now();
@@ -7999,6 +8200,16 @@ index 0000000..f8d7848
 +            snprintf(path, sizeof path, "%s/nonearcut", dir);
 +            f = fopen(path, "rb");
 +            s_ab_nonearcut = f != NULL;
++            if (f)
++                fclose(f);
++            snprintf(path, sizeof path, "%s/oldfar", dir);
++            f = fopen(path, "rb");
++            s_ab_oldfar = f != NULL;
++            if (f)
++                fclose(f);
++            snprintf(path, sizeof path, "%s/zrelax", dir);
++            f = fopen(path, "rb");
++            s_ab_zrelax = f != NULL;
 +            if (f)
 +                fclose(f);
 +        }
@@ -8168,6 +8379,19 @@ index 0000000..f8d7848
 +                    " and are cut there; %llu draws with depth clamp\n",
 +            (unsigned long long)s_stat.near_draws, (unsigned long long)s_stat.near_tris,
 +            (unsigned long long)s_stat.clamped_draws);
++    fprintf(stderr, "[GL] far plane: %llu draws (%llu triangles) reach past it in screen z"
++                    " but not in w / past the margin (drawn; the old rule cut them)%c",
++            (unsigned long long)s_stat.zfar_draws, (unsigned long long)s_stat.zfar_tris, 10);
++    if (s_eqc[3])
++        fprintf(stderr, "[GL] EQUAL check: %llu draws, samples equal %llu lequal %llu gequal %llu"
++                " | w-buffer draws %llu: lequal+4 %llu%c",
++                (unsigned long long)s_eqc[3], (unsigned long long)s_eqc[0],
++                (unsigned long long)s_eqc[1], (unsigned long long)s_eqc[2],
++                (unsigned long long)s_eqc[5], (unsigned long long)s_eqc[4], 10);
++    if (s_tie[0])
++        fprintf(stderr, "[GL] depth ties: %llu w-buffer LESS/LEQUAL draws, samples passing %llu, within 1 unit behind %llu%c",
++                (unsigned long long)s_tie[0], (unsigned long long)s_tie[1],
++                (unsigned long long)(s_tie[2] - s_tie[1]), 10);
 +    if (s_shadow_draws || s_shadow_missing)
 +        fprintf(stderr, "[GL] shadow buffers: %u stage reads bound, %u with no depth (read as lit)\n",
 +                s_shadow_draws, s_shadow_missing);
@@ -8225,10 +8449,10 @@ index 0000000..f8d7848
 +#endif
 diff --git a/src/kernel/nv2a_gl.h b/src/kernel/nv2a_gl.h
 new file mode 100644
-index 0000000..3ecfc77
+index 0000000..45d7fde
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.h
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,166 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor (nv2a_pb_exec.c).
 + *
@@ -8290,6 +8514,7 @@ index 0000000..3ecfc77
 +    float    zmax;          /* largest depth value of the zeta format      */
 +    int      use_depth;
 +    int      depth_clamp;   /* ZMIN_MAX_CONTROL bit 4                      */
++    int      depth_cull;    /* ZMIN_MAX_CONTROL bits 0-3: cull near/far    */
 +    int      swizzled;      /* SET_SURFACE_FORMAT type 2                   */
 +    /* Per-fragment state. */
 +    uint32_t blend_enable, blend_sfactor, blend_dfactor;
@@ -8395,7 +8620,7 @@ index 0000000..3ecfc77
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..367c561 100644
+index c65632c..b3e8724 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -32,11 +32,15 @@
@@ -8514,17 +8739,18 @@ index c65632c..367c561 100644
      /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
       * instead of into a buffer the title points at. Same vertex format, a
       * different place to read them from. */
-@@ -298,6 +348,9 @@ static struct {
+@@ -298,6 +348,10 @@ static struct {
      /* Visibility tests (D3D's Begin/EndVisibilityTest): pixels that pass the
       * depth test while counting is on, reported by GET_REPORT. */
      uint32_t zpass_enable, zpass_count, reports;
 +    /* Triangles of the current visibility test cut by the near/w clip, and
 +     * how many reports that turned from 0 into 1 (see GET_REPORT). */
 +    uint32_t zpass_clipped, zpass_rescued;
++    uint32_t clip_vp_fixed;             /* xf_viewport: c[58].xy unusable */
      uint32_t blend_pairs[16];   /* sfactor<<16 | dfactor seen, for the report */
      int blend_npairs;
      Texture  texs[4];                   /* one per texture stage */
-@@ -307,6 +360,7 @@ static struct {
+@@ -307,6 +361,7 @@ static struct {
      Nv2aCombiner rc;
      int      rc_seen;
      uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
@@ -8532,7 +8758,7 @@ index c65632c..367c561 100644
      uint32_t alpha_test, alpha_func, alpha_ref;
      uint32_t fog_enable, fog_mode, fog_color;
      float    fog_param[2];
-@@ -315,13 +369,23 @@ static struct {
+@@ -315,13 +370,23 @@ static struct {
      uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
      uint32_t batches_program, verts_program, tris_behind;
      /* Where program-path triangles go, so "nothing drew" has a reason. */
@@ -8557,7 +8783,7 @@ index c65632c..367c561 100644
  } s_gpu;
  
  /* Unhandled methods, ranked. The interesting output is not that something was
-@@ -440,8 +504,100 @@ static void note_texture_use(void)
+@@ -440,8 +505,100 @@ static void note_texture_use(void)
      }
  }
  
@@ -8613,28 +8839,28 @@ index c65632c..367c561 100644
 + * old behaviour back on while it exists. */
 +static int s_ab_oldidx, s_ab_nocull, s_ab_nopoly, s_ab_nozpersp, s_ab_nostipple,
 +           s_ab_shadowlit, s_ab_shadowflip, s_ab_oldclip, s_ab_nocolclamp,
-+           s_ab_nostencil;
++           s_ab_nostencil, s_ab_oldclipvp;
 +
 +volatile long nv2a_win_trace, nv2a_win_nocull, nv2a_win_zrelax;   /* nv2a_gl.h */
 +
 +static void ab_poll(void)
 +{
 +    static const char *dir = (const char *)-1;
-+    static const char *const names[10] = { "oldidx", "nocull", "nopoly",
++    static const char *const names[11] = { "oldidx", "nocull", "nopoly",
 +                                          "nozpersp", "nostipple", "shadowlit",
 +                                          "shadowflip", "oldclip", "nocolclamp",
-+                                          "nostencil" };
-+    int *const flags[10] = { &s_ab_oldidx, &s_ab_nocull, &s_ab_nopoly,
++                                          "nostencil", "oldclipvp" };
++    int *const flags[11] = { &s_ab_oldidx, &s_ab_nocull, &s_ab_nopoly,
 +                            &s_ab_nozpersp, &s_ab_nostipple, &s_ab_shadowlit,
 +                            &s_ab_shadowflip, &s_ab_oldclip, &s_ab_nocolclamp,
-+                            &s_ab_nostencil };
++                            &s_ab_nostencil, &s_ab_oldclipvp };
 +    char path[600];
 +    int i;
 +    if (dir == (const char *)-1)
 +        dir = getenv("RECOMP_GPU_AB");
 +    if (!dir)
 +        return;
-+    for (i = 0; i < 10; i++) {
++    for (i = 0; i < 11; i++) {
 +        FILE *f;
 +        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
 +        f = fopen(path, "rb");
@@ -8658,7 +8884,7 @@ index c65632c..367c561 100644
      int i;
  
      s_gpu.unhandled_total++;
-@@ -471,8 +627,26 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
+@@ -471,8 +628,26 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
  
      out[0] = out[1] = out[2] = 0.0f;
      out[3] = 1.0f;
@@ -8686,7 +8912,7 @@ index c65632c..367c561 100644
      if (s_gpu.inline_active) {
          /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
           * the buffered payload rather than a guest address -- and 0 is a legal
-@@ -527,6 +701,78 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
+@@ -527,6 +702,78 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
      }
  }
  
@@ -8765,7 +8991,7 @@ index c65632c..367c561 100644
  static uint32_t surface_bpp(void);
  
  static void note_drawn(void)
-@@ -583,12 +829,18 @@ static uint32_t surface_bpp(void)
+@@ -583,12 +830,18 @@ static uint32_t surface_bpp(void)
   * the sequence. */
  static int s_flip_dumping;
  
@@ -8784,7 +9010,7 @@ index c65632c..367c561 100644
      uint32_t pitch = drawn ? s_gpu.drawn_pitch : s_gpu.pitch;
      uint32_t cx = drawn ? s_gpu.drawn_x : s_gpu.clip_x;
      uint32_t cy = drawn ? s_gpu.drawn_y : s_gpu.clip_y;
-@@ -649,6 +901,11 @@ static void dump_surface_bmp(void)
+@@ -649,6 +902,11 @@ static void dump_surface_bmp(void)
          }
      }
      fclose(f);
@@ -8796,7 +9022,7 @@ index c65632c..367c561 100644
      if (seq == 1)
          fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
                  path, w, h, s_gpu.color_offset, bpp);
-@@ -659,6 +916,7 @@ static void dump_surface_bmp(void)
+@@ -659,6 +917,7 @@ static void dump_surface_bmp(void)
  static void raster_triangle(const float a[2], const float b[2],
                              const float c[2], uint32_t argb,
                              const float uv[3][2]);
@@ -8804,7 +9030,7 @@ index c65632c..367c561 100644
  
  static void clear_surface(uint32_t param)
  {
-@@ -679,13 +937,63 @@ static void clear_surface(uint32_t param)
+@@ -679,13 +938,63 @@ static void clear_surface(uint32_t param)
          s_gpu.color_base = base;
      }
  
@@ -8871,7 +9097,7 @@ index c65632c..367c561 100644
          } else if (bpp == 2) {
              /* The clear value is always given as A8R8G8B8; a 16-bit surface
               * takes the same colour reduced to 5:6:5. */
-@@ -693,7 +1001,7 @@ static void clear_surface(uint32_t param)
+@@ -693,7 +1002,7 @@ static void clear_surface(uint32_t param)
                                    | ((s_gpu.clear_color >> 5) & 0x07E0)
                                    | ((s_gpu.clear_color >> 3) & 0x001F));
              uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
@@ -8880,7 +9106,7 @@ index c65632c..367c561 100644
                  p[x] = v;
          }
      }
-@@ -701,7 +1009,7 @@ static void clear_surface(uint32_t param)
+@@ -701,7 +1010,7 @@ static void clear_surface(uint32_t param)
      /* Progress markers, interleaved with everything else in the log. The
       * summary says drawing stopped; only a marker next to the surrounding
       * activity says what the title was doing when it stopped. */
@@ -8889,7 +9115,7 @@ index c65632c..367c561 100644
          fprintf(stderr, "  [GPU] clear #%u\n", s_gpu.clears);
      /* Distinct clear colours actually used. "Cleared to black" and "the clear
       * never ran" look identical in the framebuffer, and only one of them is a
-@@ -854,6 +1162,11 @@ static uint32_t linear_twin(uint32_t fmt)
+@@ -854,6 +1163,11 @@ static uint32_t linear_twin(uint32_t fmt)
  {
      switch (fmt) {
      case 0x00: return 0x13;                /* L8        -> LIN_L8        */
@@ -8901,7 +9127,7 @@ index c65632c..367c561 100644
      case 0x02: return 0x10;                /* A1R5G5B5  -> LIN_A1R5G5B5  */
      case 0x03: return 0x1C;                /* X1R5G5B5  -> LIN_X1R5G5B5  */
      case 0x04: return 0x1D;                /* A4R4G4B4  -> LIN_A4R4G4B4  */
-@@ -865,6 +1178,9 @@ static uint32_t linear_twin(uint32_t fmt)
+@@ -865,6 +1179,9 @@ static uint32_t linear_twin(uint32_t fmt)
      }
  }
  
@@ -8911,7 +9137,7 @@ index c65632c..367c561 100644
  /* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
  static int sample_tex(const Texture *t, uint32_t face_offset,
                        uint32_t u, uint32_t v, uint32_t *argb)
-@@ -922,7 +1238,15 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -922,7 +1239,15 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
      } else {
          p = mem + base + (size_t)v * t->pitch;
      }
@@ -8927,7 +9153,7 @@ index c65632c..367c561 100644
      switch (fmt) {
  
      /* 32-bit, alpha-red-green-blue in the dword. */
-@@ -1006,6 +1330,20 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1006,6 +1331,20 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
      case 0x1F:                                      /* LIN_A8 */
          *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
          return 1;
@@ -8948,7 +9174,7 @@ index c65632c..367c561 100644
  
      /* 4:2:2 packed YUV, two texels per four bytes.
       *
-@@ -1048,6 +1386,126 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+@@ -1048,6 +1387,126 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
      return sample_tex(&s_gpu.texs[0], 0, u, v, argb);
  }
  
@@ -9075,7 +9301,7 @@ index c65632c..367c561 100644
  /* Write a bound texture out as a BMP, through the sampler rather than around it.
   *
   * "Which texture is this" is not answerable from an address and a format, and
-@@ -1245,6 +1703,72 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
+@@ -1245,6 +1704,72 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
      }
  }
  
@@ -9148,7 +9374,7 @@ index c65632c..367c561 100644
  /* Half-space fill. Barycentric edge functions rather than scanline slopes:
   * the same test decides both windings, so a title that emits clockwise
   * triangles does not silently render nothing. */
-@@ -1285,6 +1809,15 @@ static void raster_triangle(const float a[2], const float b[2],
+@@ -1285,6 +1810,15 @@ static void raster_triangle(const float a[2], const float b[2],
          return;
      }
  
@@ -9164,7 +9390,7 @@ index c65632c..367c561 100644
      for (y = miny; y < maxy; y++) {
          for (x = minx; x < maxx; x++) {
              float px = (float)x + 0.5f, py = (float)y + 0.5f;
-@@ -1620,9 +2153,12 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+@@ -1620,9 +2154,12 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
  {
      switch (fmt) {
      case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
@@ -9178,7 +9404,7 @@ index c65632c..367c561 100644
          return 2;
      default:
          return 4;
-@@ -1702,14 +2238,17 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
+@@ -1702,14 +2239,17 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
          return 1;
      case 1: case 2:                               /* PROJECT2D / 3D */
          rc_texel(t, 0, c[0] / q, c[1] / q, out);
@@ -9198,7 +9424,7 @@ index c65632c..367c561 100644
          }
          if (ax >= ay && ax >= az) {
              face = x > 0 ? 0 : 1; ma = ax; sc = x > 0 ? -z : z; tc = -y;
-@@ -1785,6 +2324,133 @@ static int alpha_test_pass(float a)
+@@ -1785,6 +2325,134 @@ static int alpha_test_pass(float a)
      }
  }
  
@@ -9260,6 +9486,7 @@ index c65632c..367c561 100644
 +    st->use_depth = mode != NV2A_GL_MODE_2D
 +                 && (s_gpu.depth_test || s_gpu.depth_mask);
 +    st->depth_clamp = (s_gpu.zminmax_control & 0x10) != 0;
++    st->depth_cull = (s_gpu.zminmax_control & 0x0F) != 0;
 +    st->swizzled = ((s_gpu.format >> 8) & 0xF) == 2;
 +    st->blend_enable = s_gpu.blend_enable;
 +    st->blend_sfactor = s_gpu.blend_sfactor;
@@ -9332,7 +9559,7 @@ index c65632c..367c561 100644
  /* Everything a triangle's pixels need, computed once per triangle, so the
   * pixel loop can run over any subset of rows on any thread. */
  typedef struct {
-@@ -1794,7 +2460,10 @@ typedef struct {
+@@ -1794,7 +2462,10 @@ typedef struct {
      const float *a, *b, *c;
      float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
      float *zb;
@@ -9343,7 +9570,7 @@ index c65632c..367c561 100644
  } XfTri;
  
  typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
-@@ -1819,7 +2488,16 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -1819,7 +2490,16 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                  continue;
              /* w1 is opposite a, w2 opposite b, w0 opposite c. */
              l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
@@ -9361,7 +9588,7 @@ index c65632c..367c561 100644
              {
                  float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
                  int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
-@@ -1904,12 +2582,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -1904,12 +2584,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -9405,7 +9632,7 @@ index c65632c..367c561 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -1919,7 +2628,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -1919,7 +2630,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -9420,7 +9647,7 @@ index c65632c..367c561 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -1985,25 +2700,204 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -1985,25 +2702,204 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
  }
  #endif
  
@@ -9626,7 +9853,7 @@ index c65632c..367c561 100644
  
      v[0] = va; v[1] = vb; v[2] = vc;
      a = va->pos; b = vb->pos; c = vc->pos;
-@@ -2012,13 +2906,88 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2012,13 +2908,100 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          return;
      if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
          s_gpu.tris_behind++;
@@ -9637,6 +9864,18 @@ index c65632c..367c561 100644
      if (area == 0.0f || area != area) {
 +        if (area != area) s_gpu.xf_nan++;
          s_gpu.xf_degenerate++;
++        if (s_xf_inclip) {
++            static int budget = -1;
++            if (budget < 0) {
++                const char *e = getenv("RECOMP_GPU_DEGEN_LOG");
++                budget = e ? atoi(e) : 0;
++            }
++            if (budget > 0 && s_ftrace == 2) {
++                budget--;
++                fprintf(stderr, "[XF] degenerate clip piece: area %g | a %g %g %g %g | b %g %g %g %g | c %g %g %g %g%c",
++                        area, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], c[0], c[1], c[2], c[3], 10);
++            }
++        }
          return;
      }
 +    /* Face culling. `area` is positive for a triangle that runs clockwise on
@@ -9715,16 +9954,13 @@ index c65632c..367c561 100644
      for (k = 0; k < 3; k++) {
          if (!s_gpu.xf_seeded)
              s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
-@@ -2028,12 +2997,55 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2028,9 +3011,52 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_seeded = 1;
      if (!surface_begin_batch(T.mem))
          return;
 -    if (s_gpu.depth_test || s_gpu.depth_mask)
 -        T.zb = zbuf_current(1);
 -    if (tex_size_from_format(s_gpu.texs[0].color)) {
--        su = (float)s_gpu.texs[0].width;
--        sv = (float)s_gpu.texs[0].height;
--    }
 +    if (gl_only) {
 +        /* The slow path's bounds, scissor rejection and GL vertices, exactly:
 +         * x and y are not NaN here (a NaN would have made `area` NaN), so
@@ -9771,13 +10007,10 @@ index c65632c..367c561 100644
 +        && (!nv2a_gl_active() || nv2a_gl_verify()))
 +        T.zb = zbuf_current(1);
 +    if (tex_size_from_format(s_gpu.texs[0].color)) {
-+        su = (float)s_gpu.texs[0].width;
-+        sv = (float)s_gpu.texs[0].height;
-+    }
-     for (k = 0; k < 3; k++) {
-         T.iw[k] = 1.0f / v[k]->pos[3];
-         T.uv[k][0] = v[k]->tex[0][0] * su * T.iw[k];
-@@ -2052,10 +3064,13 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+         su = (float)s_gpu.texs[0].width;
+         sv = (float)s_gpu.texs[0].height;
+     }
+@@ -2052,10 +3078,13 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          { float r = T.fogc[2]; T.fogc[2] = T.fogc[0]; T.fogc[0] = r; }
      }
  
@@ -9795,7 +10028,7 @@ index c65632c..367c561 100644
      if (T.minx < (int)s_gpu.clip_x) T.minx = (int)s_gpu.clip_x;
      if (T.miny < (int)s_gpu.clip_y) T.miny = (int)s_gpu.clip_y;
      if (T.maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) T.maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
-@@ -2070,7 +3085,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2070,7 +3099,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -9826,7 +10059,7 @@ index c65632c..367c561 100644
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
      s_gpu.zpass_count += cnt.zpass;
-@@ -2092,8 +3129,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2092,12 +3143,47 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
   * offset) while leaving w itself alone. So each vertex is taken back to clip
   * space first: clip = (screen - offset) / scale * w. Everything else the
   * vertex carries -- colours, fog, texture coordinates -- is linear in clip
@@ -9837,7 +10070,46 @@ index c65632c..367c561 100644
   * ponytail: the near plane only; x/y/far fall to the rasteriser's bounds
   * check, which is correct, just slower for huge off-screen triangles. */
  #define NV_CLIP_W 1e-3f
-@@ -2116,8 +3153,13 @@ static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
+ 
++/* The viewport map the clipper takes screen positions back to clip space
++ * with: D3D's epilogue scale c[58] and offset c[59]. Any map
++ * pos = c / w * k + o with k != 0 gives the same pieces (clip space is only
++ * rescaled and sheared by w, and the planes are planes in w and z), but a
++ * zero k makes every clipped vertex land on o. Halo 2's vertex programs
++ * do their own viewport, so c[58]/c[59] hold whatever was loaded there
++ * last: often c[58].xy = 0 (c[59] = -0.294 0.956 in Cairo Station), always
++ * after Restart Level. Then every piece of a clipped triangle was one point,
++ * dropped as degenerate: the Earth, a sky quad that reaches behind the
++ * camera, vanished while the unclipped ship and stars stayed, and floor and
++ * wall triangles crossing the near plane vanished with it (whole floors
++ * after a restart; single panels at other times). Unusable entries are
++ * taken as k = 1, o = 0.
++ * RECOMP_GPU_CLIPVP=0 or the A/B file oldclipvp: c[58]/c[59] as they are. */
++static void xf_viewport(float k[3], float o[3])
++{
++    static int on = -1;
++    const float *sc = nv2a_vsh_constant(58), *of = nv2a_vsh_constant(59);
++    int i;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_GPU_CLIPVP");
++        on = !(e && *e == '0');
++    }
++    for (i = 0; i < 3; i++) {
++        k[i] = sc[i];
++        o[i] = of[i];
++        if (on && !s_ab_oldclipvp && (k[i] == 0.0f || k[i] - k[i] != 0.0f || o[i] - o[i] != 0.0f)) {
++            if (i < 2)
++                s_gpu.clip_vp_fixed++;
++            k[i] = 1.0f;
++            o[i] = 0.0f;
++        }
++    }
++}
++
+ static void xf_to_clip(const Nv2aVshOutput *v, const float k[3],
+                        const float o[3], float c[3])
+ {
+@@ -2116,8 +3202,13 @@ static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
          po[i] = pa[i] + (pb[i] - pa[i]) * t;
  }
  
@@ -9853,7 +10125,7 @@ index c65632c..367c561 100644
  {
      const Nv2aVshOutput *in[3];
      Nv2aVshOutput poly[4], va, vb;
-@@ -2130,7 +3172,7 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -2130,7 +3221,7 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
      }
      if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
          && c->pos[3] <= NV_CLIP_W) {
@@ -9862,7 +10134,7 @@ index c65632c..367c561 100644
          return;
      }
      {
-@@ -2156,15 +3198,361 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -2156,15 +3247,372 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
              xf_lerp(&va, &vb, t, &poly[n++]);
          }
      }
@@ -9956,10 +10228,7 @@ index c65632c..367c561 100644
 +        }
 +        near_on = near_env && (s_gpu.zminmax_control & 0x0F) != 0 && s_gpu.clip_zmin > 0.0f;
 +    }
-+    {
-+        const float *sc = nv2a_vsh_constant(58), *of = nv2a_vsh_constant(59);
-+        for (i = 0; i < 3; i++) { k[i] = sc[i]; o[i] = of[i]; }
-+    }
++    xf_viewport(k, o);
 +    if (near_on) {
 +        if (zp)
 +            z0 = s_gpu.clip_zmin;
@@ -10059,7 +10328,9 @@ index c65632c..367c561 100644
 +    cx->z0 = 0.0;
 +    cx->near_on = near_env && (s_gpu.zminmax_control & 0x0F) != 0 && s_gpu.clip_zmin > 0.0f;
 +    if (cx->near_on) {
-+        const float k2 = nv2a_vsh_constant(58)[2], o2 = nv2a_vsh_constant(59)[2];
++        float kk[3], oo[3], k2, o2;
++        xf_viewport(kk, oo);
++        k2 = kk[2]; o2 = oo[2];
 +        if (cx->zp)
 +            cx->z0 = s_gpu.clip_zmin;
 +        else if (k2 > 0.0f)
@@ -10130,6 +10401,18 @@ index c65632c..367c561 100644
 +    if (area == 0.0f || area != area) {
 +        if (area != area) s_gpu.xf_nan++;
 +        s_gpu.xf_degenerate++;
++        if (s_xf_inclip) {
++            static int budget = -1;
++            if (budget < 0) {
++                const char *e = getenv("RECOMP_GPU_DEGEN_LOG");
++                budget = e ? atoi(e) : 0;
++            }
++            if (budget > 0 && s_ftrace == 2) {
++                budget--;
++                fprintf(stderr, "[XF] degenerate clip piece: area %g | a %g %g %g %g | b %g %g %g %g | c %g %g %g %g%c",
++                        area, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], c[0], c[1], c[2], c[3], 10);
++            }
++        }
 +        return;
 +    }
 +    if (cx->cull) {
@@ -10225,7 +10508,7 @@ index c65632c..367c561 100644
  
  static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
  {
-@@ -2176,13 +3564,425 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+@@ -2176,13 +3624,425 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
      return nv2a_vsh_run((const float (*)[4])in, out);
  }
  
@@ -10654,7 +10937,7 @@ index c65632c..367c561 100644
      s_gpu.batches_program++;
      s_gpu.verts_program += n;
      if (s_gpu.blend_enable) {
-@@ -2225,10 +4025,11 @@ static void raster_batch_program(void)
+@@ -2225,10 +4085,11 @@ static void raster_batch_program(void)
                              c[0], c[1], c[2], c[3], 10);
                  }
              }
@@ -10669,7 +10952,7 @@ index c65632c..367c561 100644
          }
      }
      for (i = 0; i < NV2A_VSH_INPUTS; i++) {
-@@ -2243,15 +4044,47 @@ static void raster_batch_program(void)
+@@ -2243,15 +4104,47 @@ static void raster_batch_program(void)
      }
      if (s_gpu.texs[0].valid)
          note_texture_use();
@@ -10718,7 +11001,7 @@ index c65632c..367c561 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -2271,6 +4104,7 @@ static void raster_batch_program(void)
+@@ -2271,6 +4164,7 @@ static void raster_batch_program(void)
          }
          break;
      default:
@@ -10726,7 +11009,7 @@ index c65632c..367c561 100644
          break;
      }
  }
-@@ -2280,8 +4114,11 @@ static void raster_batch(void)
+@@ -2280,8 +4174,11 @@ static void raster_batch(void)
      uint32_t i;
      uint32_t before = s_gpu.tris_drawn;
  
@@ -10739,7 +11022,7 @@ index c65632c..367c561 100644
      static int no_vsh = -1;
      if (no_vsh < 0)
          no_vsh = getenv("RECOMP_NO_VSH") != NULL;
-@@ -2348,6 +4185,7 @@ static void raster_batch(void)
+@@ -2348,6 +4245,7 @@ static void raster_batch(void)
          }
          break;
      default:
@@ -10747,7 +11030,7 @@ index c65632c..367c561 100644
          break;                             /* points and lines: not yet */
      }
  
-@@ -2377,12 +4215,64 @@ static void raster_batch(void)
+@@ -2377,12 +4275,64 @@ static void raster_batch(void)
   * blend and depth state, and how many pixels it actually wrote. "The frame
   * is black" has many causes and this is what tells them apart. */
  
@@ -10813,7 +11096,7 @@ index c65632c..367c561 100644
          return;
      if (s_ftrace == 3) {
          /* Deleting the flag file re-arms the trace for the next time it
-@@ -2395,6 +4285,19 @@ static void frame_trace_flip(void)
+@@ -2395,6 +4345,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -10833,7 +11116,7 @@ index c65632c..367c561 100644
          s_ftrace = 3;
          fprintf(stderr, "[FTRACE] end of frame\n");
          return;
-@@ -2417,7 +4320,12 @@ static void draw_primitive(void)
+@@ -2417,7 +4380,12 @@ static void draw_primitive(void)
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
@@ -10847,7 +11130,7 @@ index c65632c..367c561 100644
          fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
      s_gpu.verts += s_gpu.idx_count;
  
-@@ -2440,8 +4348,22 @@ static void draw_primitive(void)
+@@ -2440,8 +4408,22 @@ static void draw_primitive(void)
      {
          uint32_t t0 = s_gpu.tris_drawn;
          uint64_t p0 = s_gpu.pixels;
@@ -10870,7 +11153,7 @@ index c65632c..367c561 100644
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
                      " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
-@@ -2455,6 +4377,27 @@ static void draw_primitive(void)
+@@ -2455,6 +4437,27 @@ static void draw_primitive(void)
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                      s_gpu.tris_drawn - t0,
                      (unsigned long long)(s_gpu.pixels - p0));
@@ -10898,7 +11181,7 @@ index c65632c..367c561 100644
              if ((s_gpu.xf_mode & 3) == 2)
                  fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                          s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
-@@ -2489,9 +4432,12 @@ static void draw_primitive(void)
+@@ -2489,9 +4492,12 @@ static void draw_primitive(void)
          }
      }
  
@@ -10914,7 +11197,7 @@ index c65632c..367c561 100644
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
                              " off 0x%08X type %u size %u stride %u\n",
                      s_gpu.prim, s_gpu.idx_count, s_gpu.attr[0].offset,
-@@ -2607,6 +4553,9 @@ static void draw_inline_array(void)
+@@ -2607,6 +4613,9 @@ static void draw_inline_array(void)
          case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
          case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
          case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
@@ -10924,7 +11207,7 @@ index c65632c..367c561 100644
          default: bytes = 4 * s_gpu.attr[a].size;   break;
          }
          s_gpu.attr[a].offset = off;
-@@ -2617,6 +4566,22 @@ static void draw_inline_array(void)
+@@ -2617,6 +4626,22 @@ static void draw_inline_array(void)
          goto out;
  
      count = (s_gpu.inline_count * 4) / vsize;
@@ -10947,7 +11230,7 @@ index c65632c..367c561 100644
      if (count < 3 || count > NV_MAX_INDICES)
          goto out;
      for (a = 0; a < NV_VERTEX_ATTRS; a++)
-@@ -2840,6 +4805,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2840,6 +4865,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
      case NV097_SET_TEXTURE_CONTROL1:
          t->pitch = param >> 16;          /* linear formats only */
          break;
@@ -10957,7 +11240,7 @@ index c65632c..367c561 100644
      case NV097_SET_TEXTURE_IMAGE_RECT:
          t->width  = param >> 16;
          t->height = param & 0xFFFF;
-@@ -2851,12 +4819,370 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2851,12 +4879,370 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          break;
      }
      tex_update_valid(t);
@@ -11328,7 +11611,7 @@ index c65632c..367c561 100644
      static int inited;
      if (!inited) {
          inited = 1;
-@@ -2956,6 +5282,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2956,6 +5342,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          s_gpu.rc_seen = 1;
          break;
      case 0x1E70: s_gpu.rc.stage_program = param; break;
@@ -11338,7 +11621,7 @@ index c65632c..367c561 100644
      case 0x17F8: s_gpu.clip_plane_mode = param; break;
  
      /* Alpha test and fog. */
-@@ -2967,8 +5296,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2967,8 +5356,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x029C: s_gpu.fog_mode = param; break;
      case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
@@ -11351,7 +11634,7 @@ index c65632c..367c561 100644
          break;
      case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
          s_gpu.zpass_enable = param;
-@@ -2980,12 +5313,54 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2980,12 +5373,54 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
           * starts the slot at 0xFFFFFFFF) sees every test incomplete. Burnout
           * 3 culls its world with these, so the race's main view drew only
           * the sky while the cube-map passes, which do not test, drew it all.
@@ -11410,7 +11693,7 @@ index c65632c..367c561 100644
          memset(mem + at + 12, 0, 4);
          break;
      }
-@@ -3004,8 +5379,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3004,8 +5439,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -11429,7 +11712,7 @@ index c65632c..367c561 100644
          break;
  
      case NV097_SET_BEGIN_END:
-@@ -3052,19 +5435,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3052,19 +5495,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  
          if (!s_gpu.prim)
              break;
@@ -11486,7 +11769,7 @@ index c65632c..367c561 100644
      case NV097_SET_FLIP_READ:
          if (s_ftrace == 2)
              fprintf(stderr, "[FTRACE] P_READ %u%c", param, 10);
-@@ -3087,6 +5502,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3087,6 +5562,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                           : s_gpu.flip_write + 1;
          s_gpu.flips++;
          frame_trace_flip();
@@ -11494,7 +11777,7 @@ index c65632c..367c561 100644
          return;
  
      case NV097_FLIP_STALL:
-@@ -3096,9 +5512,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3096,9 +5572,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* The stall ends when the buffer being read is the one just finished.
           * There is no scanout here to wait for, so that is now. */
          s_gpu.flip_read = s_gpu.flip_write;
@@ -11506,7 +11789,7 @@ index c65632c..367c561 100644
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -3119,6 +5537,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3119,6 +5597,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -11530,7 +11813,7 @@ index c65632c..367c561 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-@@ -3146,6 +5581,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3146,6 +5641,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -11539,7 +11822,7 @@ index c65632c..367c561 100644
  
          if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
              static unsigned n;
-@@ -3177,12 +5614,45 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3177,12 +5674,45 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  
      /* Depth. */
      case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
@@ -11585,7 +11868,7 @@ index c65632c..367c561 100644
          if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
              s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
              break;
-@@ -3443,12 +5913,46 @@ void nv2a_pb_exec_report(void)
+@@ -3443,12 +5973,46 @@ void nv2a_pb_exec_report(void)
              s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
      /* One picture per report rather than per clear: a title clears hundreds of
       * times a second and nobody wants that many files. */
@@ -11634,14 +11917,16 @@ index c65632c..367c561 100644
      fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
      fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
                      " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
-@@ -3460,8 +5964,28 @@ void nv2a_pb_exec_report(void)
+@@ -3460,8 +6024,30 @@ void nv2a_pb_exec_report(void)
              s_gpu.tris_drawn, s_gpu.batches_untransformed,
              s_gpu.tris_skipped_offscreen);
      fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
 -                    " %u triangles dropped behind the eye\n",
 -            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
-+                    " %u triangles dropped behind the eye (%u near-clip pieces lost)\n",
-+            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind, s_gpu.clip_lost);
++                    " %u triangles dropped behind the eye (%u near-clip pieces lost;"
++                    " %u viewport lookups found c[58] unusable: unit map used)\n",
++            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind, s_gpu.clip_lost,
++            s_gpu.clip_vp_fixed);
 +    fprintf(stderr, "[GPU]   indices: longest batch %u, %u batches over 4096 (%llu indices"
 +                    " past it), %u odd tails (ARRAY_ELEMENT32), %u batches drawn in"
 +                    " pieces, %u indices lost; %u triangles face-culled; %u NaN\n",
@@ -11665,7 +11950,7 @@ index c65632c..367c561 100644
      fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
                      " %u drawn; pixels %llu written, %llu depth-failed;"
                      " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
-@@ -3471,6 +5995,28 @@ void nv2a_pb_exec_report(void)
+@@ -3471,6 +6057,28 @@ void nv2a_pb_exec_report(void)
              s_gpu.xf_min[0], s_gpu.xf_max[0], s_gpu.xf_min[1], s_gpu.xf_max[1],
              s_gpu.xf_min[2], s_gpu.xf_max[2]);
      {
