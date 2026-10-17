@@ -1,6 +1,7 @@
 # Open Live for Open Halo 2: design
 
-Status: design only, 2026-10-16. Nothing here is implemented. Roadmap item "Live HLE" in
+Status 2026-10-17: implemented on the native build up to M5 (see "Implementation status"
+at the end). Roadmap item "Live HLE" in
 `C:/Users/andre/.claude/plans/wild-squishing-haven.md` (after P2P online system link).
 
 Owner's goal: "a proper Xbox Live experience that costs me nothing for server infrastructure".
@@ -572,3 +573,41 @@ all-or-nothing stretch (DNS, Kerberos, SG, xmatch) before the first menu reacts.
 * The presence blob: 0xFCF1 signature, time byte and flags byte, decoded in
   `online_friends.cpp` 0x8D230. Halo 2 friends lists show "in lobby, 12 minutes" from it.
 * Whether XNet accepts our kid while "not logged on" (M4a).
+
+---
+
+## Implementation status (2026-10-17, native build)
+
+Switches: `RECOMP_OPEN_LIVE=1` (ini `open_live = 1`) answers the API; off, the wrappers call
+the title's own library (no behaviour change). `RECOMP_XO_TRACE=1` traces either path.
+`RECOMP_OL_GAMERTAG` / ini `gamertag` names the first local account (`openlive.json`).
+
+| Part | Where | State |
+|---|---|---|
+| Hooks (111 entry points) | `h2lift/xo_hle_pass.py` (run by `tools/relift.sh`), `port/xr/src/openlive.c` | done; the web build keeps the direct calls until it links openlive*.c |
+| Sign-in, tasks, stats (empty), arbitration (accepted) | `openlive_api.c` | done |
+| Title storage (our MOTD, our playlists) | `openlive_api.c`, `tools/ol_storage.py` | done; network configuration and bungienet user file not served (title defaults) |
+| Facilitator (hold/visit rooms on the relay) | `net/olive.c` | done, native only (no `olive.js`) |
+| Multi-room mesh | `net/h2net.c` (`h2net_init/join/leave`) | done |
+| Matchmaking, QoS, session mesh | `openlive_match.c` | done: Quickmatch/Optimatch find, join and start a match |
+| Friends, presence, requests, invites, join friend, custom games | `openlive_friends.c` | done except the invite icon/accept path (joining works through presence) |
+| Clans, messages | `openlive_friends.c` | no service: clans none (create is a silent no-op), messages dropped |
+
+Differences from the design above, found by measurement:
+* Discovery uses private bucket rooms `h2q9809-<playlist>-<shard>` that every advertising host
+  holds, not `pub-` rooms: the relay's public directory is listed by Skate 3's room browser.
+* The mesh room is named after every key the title registers (`h2s-<kid>`), not the Live
+  session id: the joiner registers the host's network session key taken from the QoS data.
+* The title marks Live session ids as online-peer ids (0x7A8D7 sets bit 7 of byte 0); XNet then
+  refuses the plain address (WSAEINVAL). The hooks hand the title's XNet unmarked copies.
+* Matchmaking needs stats (six values per playlist, 0x74AA0) and a successful arbitration
+  registration (or the match ends); both are answered locally.
+
+Evidence: `D:/n64work/halo2/reports/openlive/` (M1_signin_sheet, M2_storage_sheet,
+M4_duel_match_started, M4_postrelift_joined, M5_friend_request, M5_friends_presence,
+M5_party_joined, M5_custom_game_started). Rigs: `tools/ol_boot.sh`, `ol_pair.sh`,
+`ol_tolive.sh`, `ol_keys.sh`, `ol_mainrow.sh`, `ol_kill.sh`.
+
+Not done: M6 (squad matchmaking, more than 10 players per session room, host migration
+test), the rest of M7 (Content Download launches the downloader and was not pressed), M8
+(web parity, NAT test, two real networks).
