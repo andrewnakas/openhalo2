@@ -17,6 +17,6 @@ for i in 1 2 3 4 5 6 7 8; do
   echo "a:500" >> "$OUT/pad.txt"; sleep 13
 done
 sleep ${MPLOAD:-45}
-tasklist 2>/dev/null | grep -q halo2_recomp || { echo "died during map load"; exit 1; }
+tasklist 2>/dev/null | grep -q "${EXE:-halo2_recomp.exe}" || { echo "died during map load"; exit 1; }
 echo "MARK mpgame at t=$SECONDS" >> "$OUT/marks.txt"
 echo "in map: $(grep -a 'fps (' "$OUT/out.log" | tail -1)"

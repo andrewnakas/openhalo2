@@ -3930,10 +3930,10 @@ index 8abfc5f..307b818 100644
  /* One pixel. Colours are r,g,b,a in [0,1]; `fog` is (fog colour, factor).
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..db14f35
+index 0000000..34011d4
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,3941 @@
+@@ -0,0 +1,3996 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor. See nv2a_gl.h.
 + *
@@ -5059,6 +5059,69 @@ index 0000000..db14f35
 +    b->supported = 0;
 +}
 +
++/* One image of t into buf: nv2a_exec_decode_image (whole rows), or texel by
++ * texel through the sampler as before (RECOMP_GL_TEXFAST=0). RECOMP_GL_TEXCHECK=1
++ * decodes both ways and reports any texel that differs. */
++static void tex_decode_image(const Nv2aTexture *t, uint32_t face_offset,
++                             uint32_t w, uint32_t h, uint32_t *buf)
++{
++    static int fast = -1, check;
++    uint32_t x, y;
++    if (fast < 0) {
++        const char *e = getenv("RECOMP_GL_TEXFAST");
++        fast = !(e && *e == '0');
++        check = getenv("RECOMP_GL_TEXCHECK") != NULL;
++    }
++    if (fast && nv2a_exec_decode_image(t, face_offset, w, h, buf)) {
++        if (check) {
++            /* A texture the title rewrites while it is read (the game thread
++             * runs beside the executor) can differ between two reads of
++             * either kind; such an image is decoded both ways again and only
++             * a difference that stays is counted as one. */
++            static unsigned long long images, texels, bad, bad_images, moving;
++            uint64_t before = bad;
++            int pass;
++            for (pass = 0; pass < 2; pass++) {
++                uint64_t diff = 0;
++                uint32_t *again = NULL;
++                if (pass) {
++                    again = (uint32_t *)malloc(sizeof *again * (size_t)w * h);
++                    if (!again || !nv2a_exec_decode_image(t, face_offset, w, h, again))
++                        break;
++                }
++                for (y = 0; y < h; y++)
++                    for (x = 0; x < w; x++) {
++                        uint32_t ref;
++                        if (!nv2a_exec_sample_tex(t, face_offset, x, y, &ref))
++                            ref = 0xFFFFFFFFu;
++                        if (ref != (pass ? again : buf)[(size_t)y * w + x])
++                            diff++;
++                    }
++                free(again);
++                if (!diff)
++                    break;
++                if (pass)
++                    bad += diff;
++                else
++                    moving++;
++            }
++            texels += (uint64_t)w * h;
++            images++;
++            if (bad != before && ++bad_images <= 10)
++                fprintf(stderr, "  [GL] TEXCHECK: format %02X %ux%u differs%c", t->color, w, h, 10);
++            if ((images & (images - 1)) == 0 && images >= 64)
++                fprintf(stderr, "  [GL] TEXCHECK: %llu images, %llu texels, %llu differ"
++                                " (%llu images differed at first and were read again)%c",
++                        images, texels, bad, moving, 10);
++        }
++        return;
++    }
++    for (y = 0; y < h; y++)
++        for (x = 0; x < w; x++)
++            if (!nv2a_exec_sample_tex(t, face_offset, x, y, &buf[(size_t)y * w + x]))
++                buf[(size_t)y * w + x] = 0xFFFFFFFFu;
++}
++
 +static void tex_decode_upload(GlTexEntry *e, const Nv2aTexture *t)
 +{
 +    uint32_t w = t->width, h = t->height, x, y, f, faces = t->cube ? 6 : 1;
@@ -5081,11 +5144,7 @@ index 0000000..db14f35
 +    }
 +    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 +    for (f = 0; f < faces; f++) {
-+        for (y = 0; y < h; y++)
-+            for (x = 0; x < w; x++)
-+                if (!nv2a_exec_sample_tex(t, f * stride, x, y,
-+                                          &buf[(size_t)y * w + x]))
-+                    buf[(size_t)y * w + x] = 0xFFFFFFFFu;
++        tex_decode_image(t, f * stride, w, h, buf);
 +        px_swap(buf, (size_t)w * h);
 +        glTexImage2D(t->cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f : GL_TEXTURE_2D,
 +                     0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_BGRA,
@@ -5131,11 +5190,7 @@ index 0000000..db14f35
 +                lt.width = lw; lt.height = lh;
 +                lt.offset = t->offset + lvoff;
 +                for (f = 0; f < faces; f++) {
-+                    for (y = 0; y < lh; y++)
-+                        for (x = 0; x < lw; x++)
-+                            if (!nv2a_exec_sample_tex(&lt, f * stride, x, y,
-+                                                      &buf[(size_t)y * lw + x]))
-+                                buf[(size_t)y * lw + x] = 0xFFFFFFFFu;
++                    tex_decode_image(&lt, f * stride, lw, lh, buf);
 +                    px_swap(buf, (size_t)lw * lh);
 +                    glTexImage2D(t->cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f
 +                                         : GL_TEXTURE_2D,
@@ -7877,10 +7932,10 @@ index 0000000..db14f35
 +#endif
 diff --git a/src/kernel/nv2a_gl.h b/src/kernel/nv2a_gl.h
 new file mode 100644
-index 0000000..cd6c2b0
+index 0000000..3ecfc77
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.h
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,165 @@
 +/**
 + * Hardware pixel backend for the pushbuffer executor (nv2a_pb_exec.c).
 + *
@@ -8039,11 +8094,15 @@ index 0000000..cd6c2b0
 +int      nv2a_exec_sample_tex(const Nv2aTexture *t, uint32_t face_offset,
 +                              uint32_t u, uint32_t v, uint32_t *argb);
 +uint32_t nv2a_exec_tex_face_stride(const Nv2aTexture *t);
++/* Texels (0..w-1, 0..h-1) of t, row by row, as nv2a_exec_sample_tex gives
++ * them one by one (0xFFFFFFFF where it gives none); 0 if t is not sampled. */
++int      nv2a_exec_decode_image(const Nv2aTexture *t, uint32_t face_offset,
++                                uint32_t w, uint32_t h, uint32_t *out);
 +uint32_t nv2a_exec_tex_texel_bytes(uint32_t fmt);
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..012ab70 100644
+index c65632c..313805b 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -37,6 +37,7 @@
@@ -8326,7 +8385,86 @@ index c65632c..012ab70 100644
      if (s_gpu.inline_active) {
          /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
           * the buffered payload rather than a guest address -- and 0 is a legal
-@@ -583,12 +754,18 @@ static uint32_t surface_bpp(void)
+@@ -527,6 +698,78 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
+     }
+ }
+ 
++/* fetch_attr for one attribute of a whole batch: where it reads worked out
++ * once (the batch's array attributes, whose offset is set or which come
++ * from the inline payload), the same conversions. */
++typedef struct {
++    const uint8_t *base;    /* first element (array) or the inline payload */
++    size_t   off, lim;      /* inline: byte offset and payload size        */
++    uint32_t stride, type, size;
++    int      inl;
++} XfFetch;
++
++static void xf_fetch_prepare(const VertexAttr *a, XfFetch *f)
++{
++    f->inl = s_gpu.inline_active;
++    f->stride = a->stride;
++    f->type = a->type;
++    f->size = a->size < 4 ? a->size : 4;
++    f->off = a->offset;
++    f->lim = (size_t)s_gpu.inline_count * 4;
++    f->base = f->inl ? (const uint8_t *)s_gpu.inline_buf
++                     : (const uint8_t *)xbox_GetMemoryOffset() + a->offset;
++}
++
++static __inline void xf_fetch(const XfFetch *f, uint32_t index, float out[4])
++{
++    const uint8_t *p;
++    uint32_t i;
++
++    out[0] = out[1] = out[2] = 0.0f;
++    out[3] = 1.0f;
++    if (f->inl) {
++        size_t at = f->off + (size_t)index * f->stride;
++        if (at + 4 > f->lim)
++            return;
++        p = f->base + at;
++    } else {
++        p = f->base + (size_t)index * f->stride;
++    }
++    switch (f->type) {
++    case 0:                                  /* D3DCOLOR, as B,G,R,A bytes */
++        out[0] = (float)p[2] / 255.0f;
++        out[1] = (float)p[1] / 255.0f;
++        out[2] = (float)p[0] / 255.0f;
++        out[3] = (float)p[3] / 255.0f;
++        return;
++    case 2:
++        for (i = 0; i < f->size; i++)
++            out[i] = ((const float *)p)[i];
++        return;
++    case 4:
++        for (i = 0; i < f->size; i++)
++            out[i] = (float)p[i] / 255.0f;
++        return;
++    case 1:
++        for (i = 0; i < f->size; i++)
++            out[i] = (float)((const int16_t *)p)[i] / 32767.0f;
++        return;
++    case 5:
++        for (i = 0; i < f->size; i++)
++            out[i] = (float)((const int16_t *)p)[i];
++        return;
++    case 6: {
++        uint32_t v = *(const uint32_t *)p;
++        out[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
++        out[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
++        out[2] = (float)((int32_t)v >> 22) / 511.0f;
++        return;
++    }
++    default:
++        return;
++    }
++}
++
+ static uint32_t surface_bpp(void);
+ 
+ static void note_drawn(void)
+@@ -583,12 +826,18 @@ static uint32_t surface_bpp(void)
   * the sequence. */
  static int s_flip_dumping;
  
@@ -8345,7 +8483,7 @@ index c65632c..012ab70 100644
      uint32_t pitch = drawn ? s_gpu.drawn_pitch : s_gpu.pitch;
      uint32_t cx = drawn ? s_gpu.drawn_x : s_gpu.clip_x;
      uint32_t cy = drawn ? s_gpu.drawn_y : s_gpu.clip_y;
-@@ -649,6 +826,11 @@ static void dump_surface_bmp(void)
+@@ -649,6 +898,11 @@ static void dump_surface_bmp(void)
          }
      }
      fclose(f);
@@ -8357,7 +8495,7 @@ index c65632c..012ab70 100644
      if (seq == 1)
          fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
                  path, w, h, s_gpu.color_offset, bpp);
-@@ -659,6 +841,7 @@ static void dump_surface_bmp(void)
+@@ -659,6 +913,7 @@ static void dump_surface_bmp(void)
  static void raster_triangle(const float a[2], const float b[2],
                              const float c[2], uint32_t argb,
                              const float uv[3][2]);
@@ -8365,7 +8503,7 @@ index c65632c..012ab70 100644
  
  static void clear_surface(uint32_t param)
  {
-@@ -679,13 +862,63 @@ static void clear_surface(uint32_t param)
+@@ -679,13 +934,63 @@ static void clear_surface(uint32_t param)
          s_gpu.color_base = base;
      }
  
@@ -8432,7 +8570,7 @@ index c65632c..012ab70 100644
          } else if (bpp == 2) {
              /* The clear value is always given as A8R8G8B8; a 16-bit surface
               * takes the same colour reduced to 5:6:5. */
-@@ -693,7 +926,7 @@ static void clear_surface(uint32_t param)
+@@ -693,7 +998,7 @@ static void clear_surface(uint32_t param)
                                    | ((s_gpu.clear_color >> 5) & 0x07E0)
                                    | ((s_gpu.clear_color >> 3) & 0x001F));
              uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
@@ -8441,7 +8579,7 @@ index c65632c..012ab70 100644
                  p[x] = v;
          }
      }
-@@ -701,7 +934,7 @@ static void clear_surface(uint32_t param)
+@@ -701,7 +1006,7 @@ static void clear_surface(uint32_t param)
      /* Progress markers, interleaved with everything else in the log. The
       * summary says drawing stopped; only a marker next to the surrounding
       * activity says what the title was doing when it stopped. */
@@ -8450,7 +8588,7 @@ index c65632c..012ab70 100644
          fprintf(stderr, "  [GPU] clear #%u\n", s_gpu.clears);
      /* Distinct clear colours actually used. "Cleared to black" and "the clear
       * never ran" look identical in the framebuffer, and only one of them is a
-@@ -854,6 +1087,11 @@ static uint32_t linear_twin(uint32_t fmt)
+@@ -854,6 +1159,11 @@ static uint32_t linear_twin(uint32_t fmt)
  {
      switch (fmt) {
      case 0x00: return 0x13;                /* L8        -> LIN_L8        */
@@ -8462,7 +8600,33 @@ index c65632c..012ab70 100644
      case 0x02: return 0x10;                /* A1R5G5B5  -> LIN_A1R5G5B5  */
      case 0x03: return 0x1C;                /* X1R5G5B5  -> LIN_X1R5G5B5  */
      case 0x04: return 0x1D;                /* A4R4G4B4  -> LIN_A4R4G4B4  */
-@@ -1006,6 +1244,20 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -865,6 +1175,9 @@ static uint32_t linear_twin(uint32_t fmt)
+     }
+ }
+ 
++static __inline int tex_convert(const Texture *t, const uint8_t *mem, uint32_t fmt,
++                                const uint8_t *p, uint32_t u, uint32_t *argb);
++
+ /* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
+ static int sample_tex(const Texture *t, uint32_t face_offset,
+                       uint32_t u, uint32_t v, uint32_t *argb)
+@@ -922,7 +1235,15 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+     } else {
+         p = mem + base + (size_t)v * t->pitch;
+     }
++    return tex_convert(t, mem, fmt, p, u, argb);
++}
+ 
++/* Texel u of the row (linear) or image (swizzled, Morton index) at p, in
++ * format fmt (a swizzled format's linear twin): sample_tex's conversions,
++ * shared with nv2a_exec_decode_image. */
++static __inline int tex_convert(const Texture *t, const uint8_t *mem, uint32_t fmt,
++                                const uint8_t *p, uint32_t u, uint32_t *argb)
++{
+     switch (fmt) {
+ 
+     /* 32-bit, alpha-red-green-blue in the dword. */
+@@ -1006,6 +1327,20 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
      case 0x1F:                                      /* LIN_A8 */
          *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
          return 1;
@@ -8483,7 +8647,134 @@ index c65632c..012ab70 100644
  
      /* 4:2:2 packed YUV, two texels per four bytes.
       *
-@@ -1245,6 +1497,55 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
+@@ -1048,6 +1383,126 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+     return sample_tex(&s_gpu.texs[0], 0, u, v, argb);
+ }
+ 
++/* d3d8_dxt_decode_texel for all sixteen texels of the block at b: the same
++ * arithmetic with the endpoints and palette worked out once. */
++static void dxt_decode_block(const uint8_t *b, uint32_t fmt, uint32_t px[16])
++{
++    const uint32_t block_bytes = d3d8_format_dxt_block_bytes(fmt);
++    uint32_t alpha[16], c[4], c0, c1, i, idx;
++
++    for (i = 0; i < 16; i++)
++        alpha[i] = 255u;
++    if (block_bytes == 16) {
++        if (fmt == 0x0E) {
++            for (i = 0; i < 16; i++) {
++                uint32_t nib = b[i >> 1];
++                alpha[i] = d3d8_expand_channel((i & 1u) ? (nib >> 4) : (nib & 0x0Fu), 4);
++            }
++        } else {
++            uint32_t a0 = b[0], a1 = b[1], a[8];
++            uint64_t bits = 0;
++            for (i = 0; i < 6; i++)
++                bits |= (uint64_t)b[2 + i] << (8 * i);
++            a[0] = a0; a[1] = a1;
++            if (a0 > a1)
++                for (i = 1; i < 7; i++)
++                    a[i + 1] = ((7 - i) * a0 + i * a1) / 7;
++            else {
++                for (i = 1; i < 5; i++)
++                    a[i + 1] = ((5 - i) * a0 + i * a1) / 5;
++                a[6] = 0; a[7] = 255;
++            }
++            for (i = 0; i < 16; i++)
++                alpha[i] = a[(uint32_t)((bits >> (3 * i)) & 7u)];
++        }
++        b += 8;
++    }
++    c0 = (uint32_t)b[0] | ((uint32_t)b[1] << 8);
++    c1 = (uint32_t)b[2] | ((uint32_t)b[3] << 8);
++    for (i = 0; i < 2; i++) {
++        uint32_t rgb = i ? c1 : c0;
++        c[i] = (d3d8_expand_channel((rgb >> 11) & 0x1Fu, 5) << 16)
++             | (d3d8_expand_channel((rgb >>  5) & 0x3Fu, 6) <<  8)
++             |  d3d8_expand_channel( rgb        & 0x1Fu, 5);
++    }
++    c[2] = c[3] = 0;
++    if (c0 > c1 || block_bytes == 16) {
++        for (i = 0; i < 3; i++) {
++            uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
++            c[2] = (c[2] & ~(0xFFu << sh)) | (((2 * m0 + m1) / 3) << sh);
++            c[3] = (c[3] & ~(0xFFu << sh)) | (((m0 + 2 * m1) / 3) << sh);
++        }
++    } else {
++        for (i = 0; i < 3; i++) {
++            uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
++            c[2] = (c[2] & ~(0xFFu << sh)) | (((m0 + m1) / 2) << sh);
++        }
++        c[3] = 0;
++    }
++    idx = (uint32_t)b[4] | ((uint32_t)b[5] << 8) | ((uint32_t)b[6] << 16)
++        | ((uint32_t)b[7] << 24);
++    for (i = 0; i < 16; i++) {
++        uint32_t k = (idx >> (2 * i)) & 3u, al = alpha[i];
++        if (block_bytes == 8 && c0 <= c1 && k == 3)
++            al = 0;
++        px[i] = (al << 24) | (c[k] & 0x00FFFFFFu);
++    }
++}
++
++/* Texels (0..w-1, 0..h-1) of t, row by row, exactly as sample_tex returns
++ * them one at a time (0xFFFFFFFF where it returns nothing): the GL
++ * backend's texture uploads. Sampling texel by texel -- wrap, format tests,
++ * a Morton index or a block-cache probe for every texel -- had uploads at
++ * up to 2.3 s of a 5 s interval while Cairo's cinematic streams textures.
++ * Returns 0 when t is not sampled at all. */
++int nv2a_exec_decode_image(const Nv2aTexture *t, uint32_t face_offset,
++                           uint32_t w, uint32_t h, uint32_t *out)
++{
++    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++    const uint32_t base = t->offset + face_offset;
++    uint32_t fmt = t->color, x, y;
++
++    if (!t->valid || w > t->width || h > t->height)
++        return 0;
++    if (d3d8_format_dxt_block_bytes(fmt)) {
++        const uint32_t bb = d3d8_format_dxt_block_bytes(fmt), bw = (t->width + 3) >> 2;
++        uint32_t bx, by, px[16], i;
++        for (by = 0; by < (h + 3) >> 2; by++)
++            for (bx = 0; bx < (w + 3) >> 2; bx++) {
++                dxt_decode_block(mem + base + ((size_t)by * bw + bx) * bb, fmt, px);
++                for (i = 0; i < 16; i++) {
++                    x = bx * 4 + (i & 3); y = by * 4 + (i >> 2);
++                    if (x < w && y < h)
++                        out[(size_t)y * w + x] = px[i];
++                }
++            }
++        return 1;
++    }
++    if (d3d8_format_is_swizzled(fmt)) {
++        uint32_t mx, my, ox, oy = 0;
++        const uint8_t *p = mem + base;
++        fmt = linear_twin(fmt);
++        xbox_swizzle_masks(t->width, t->height, &mx, &my);
++        for (y = 0; y < h; y++) {
++            ox = 0;
++            for (x = 0; x < w; x++) {
++                if (!tex_convert(t, mem, fmt, p, ox | oy, &out[(size_t)y * w + x]))
++                    out[(size_t)y * w + x] = 0xFFFFFFFFu;
++                ox = (ox - mx) & mx;            /* masked increment */
++            }
++            oy = (oy - my) & my;
++        }
++        return 1;
++    }
++    for (y = 0; y < h; y++) {
++        const uint8_t *p = mem + base + (size_t)y * t->pitch;
++        for (x = 0; x < w; x++)
++            if (!tex_convert(t, mem, fmt, p, x, &out[(size_t)y * w + x]))
++                out[(size_t)y * w + x] = 0xFFFFFFFFu;
++    }
++    return 1;
++}
++
+ /* Write a bound texture out as a BMP, through the sampler rather than around it.
+  *
+  * "Which texture is this" is not answerable from an address and a format, and
+@@ -1245,6 +1700,72 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
      }
  }
  
@@ -8495,10 +8786,27 @@ index c65632c..012ab70 100644
 + * state" rule the software batch queue relies on. */
 +static int s_glq_mode;
 +
++/* RECOMP_XF_CHECK: while s_rec_on, triangles go to s_rec (with their mode)
++ * instead of the GL queue, so two setup paths can be compared. */
++#define XF_REC_MAX (3 * 65536)
++static Nv2aGlVertex *s_rec;
++static int *s_rec_mode;
++static int s_rec_n, s_rec_on, s_rec_over;
++
 +static Nv2aGlVertex *gl_next_tri(int mode)
 +{
 +    Nv2aGlVertex *v;
 +
++    if (s_rec_on) {
++        if (s_rec_n + 3 > XF_REC_MAX) {
++            s_rec_over = 1;
++            return NULL;
++        }
++        s_rec_mode[s_rec_n / 3] = mode;
++        v = &s_rec[s_rec_n];
++        s_rec_n += 3;
++        return v;
++    }
 +    if (nv2a_gl_pending() && mode != s_glq_mode)
 +        nv2a_pb_exec_flush();
 +    s_glq_mode = mode;
@@ -8539,7 +8847,7 @@ index c65632c..012ab70 100644
  /* Half-space fill. Barycentric edge functions rather than scanline slopes:
   * the same test decides both windings, so a title that emits clockwise
   * triangles does not silently render nothing. */
-@@ -1285,6 +1586,15 @@ static void raster_triangle(const float a[2], const float b[2],
+@@ -1285,6 +1806,15 @@ static void raster_triangle(const float a[2], const float b[2],
          return;
      }
  
@@ -8555,7 +8863,7 @@ index c65632c..012ab70 100644
      for (y = miny; y < maxy; y++) {
          for (x = minx; x < maxx; x++) {
              float px = (float)x + 0.5f, py = (float)y + 0.5f;
-@@ -1620,9 +1930,12 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+@@ -1620,9 +2150,12 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
  {
      switch (fmt) {
      case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
@@ -8569,7 +8877,7 @@ index c65632c..012ab70 100644
          return 2;
      default:
          return 4;
-@@ -1702,14 +2015,17 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
+@@ -1702,14 +2235,17 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
          return 1;
      case 1: case 2:                               /* PROJECT2D / 3D */
          rc_texel(t, 0, c[0] / q, c[1] / q, out);
@@ -8589,7 +8897,7 @@ index c65632c..012ab70 100644
          }
          if (ax >= ay && ax >= az) {
              face = x > 0 ? 0 : 1; ma = ax; sc = x > 0 ? -z : z; tc = -y;
-@@ -1785,6 +2101,133 @@ static int alpha_test_pass(float a)
+@@ -1785,6 +2321,133 @@ static int alpha_test_pass(float a)
      }
  }
  
@@ -8723,7 +9031,7 @@ index c65632c..012ab70 100644
  /* Everything a triangle's pixels need, computed once per triangle, so the
   * pixel loop can run over any subset of rows on any thread. */
  typedef struct {
-@@ -1794,7 +2237,10 @@ typedef struct {
+@@ -1794,7 +2457,10 @@ typedef struct {
      const float *a, *b, *c;
      float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
      float *zb;
@@ -8734,7 +9042,7 @@ index c65632c..012ab70 100644
  } XfTri;
  
  typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
-@@ -1819,7 +2265,16 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -1819,7 +2485,16 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                  continue;
              /* w1 is opposite a, w2 opposite b, w0 opposite c. */
              l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
@@ -8752,7 +9060,7 @@ index c65632c..012ab70 100644
              {
                  float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
                  int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
-@@ -1904,12 +2359,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -1904,12 +2579,43 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -8796,7 +9104,7 @@ index c65632c..012ab70 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -1919,7 +2405,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -1919,7 +2625,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -8811,11 +9119,23 @@ index c65632c..012ab70 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -1985,12 +2477,97 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -1985,25 +2697,204 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
  }
  #endif
  
 +/* Rasterise everything queued. */
++/* [XF] report line: where the executor's time goes in program batches --
++ * fetching + running the vertex program, triangle setup (clip, cull, GL
++ * queue), and the GL flushes setup triggers -- per report interval. */
++static uint64_t s_xp_xform, s_xp_setup, s_xp_flush, s_xp_verts, s_xp_idx, s_xp_batches;
++static uint64_t s_xp_xform_last, s_xp_mt;
++static uint64_t xp_now(void)
++{
++    LARGE_INTEGER q;
++    QueryPerformanceCounter(&q);
++    return (uint64_t)q.QuadPart;
++}
++
 +void nv2a_pb_exec_flush(void)
 +{
 +    XfCount total = {0, 0, 0};
@@ -8824,10 +9144,12 @@ index c65632c..012ab70 100644
 +    if (nv2a_gl_pending()) {
 +        Nv2aGlState st;
 +        uint32_t zpass = 0;
++        uint64_t t0 = xp_now();
 +        gl_fill_state(&st, s_glq_mode);
 +        nv2a_gl_draw(&st, &zpass);
 +        if (!nv2a_gl_verify())             /* else the software path counts */
 +            s_gpu.zpass_count += zpass;
++        s_xp_flush += xp_now() - t0;
 +    }
 +    if (!s_xfq_n)
 +        return;
@@ -8899,6 +9221,42 @@ index c65632c..012ab70 100644
 +}
 +static int s_xf_flip;       /* odd triangle of a strip: its winding is reversed */
 +
++/* RECOMP_XF_FAST=0: the setup paths as they were before the fast paths below
++ * (2026-10-17): every triangle through the software rasteriser's full setup
++ * even when only the GL backend draws, the clip test redone from the state
++ * per triangle, shared vertices copied per index. The fast paths queue the
++ * same GL vertices and count the same statistics. */
++static int s_xf_force_slow;     /* RECOMP_XF_CHECK: the reference pass */
++static int xf_check_on(void)
++{
++    static int on = -1;
++    if (on < 0)
++        on = getenv("RECOMP_XF_CHECK") != NULL;
++    return on;
++}
++static int xf_fast(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_XF_FAST");
++        on = !(e && *e == '0');
++    }
++    return on;
++}
++
++/* (int)floorf(x) and (int)ceilf(x) for |x| <= 2^20 (xf_bound's range), where
++ * the float-to-int truncation is exact. */
++static __inline int xf_ifloor(float x)
++{
++    int t = (int)x;
++    return (float)t > x ? t - 1 : t;
++}
++static __inline int xf_iceil(float x)
++{
++    int t = (int)x;
++    return (float)t < x ? t + 1 : t;
++}
++
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                 const Nv2aVshOutput *vc)
  {
@@ -8909,7 +9267,22 @@ index c65632c..012ab70 100644
      const float *a, *b, *c;
      float area, su = 1.0f, sv = 1.0f;
      int k;
-@@ -2004,6 +2581,42 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     static int no_rc = -1;
+ 
++    int gl_only;
++
+     if (no_rc < 0)
+         no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+-    memset(&T, 0, sizeof T);
++    /* Only the GL backend draws (no software verify): the software
++     * rasteriser's per-triangle setup (texel coordinates, combiner inputs,
++     * depth buffer, edge setup) is never used, and the fast path below skips
++     * it. */
++    gl_only = xf_fast() && !s_xf_force_slow && nv2a_gl_active() && !nv2a_gl_verify();
++    if (!gl_only)
++        memset(&T, 0, sizeof T);
+     T.mem = (uint8_t *)xbox_GetMemoryOffset();
+     T.bpp = surface_bpp();
      T.textured = s_gpu.texs[0].valid;
      T.use_rc = s_gpu.rc_seen && !no_rc;
      T.va = va; T.vb = vb; T.vc = vc;
@@ -8952,7 +9325,7 @@ index c65632c..012ab70 100644
  
      v[0] = va; v[1] = vb; v[2] = vc;
      a = va->pos; b = vb->pos; c = vc->pos;
-@@ -2012,13 +2625,88 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2012,13 +2903,88 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          return;
      if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
          s_gpu.tris_behind++;
@@ -9041,17 +9414,69 @@ index c65632c..012ab70 100644
      for (k = 0; k < 3; k++) {
          if (!s_gpu.xf_seeded)
              s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
-@@ -2028,7 +2716,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2028,12 +2994,55 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_seeded = 1;
      if (!surface_begin_batch(T.mem))
          return;
 -    if (s_gpu.depth_test || s_gpu.depth_mask)
+-        T.zb = zbuf_current(1);
+-    if (tex_size_from_format(s_gpu.texs[0].color)) {
+-        su = (float)s_gpu.texs[0].width;
+-        sv = (float)s_gpu.texs[0].height;
+-    }
++    if (gl_only) {
++        /* The slow path's bounds, scissor rejection and GL vertices, exactly:
++         * x and y are not NaN here (a NaN would have made `area` NaN), so
++         * plain compares are fminf/fmaxf, and xf_bound keeps the values in
++         * the range where xf_ifloor/xf_iceil are floorf/ceilf. */
++        int shade, minx, maxx, miny, maxy;
++        float lo, hi;
++        Nv2aGlVertex *g;
++        lo = b[0] < c[0] ? b[0] : c[0]; lo = a[0] < lo ? a[0] : lo;
++        hi = b[0] > c[0] ? b[0] : c[0]; hi = a[0] > hi ? a[0] : hi;
++        minx = xf_ifloor(xf_bound(lo)); maxx = xf_iceil(xf_bound(hi));
++        lo = b[1] < c[1] ? b[1] : c[1]; lo = a[1] < lo ? a[1] : lo;
++        hi = b[1] > c[1] ? b[1] : c[1]; hi = a[1] > hi ? a[1] : hi;
++        miny = xf_ifloor(xf_bound(lo)); maxy = xf_iceil(xf_bound(hi));
++        if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
++        if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
++        if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
++        if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
++        if (maxx > NV_ZBUF_W) maxx = NV_ZBUF_W;
++        if (maxy > NV_ZBUF_H) maxy = NV_ZBUF_H;
++        if (minx >= maxx || miny >= maxy) {
++            s_gpu.tris_skipped_offscreen++;
++            s_gpu.xf_offscreen++;
++            return;
++        }
++        s_gpu.xf_drawn++;
++        shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
++        g = gl_next_tri(!shade ? NV2A_GL_MODE_DEPTH
++                        : T.use_rc ? NV2A_GL_MODE_RC : NV2A_GL_MODE_XF);
++        if (g) {
++            for (k = 0; k < 3; k++) {
++                memcpy(g[k].pos, v[k]->pos, sizeof g[k].pos);
++                memcpy(g[k].d0, v[k]->d0, sizeof g[k].d0);
++                memcpy(g[k].d1, v[k]->d1, sizeof g[k].d1);
++                memcpy(g[k].tex, v[k]->tex, sizeof g[k].tex);
++                g[k].fog = T.use_rc ? fog_factor(v[k]->fog[0]) : 0.0f;
++            }
++        }
++        s_gpu.tris_drawn++;
++        note_drawn();
++        return;
++    }
 +    if ((s_gpu.depth_test || s_gpu.depth_mask)
 +        && (!nv2a_gl_active() || nv2a_gl_verify()))
-         T.zb = zbuf_current(1);
-     if (tex_size_from_format(s_gpu.texs[0].color)) {
-         su = (float)s_gpu.texs[0].width;
-@@ -2052,10 +2741,13 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
++        T.zb = zbuf_current(1);
++    if (tex_size_from_format(s_gpu.texs[0].color)) {
++        su = (float)s_gpu.texs[0].width;
++        sv = (float)s_gpu.texs[0].height;
++    }
+     for (k = 0; k < 3; k++) {
+         T.iw[k] = 1.0f / v[k]->pos[3];
+         T.uv[k][0] = v[k]->tex[0][0] * su * T.iw[k];
+@@ -2052,10 +3061,13 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          { float r = T.fogc[2]; T.fogc[2] = T.fogc[0]; T.fogc[0] = r; }
      }
  
@@ -9069,7 +9494,7 @@ index c65632c..012ab70 100644
      if (T.minx < (int)s_gpu.clip_x) T.minx = (int)s_gpu.clip_x;
      if (T.miny < (int)s_gpu.clip_y) T.miny = (int)s_gpu.clip_y;
      if (T.maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) T.maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
-@@ -2070,7 +2762,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2070,7 +3082,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -9100,7 +9525,7 @@ index c65632c..012ab70 100644
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
      s_gpu.zpass_count += cnt.zpass;
-@@ -2092,8 +2806,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2092,8 +3126,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
   * offset) while leaving w itself alone. So each vertex is taken back to clip
   * space first: clip = (screen - offset) / scale * w. Everything else the
   * vertex carries -- colours, fog, texture coordinates -- is linear in clip
@@ -9111,7 +9536,7 @@ index c65632c..012ab70 100644
   * ponytail: the near plane only; x/y/far fall to the rasteriser's bounds
   * check, which is correct, just slower for huge off-screen triangles. */
  #define NV_CLIP_W 1e-3f
-@@ -2116,8 +2830,13 @@ static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
+@@ -2116,8 +3150,13 @@ static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
          po[i] = pa[i] + (pb[i] - pa[i]) * t;
  }
  
@@ -9127,7 +9552,7 @@ index c65632c..012ab70 100644
  {
      const Nv2aVshOutput *in[3];
      Nv2aVshOutput poly[4], va, vb;
-@@ -2130,7 +2849,7 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -2130,7 +3169,7 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
      }
      if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
          && c->pos[3] <= NV_CLIP_W) {
@@ -9136,7 +9561,7 @@ index c65632c..012ab70 100644
          return;
      }
      {
-@@ -2156,12 +2875,164 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -2156,15 +3195,361 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
              xf_lerp(&va, &vb, t, &poly[n++]);
          }
      }
@@ -9302,13 +9727,441 @@ index c65632c..012ab70 100644
  }
  
  static Nv2aVshOutput s_xf[NV_MAX_INDICES];
-@@ -2180,9 +3051,104 @@ static void raster_batch_program(void)
++/* With RECOMP_XF_FAST (default) index i's vertex is s_xv[i], which points
++ * at the first s_xf entry of the same vertex instead of a copy of it. */
++static const Nv2aVshOutput *s_xv[NV_MAX_INDICES];
++
++/* raster_xf_clipped's "wholly inside" test with the per-batch part (the
++ * near plane, w-buffering) worked out once per batch. Same arithmetic in the
++ * same precision; a triangle that is not wholly inside goes to
++ * raster_xf_clipped, which repeats the test and clips it. */
++typedef struct {
++    int near_on, zp; double z0; float zmin;
++    /* xf_tri_gl's per-batch state: valid when gl (only the GL backend
++     * draws, and nothing in the batch needs raster_xf_triangle's rarer
++     * paths); the rest as raster_xf_triangle reads it per triangle. */
++    int gl, bpp, stipple, use_rc, surface_ok, cull, cull_mode, mode;
++    uint32_t drop;
++    float zbias;
++    int clip_x0, clip_y0, clip_x1, clip_y1;
++} XfClipCtx;
++
++static void xf_clip_ctx(XfClipCtx *cx)
++{
++    static int near_env = -1, cull_env = -1, pbv = -1, no_rc = -1;
++    if (near_env < 0) {
++        const char *e = getenv("RECOMP_GPU_NEAR");
++        near_env = !(e && *e == '0');
++    }
++    cx->zp = xf_zpersp();
++    cx->zmin = s_gpu.clip_zmin;
++    cx->z0 = 0.0;
++    cx->near_on = near_env && (s_gpu.zminmax_control & 0x0F) != 0 && s_gpu.clip_zmin > 0.0f;
++    if (cx->near_on) {
++        const float k2 = nv2a_vsh_constant(58)[2], o2 = nv2a_vsh_constant(59)[2];
++        if (cx->zp)
++            cx->z0 = s_gpu.clip_zmin;
++        else if (k2 > 0.0f)
++            cx->z0 = ((double)s_gpu.clip_zmin - o2) / k2;
++        else
++            cx->near_on = 0;
++    }
++    /* raster_xf_triangle's state, once per batch (nothing between BEGIN and
++     * END changes it). Polygon offset outside a w-buffer (per-triangle
++     * slopes) and the RECOMP_PB_VALUES statistics keep the full path. */
++    if (cull_env < 0) {
++        const char *e = getenv("RECOMP_GPU_CULL");
++        cull_env = e ? atoi(e) : 1;
++        pbv = getenv("RECOMP_PB_VALUES") != NULL;
++        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
++    }
++    cx->gl = xf_fast() && !s_xf_force_slow && nv2a_gl_active() && !nv2a_gl_verify() && !pbv
++          && (cx->zp || !(s_gpu.poly_offset_enable
++                          && (s_gpu.poly_offset_factor != 0.0f || s_gpu.poly_offset_bias != 0.0f)
++                          && xf_polyoffset_on()));
++    if (!cx->gl)
++        return;
++    cx->bpp = (int)surface_bpp();
++    cx->stipple = xf_stipple();
++    cx->use_rc = s_gpu.rc_seen && !no_rc;
++    cx->zbias = cx->zp ? xf_zbias() : 0.0f;
++    cx->surface_ok = surface_begin_batch((uint8_t *)xbox_GetMemoryOffset());
++    cx->cull_mode = cull_env;
++    cx->cull = cull_env && !s_ab_nocull && !nv2a_win_nocull && s_gpu.cull_enable;
++    {
++        uint32_t ff = s_gpu.front_face == 0x901u ? 0x901u : 0x900u;
++        cx->drop = s_gpu.cull_face == 0x404u ? ff : (ff ^ 1u);
++    }
++    cx->clip_x0 = (int)s_gpu.clip_x;
++    cx->clip_y0 = (int)s_gpu.clip_y;
++    cx->clip_x1 = (int)(s_gpu.clip_x + s_gpu.clip_w);
++    cx->clip_y1 = (int)(s_gpu.clip_y + s_gpu.clip_h);
++    {
++        int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
++        cx->mode = !shade ? NV2A_GL_MODE_DEPTH
++                 : cx->use_rc ? NV2A_GL_MODE_RC : NV2A_GL_MODE_XF;
++    }
++}
++
++/* raster_xf_triangle for a triangle wholly inside the clip planes when only
++ * the GL backend draws: the same tests, statistics and GL vertices, with the
++ * batch's state from xf_clip_ctx. RECOMP_XF_CHECK compares it with the full
++ * path. */
++static void xf_tri_gl(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
++                      const Nv2aVshOutput *vc, const XfClipCtx *cx)
++{
++    const float *a = va->pos, *b = vb->pos, *c = vc->pos;
++    const Nv2aVshOutput *v[3];
++    float area, lo, hi;
++    int k, minx, maxx, miny, maxy;
++    Nv2aGlVertex *g;
++
++    if (cx->zp) s_gpu.zpersp_tris++;
++    if (cx->stipple) s_gpu.stipple_tris++;
++    if (cx->bpp != 4 && cx->bpp != 2)
++        return;
++    if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
++        s_gpu.tris_behind++;
++        if (s_xf_inclip) s_gpu.clip_lost++;
++        return;
++    }
++    area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
++    if (area == 0.0f || area != area) {
++        if (area != area) s_gpu.xf_nan++;
++        s_gpu.xf_degenerate++;
++        return;
++    }
++    if (cx->cull) {
++        double ax = (double)a[0] * a[3], ay = (double)a[1] * a[3], aw = a[3];
++        double bx = (double)b[0] * b[3], by = (double)b[1] * b[3], bw = b[3];
++        double cxx = (double)c[0] * c[3], cy = (double)c[1] * c[3], cw = c[3];
++        double det = ax * (by * cw - cy * bw) - ay * (bx * cw - cxx * bw)
++                   + aw * (bx * cy - cxx * by);
++        uint32_t wind = ((det > 0.0) != (s_xf_flip != 0)) ? 0x900u : 0x901u;
++        if (cx->cull_mode == 2)
++            wind ^= 1u;
++        if (s_gpu.cull_face == 0x408u || wind == cx->drop) {
++            s_gpu.tris_culled++;
++            return;
++        }
++    }
++    if (cx->zp && cx->zbias != 0.0f)
++        s_gpu.tris_offset++;
++    for (k = 0; k < 3; k++) {
++        if (!s_gpu.xf_seeded)
++            s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
++        if (a[k] < s_gpu.xf_min[k]) s_gpu.xf_min[k] = a[k];
++        if (a[k] > s_gpu.xf_max[k]) s_gpu.xf_max[k] = a[k];
++    }
++    s_gpu.xf_seeded = 1;
++    if (!cx->surface_ok)
++        return;
++    lo = b[0] < c[0] ? b[0] : c[0]; lo = a[0] < lo ? a[0] : lo;
++    hi = b[0] > c[0] ? b[0] : c[0]; hi = a[0] > hi ? a[0] : hi;
++    minx = xf_ifloor(xf_bound(lo)); maxx = xf_iceil(xf_bound(hi));
++    lo = b[1] < c[1] ? b[1] : c[1]; lo = a[1] < lo ? a[1] : lo;
++    hi = b[1] > c[1] ? b[1] : c[1]; hi = a[1] > hi ? a[1] : hi;
++    miny = xf_ifloor(xf_bound(lo)); maxy = xf_iceil(xf_bound(hi));
++    if (minx < cx->clip_x0) minx = cx->clip_x0;
++    if (miny < cx->clip_y0) miny = cx->clip_y0;
++    if (maxx > cx->clip_x1) maxx = cx->clip_x1;
++    if (maxy > cx->clip_y1) maxy = cx->clip_y1;
++    if (maxx > NV_ZBUF_W) maxx = NV_ZBUF_W;
++    if (maxy > NV_ZBUF_H) maxy = NV_ZBUF_H;
++    if (minx >= maxx || miny >= maxy) {
++        s_gpu.tris_skipped_offscreen++;
++        s_gpu.xf_offscreen++;
++        return;
++    }
++    s_gpu.xf_drawn++;
++    g = gl_next_tri(cx->mode);
++    if (g) {
++        v[0] = va; v[1] = vb; v[2] = vc;
++        for (k = 0; k < 3; k++) {
++            memcpy(g[k].pos, v[k]->pos, sizeof g[k].pos);
++            memcpy(g[k].d0, v[k]->d0, sizeof g[k].d0);
++            memcpy(g[k].d1, v[k]->d1, sizeof g[k].d1);
++            memcpy(g[k].tex, v[k]->tex, sizeof g[k].tex);
++            g[k].fog = cx->use_rc ? fog_factor(v[k]->fog[0]) : 0.0f;
++        }
++    }
++    s_gpu.tris_drawn++;
++    note_drawn();
++}
++
++static __inline double xf_dmax(double x, double y)     /* fmax, NaN included */
++{
++    return x != x ? y : y != y ? x : (x > y ? x : y);
++}
++
++static __inline void xf_clip_fast(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
++                                  const Nv2aVshOutput *c, const XfClipCtx *cx)
++{
++    double wmin = xf_dmax(fabs((double)a->pos[3]),
++                          xf_dmax(fabs((double)b->pos[3]), fabs((double)c->pos[3]))) * 1e-6;
++    const Nv2aVshOutput *in[3];
++    int i;
++    if (wmin < NV_CLIP_W) wmin = NV_CLIP_W;
++    in[0] = a; in[1] = b; in[2] = c;
++    for (i = 0; i < 3; i++) {
++        if (in[i]->pos[3] < wmin)
++            break;
++        if (cx->near_on) {
++            double d = cx->zp ? (double)in[i]->pos[3] - cx->z0
++                              : (double)in[i]->pos[2] - cx->zmin;
++            if (d < 0.0)
++                break;
++        }
++    }
++    if (i == 3 && !s_ab_oldclip) {
++        if (cx->gl)
++            xf_tri_gl(a, b, c, cx);
++        else
++            raster_xf_triangle(a, b, c);
++    } else
++        raster_xf_clipped(a, b, c);
++}
+ 
+ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+ {
+@@ -2176,13 +3561,423 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+     return nv2a_vsh_run((const float (*)[4])in, out);
+ }
+ 
++/* ---- the transform of one batch on several threads ----------------------
++ *
++ * A batch's distinct vertices are independent (the program cannot write
++ * constants here: nv2a_vsh_mt_ready), so a large batch is cut into runs of
++ * whole blocks and each thread fetches and transforms its own run into
++ * s_xf with its own register file. Nothing else changes: the same vertices,
++ * the same results, the same s_xf slots; triangles are set up afterwards on
++ * the executor thread in order. RECOMP_XF_THREADS=<n> threads including the
++ * executor (1: off; default 4 with 8+ processors, 2 with 4+); batches under
++ * XF_MT_MIN distinct vertices stay on the executor. RECOMP_XF_MTCHECK=1
++ * transforms every such batch again on the executor and compares. */
++#define XF_MT_MIN      384
++#define XF_MT_MAX      8
++static uint32_t s_xf_dl[NV_MAX_INDICES];     /* index positions of distinct vertices */
++
++typedef struct {
++    const XfFetch *fa;
++    const uint8_t *act;
++    uint32_t nact;
++    const float (*tmpl)[4];                  /* the absent attributes' values */
++    uint32_t from[XF_MT_MAX + 1];            /* part k: s_xf_dl[from[k] .. from[k+1]) */
++} XfMtJob;
++
++static void xf_mt_part(const XfMtJob *j, int k, Nv2aVshCtx *ctx)
++{
++    static NV_TLS float vin[NV2A_VSH_BATCH][NV2A_VSH_INPUTS][4];
++    Nv2aVshOutput *outp[NV2A_VSH_BATCH];
++    uint32_t q = j->from[k], to = j->from[k + 1], b, a;
++
++    for (b = 0; b < NV2A_VSH_BATCH; b++)
++        memcpy(vin[b], j->tmpl, sizeof vin[b]);
++    while (q < to) {
++        uint32_t nb = 0;
++        for (; nb < NV2A_VSH_BATCH && q < to; q++, nb++) {
++            const uint32_t i = s_xf_dl[q], ix = s_gpu.idx[i];
++            for (a = 0; a < j->nact; a++)
++                xf_fetch(&j->fa[a], ix, vin[nb][j->act[a]]);
++            outp[nb] = &s_xf[i];
++        }
++        nv2a_vsh_run_batch_ctx(ctx, (const float (*)[NV2A_VSH_INPUTS][4])vin, outp, nb);
++    }
++}
++
++#if defined(_WIN32)
++static struct {
++    int n;                                   /* threads incl. the executor */
++    HANDLE start[XF_MT_MAX], done;
++    volatile LONG pending;
++    const XfMtJob *job;
++    int parts;
++    Nv2aVshCtx *ctx[XF_MT_MAX];
++} s_xpool;
++
++static DWORD WINAPI xf_mt_worker(LPVOID arg)
++{
++    int k = (int)(intptr_t)arg;
++    for (;;) {
++        WaitForSingleObject(s_xpool.start[k], INFINITE);
++        if (k < s_xpool.parts)
++            xf_mt_part(s_xpool.job, k, s_xpool.ctx[k]);
++        if (InterlockedDecrement(&s_xpool.pending) == 0)
++            SetEvent(s_xpool.done);
++    }
++    return 0;
++}
++
++static int xf_mt_threads(void)
++{
++    static int init;
++    if (!init) {
++        const char *e = getenv("RECOMP_XF_THREADS");
++        SYSTEM_INFO si;
++        int n, k;
++        init = 1;
++        GetSystemInfo(&si);
++        n = e ? atoi(e) : si.dwNumberOfProcessors >= 8 ? 4 : si.dwNumberOfProcessors >= 4 ? 2 : 1;
++        if (n < 1) n = 1;
++        if (n > XF_MT_MAX) n = XF_MT_MAX;
++        for (k = 0; k < n; k++)
++            if (!(s_xpool.ctx[k] = nv2a_vsh_ctx_new()))
++                n = 1;
++        s_xpool.n = n;
++        if (n > 1) {
++            s_xpool.done = CreateEventA(NULL, FALSE, FALSE, NULL);
++            for (k = 1; k < n; k++) {
++                s_xpool.start[k] = CreateEventA(NULL, FALSE, FALSE, NULL);
++                CloseHandle(CreateThread(NULL, 0, xf_mt_worker, (LPVOID)(intptr_t)k, 0, NULL));
++            }
++        }
++    }
++    return s_xpool.n;
++}
++
++/* Parts 1.. on the workers, part 0 here; back when all are done. */
++static void xf_mt_run(XfMtJob *j, uint32_t m)
++{
++    int parts = s_xpool.n, k;
++    uint32_t per;
++    if ((uint32_t)parts > m / (XF_MT_MIN / 2))
++        parts = (int)(m / (XF_MT_MIN / 2));
++    if (parts < 1)
++        parts = 1;
++    /* whole blocks per part */
++    per = ((m + (uint32_t)parts - 1) / (uint32_t)parts + NV2A_VSH_BATCH - 1)
++        / NV2A_VSH_BATCH * NV2A_VSH_BATCH;
++    for (k = 0; k <= parts; k++)
++        j->from[k] = (uint32_t)k * per < m ? (uint32_t)k * per : m;
++    j->from[parts] = m;
++    s_xpool.job = j;
++    s_xpool.parts = parts;
++    s_xpool.pending = s_xpool.n - 1;
++    for (k = 1; k < s_xpool.n; k++)
++        SetEvent(s_xpool.start[k]);
++    xf_mt_part(j, 0, s_xpool.ctx[0]);
++    WaitForSingleObject(s_xpool.done, INFINITE);
++}
++#else
++static int xf_mt_threads(void) { return 1; }
++static void xf_mt_run(XfMtJob *j, uint32_t m) { (void)j; (void)m; }
++#endif
++
++/* The batch's triangles from its vertices v[0..n-1]: through xf_clip_fast
++ * (fast) or raster_xf_clipped as before. */
++static void xf_draw_prims(const Nv2aVshOutput *const *v, uint32_t n,
++                          const XfClipCtx *cx, int fast)
++{
++    uint32_t i;
++#define XF_TRI(a, b, c) do { if (fast) xf_clip_fast(a, b, c, cx); \
++                             else raster_xf_clipped(a, b, c); } while (0)
++    switch (s_gpu.prim) {
++    case NV_PRIM_TRIANGLES:
++        for (i = 0; i + 2 < n; i += 3)
++            XF_TRI(v[i], v[i+1], v[i+2]);
++        break;
++    case NV_PRIM_TRIANGLE_STRIP:
++        for (i = 0; i + 2 < n; i++) {
++            s_xf_flip = (int)(i & 1);
++            XF_TRI(v[i], v[i+1], v[i+2]);
++        }
++        s_xf_flip = 0;
++        break;
++    case NV_PRIM_TRIANGLE_FAN:
++    case NV_PRIM_POLYGON:
++        for (i = 1; i + 1 < n; i++)
++            XF_TRI(v[0], v[i], v[i+1]);
++        break;
++    case NV_PRIM_QUADS:
++        for (i = 0; i + 3 < n; i += 4) {
++            XF_TRI(v[i], v[i+1], v[i+2]);
++            XF_TRI(v[i], v[i+2], v[i+3]);
++        }
++        break;
++    case NV_PRIM_QUAD_STRIP:
++        for (i = 0; i + 3 < n; i += 2) {
++            XF_TRI(v[i], v[i+1], v[i+3]);
++            XF_TRI(v[i], v[i+3], v[i+2]);
++        }
++        break;
++    default:
++        s_gpu.prim_dropped[s_gpu.prim & 15]++;   /* points and lines */
++        break;
++    }
++#undef XF_TRI
++}
++
++/* RECOMP_XF_CHECK=1: every program batch is set up twice into a recording,
++ * once by the old per-triangle path (full software setup, clip test per
++ * triangle) and once by the fast one, and the GL vertices, their modes and
++ * the whole executor state afterwards must be identical. Then the state is
++ * put back and the batch is drawn for real. */
++static void xf_check_prims(uint32_t n, const XfClipCtx *cx)
++{
++    static unsigned long long batches, tris, bad, over;
++    static uint8_t *save, *after;
++    int na;
++
++    if (!save) {
++        save = (uint8_t *)malloc(sizeof s_gpu);
++        after = (uint8_t *)malloc(sizeof s_gpu);
++        if (!save || !after)
++            return;
++    }
++    memcpy(save, &s_gpu, sizeof s_gpu);
++    s_rec_on = 1; s_rec_n = 0; s_rec_over = 0;
++    s_xf_force_slow = 1;
++    xf_draw_prims(s_xv, n, cx, 0);
++    s_xf_force_slow = 0;
++    na = s_rec_n;
++    memcpy(s_rec + XF_REC_MAX, s_rec, sizeof *s_rec * (size_t)na);
++    memcpy(s_rec_mode + XF_REC_MAX / 3, s_rec_mode, sizeof *s_rec_mode * (size_t)(na / 3));
++    memcpy(after, &s_gpu, sizeof s_gpu);
++    memcpy(&s_gpu, save, sizeof s_gpu);
++    s_rec_n = 0;
++    xf_draw_prims(s_xv, n, cx, 1);
++    s_rec_on = 0;
++    batches++;
++    tris += (unsigned long long)(na / 3);
++    if (s_rec_over) {
++        over++;
++    } else if (na != s_rec_n
++               || memcmp(s_rec, s_rec + XF_REC_MAX, sizeof *s_rec * (size_t)na)
++               || memcmp(s_rec_mode, s_rec_mode + XF_REC_MAX / 3, sizeof *s_rec_mode * (size_t)(na / 3))
++               || memcmp(after, &s_gpu, sizeof s_gpu)) {
++        if (bad++ < 10)
++            fprintf(stderr, "  [XF] CHECK: batch %llu differs (prim %u, %u indices,"
++                            " %d vs %d vertices, state %s)%c", batches, s_gpu.prim, n,
++                    na, s_rec_n, memcmp(after, &s_gpu, sizeof s_gpu) ? "differs" : "same", 10);
++    }
++    if ((batches & (batches - 1)) == 0 && batches >= 1024)
++        fprintf(stderr, "  [XF] CHECK: %llu batches, %llu triangles, %llu mismatches,"
++                        " %llu too big to record%c", batches, tris, bad, over, 10);
++    memcpy(&s_gpu, save, sizeof s_gpu);
++}
++
++static void raster_batch_program_inner(uint64_t t0);
+ static void raster_batch_program(void)
++{
++    uint64_t t0 = xp_now(), fl0 = s_xp_flush;
++    raster_batch_program_inner(t0);
++    /* setup = everything after the transform, less the GL draws it caused */
++    s_xp_setup += xp_now() - t0 - s_xp_xform_last - (s_xp_flush - fl0);
++}
++
++static void raster_batch_program_inner(uint64_t t0)
  {
      uint32_t i, n = s_gpu.idx_count;
++    int fast = 0, ptrs = 0;
++    XfClipCtx cx;
  
 -    for (i = 0; i < n; i++)
 -        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
 -            return;                                    /* no program loaded */
++    s_xp_xform_last = 0;
++
 +    {
 +        /* An indexed mesh names each vertex several times; the program is a
 +         * pure function of the vertex (unless it writes constants), so run
@@ -9316,6 +10169,7 @@ index c65632c..012ab70 100644
 +        static uint32_t stamp[65536], gen;
 +        static uint16_t first[65536];
 +        int reuse = !nv2a_vsh_writes_constants();
++        fast = xf_fast();
 +
 +        if (++gen == 0) {
 +            memset(stamp, 0, sizeof stamp);
@@ -9331,15 +10185,86 @@ index c65632c..012ab70 100644
 +            uint8_t act[NV2A_VSH_INPUTS];
 +            uint32_t nact = 0, nb = 0, a, b, copies = 0;
 +
++            XfFetch fa[NV2A_VSH_INPUTS];
 +            for (a = 0; a < NV2A_VSH_INPUTS; a++) {
 +                const VertexAttr *at = &s_gpu.attr[a];
 +                if (at->size && at->stride && (s_gpu.inline_active || at->offset)) {
++                    xf_fetch_prepare(at, &fa[nact]);
 +                    act[nact++] = (uint8_t)a;
 +                } else {
 +                    for (b = 0; b < NV2A_VSH_BATCH; b++)
 +                        fetch_attr(at, 0, vin[b][a]);
 +                }
 +            }
++            if (fast) {
++                /* The distinct vertices first (s_xf_dl), then fetch and run
++                 * them in blocks -- here, or on several threads. */
++                uint32_t m = 0, q;
++                for (i = 0; i < n; i++) {
++                    uint32_t ix = s_gpu.idx[i];
++                    if (ix < 65536u) {
++                        if (stamp[ix] == gen)
++                            continue;
++                        stamp[ix] = gen;
++                        first[ix] = (uint16_t)i;
++                    }
++                    s_xf_dl[m++] = i;
++                }
++                s_xp_verts += m;
++                if (m >= XF_MT_MIN && !xf_check_on() && xf_mt_threads() > 1
++                    && nv2a_vsh_mt_ready()) {
++                    static XfMtJob job;
++                    static int mtcheck = -1;
++                    job.fa = fa; job.act = act; job.nact = nact;
++                    job.tmpl = (const float (*)[4])vin[0];
++                    xf_mt_run(&job, m);
++                    s_xp_mt += m;
++                    if (mtcheck < 0)
++                        mtcheck = getenv("RECOMP_XF_MTCHECK") != NULL;
++                    if (mtcheck) {
++                        /* the same vertices again, here, one block at a time */
++                        static unsigned long long nv, bad;
++                        for (q = 0; q < m; q++) {
++                            const uint32_t ix = s_gpu.idx[s_xf_dl[q]];
++                            Nv2aVshOutput one, *op = &one;
++                            for (a = 0; a < nact; a++)
++                                xf_fetch(&fa[a], ix, vin[0][act[a]]);
++                            nv2a_vsh_run_batch((const float (*)[NV2A_VSH_INPUTS][4])vin, &op, 1);
++                            nv++;
++                            if (memcmp(&one, &s_xf[s_xf_dl[q]], sizeof one) && bad++ < 10)
++                                fprintf(stderr, "  [XF] MTCHECK: vertex %u of a %u-vertex batch differs%c",
++                                        q, m, 10);
++                            if ((nv & (nv - 1)) == 0 && nv >= 65536)
++                                fprintf(stderr, "  [XF] MTCHECK: %llu vertices, %llu mismatches%c",
++                                        nv, bad, 10);
++                        }
++                    }
++                } else
++                for (q = 0; q < m; q++) {
++                    const uint32_t ix = s_gpu.idx[s_xf_dl[q]];
++                    for (a = 0; a < nact; a++)
++                        xf_fetch(&fa[a], ix, vin[nb][act[a]]);
++                    if (xf_check_on()) {        /* RECOMP_XF_CHECK: fetch too */
++                        static unsigned long long nf, badf;
++                        for (a = 0; a < nact; a++) {
++                            float ref[4];
++                            fetch_attr(&s_gpu.attr[act[a]], ix, ref);
++                            nf++;
++                            if (memcmp(ref, vin[nb][act[a]], sizeof ref) && badf++ < 10)
++                                fprintf(stderr, "  [XF] CHECK: fetch of v%u differs%c", act[a], 10);
++                        }
++                        if ((nf & (nf - 1)) == 0 && nf >= 65536)
++                            fprintf(stderr, "  [XF] CHECK: %llu attribute fetches, %llu mismatches%c",
++                                    nf, badf, 10);
++                    }
++                    outp[nb++] = &s_xf[s_xf_dl[q]];
++                    if (nb == NV2A_VSH_BATCH || q + 1 == m) {
++                        if (!nv2a_vsh_run_batch((const float (*)[NV2A_VSH_INPUTS][4])vin, outp, nb))
++                            return;                    /* no program loaded */
++                        nb = 0;
++                    }
++                }
++            } else
 +            for (i = 0; i < n; i++) {
 +                uint32_t ix = s_gpu.idx[i];
 +                if (ix < 65536u) {
@@ -9352,6 +10277,7 @@ index c65632c..012ab70 100644
 +                }
 +                for (a = 0; a < nact; a++)
 +                    fetch_attr(&s_gpu.attr[act[a]], ix, vin[nb][act[a]]);
++                s_xp_verts++;
 +                outp[nb++] = &s_xf[i];
 +                if (nb == NV2A_VSH_BATCH || i + 1 == n) {
 +                    if (!nv2a_vsh_run_batch((const float (*)[NV2A_VSH_INPUTS][4])vin, outp, nb))
@@ -9359,8 +10285,16 @@ index c65632c..012ab70 100644
 +                    nb = 0;
 +                }
 +            }
-+            if (nb && !nv2a_vsh_run_batch((const float (*)[NV2A_VSH_INPUTS][4])vin, outp, nb))
++            if (!fast && nb
++                && !nv2a_vsh_run_batch((const float (*)[NV2A_VSH_INPUTS][4])vin, outp, nb))
 +                return;
++            if (fast) {
++                for (i = 0; i < n; i++) {
++                    uint32_t ix = s_gpu.idx[i];
++                    s_xv[i] = ix < 65536u ? &s_xf[first[ix]] : &s_xf[i];
++                }
++                ptrs = 1;
++            } else
 +            for (i = 0; copies && i < n; i++) {
 +                uint32_t ix = s_gpu.idx[i];
 +                if (ix < 65536u && first[ix] != (uint16_t)i)
@@ -9399,18 +10333,40 @@ index c65632c..012ab70 100644
 +        }
 +        if (on && !s_ab_nocolclamp) {
 +            int k;
-+            for (i = 0; i < n; i++)
++            for (i = 0; i < n; i++) {
++                if (ptrs && s_xv[i] != &s_xf[i])
++                    continue;                       /* a later use of a vertex */
 +                for (k = 0; k < 4; k++) {
 +                    float *c0 = &s_xf[i].d0[k], *c1 = &s_xf[i].d1[k];
 +                    *c0 = *c0 > 0.0f ? (*c0 < 1.0f ? *c0 : 1.0f) : 0.0f;
 +                    *c1 = *c1 > 0.0f ? (*c1 < 1.0f ? *c1 : 1.0f) : 0.0f;
 +                }
++            }
 +        }
 +    }
++    s_xp_xform_last = xp_now() - t0;
++    s_xp_xform += s_xp_xform_last;
++    s_xp_idx += n;
++    s_xp_batches++;
      s_gpu.batches_program++;
      s_gpu.verts_program += n;
      if (s_gpu.blend_enable) {
-@@ -2243,6 +3209,15 @@ static void raster_batch_program(void)
+@@ -2225,10 +4020,11 @@ static void raster_batch_program(void)
+                             c[0], c[1], c[2], c[3], 10);
+                 }
+             }
+-            for (i = 0; i < 3; i++)
++            for (i = 0; i < 3; i++) {
++                const Nv2aVshOutput *o = ptrs ? s_xv[i] : &s_xf[i];
+                 fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
+-                        s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
+-                        s_xf[i].pos[3]);
++                        o->pos[0], o->pos[1], o->pos[2], o->pos[3]);
++            }
+         }
+     }
+     for (i = 0; i < NV2A_VSH_INPUTS; i++) {
+@@ -2243,15 +4039,47 @@ static void raster_batch_program(void)
      }
      if (s_gpu.texs[0].valid)
          note_texture_use();
@@ -9424,9 +10380,29 @@ index c65632c..012ab70 100644
 +        }
 +    }
  
++    if (fast) {
++        static int check = -1;
++        if (!ptrs)
++            for (i = 0; i < n; i++)
++                s_xv[i] = &s_xf[i];
++        xf_clip_ctx(&cx);
++        if (check < 0) {
++            check = xf_check_on();
++            if (check) {
++                s_rec = (Nv2aGlVertex *)malloc(sizeof *s_rec * 2 * XF_REC_MAX);
++                s_rec_mode = (int *)malloc(sizeof *s_rec_mode * 2 * XF_REC_MAX / 3);
++                if (!s_rec || !s_rec_mode)
++                    check = 0;
++            }
++        }
++        if (check)
++            xf_check_prims(n, &cx);
++        xf_draw_prims(s_xv, n, &cx, 1);
++        return;
++    }
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
-@@ -2250,8 +3225,11 @@ static void raster_batch_program(void)
+         for (i = 0; i + 2 < n; i += 3)
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -9439,7 +10415,7 @@ index c65632c..012ab70 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -2271,6 +3249,7 @@ static void raster_batch_program(void)
+@@ -2271,6 +4099,7 @@ static void raster_batch_program(void)
          }
          break;
      default:
@@ -9447,7 +10423,7 @@ index c65632c..012ab70 100644
          break;
      }
  }
-@@ -2280,8 +3259,11 @@ static void raster_batch(void)
+@@ -2280,8 +4109,11 @@ static void raster_batch(void)
      uint32_t i;
      uint32_t before = s_gpu.tris_drawn;
  
@@ -9460,7 +10436,7 @@ index c65632c..012ab70 100644
      static int no_vsh = -1;
      if (no_vsh < 0)
          no_vsh = getenv("RECOMP_NO_VSH") != NULL;
-@@ -2348,6 +3330,7 @@ static void raster_batch(void)
+@@ -2348,6 +4180,7 @@ static void raster_batch(void)
          }
          break;
      default:
@@ -9468,7 +10444,7 @@ index c65632c..012ab70 100644
          break;                             /* points and lines: not yet */
      }
  
-@@ -2380,9 +3363,23 @@ static void raster_batch(void)
+@@ -2380,9 +4213,23 @@ static void raster_batch(void)
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
@@ -9493,7 +10469,7 @@ index c65632c..012ab70 100644
          return;
      if (s_ftrace == 3) {
          /* Deleting the flag file re-arms the trace for the next time it
-@@ -2395,6 +3392,19 @@ static void frame_trace_flip(void)
+@@ -2395,6 +4242,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -9513,7 +10489,7 @@ index c65632c..012ab70 100644
          s_ftrace = 3;
          fprintf(stderr, "[FTRACE] end of frame\n");
          return;
-@@ -2417,7 +3427,12 @@ static void draw_primitive(void)
+@@ -2417,7 +4277,12 @@ static void draw_primitive(void)
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
@@ -9527,7 +10503,7 @@ index c65632c..012ab70 100644
          fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
      s_gpu.verts += s_gpu.idx_count;
  
-@@ -2440,8 +3455,22 @@ static void draw_primitive(void)
+@@ -2440,8 +4305,22 @@ static void draw_primitive(void)
      {
          uint32_t t0 = s_gpu.tris_drawn;
          uint64_t p0 = s_gpu.pixels;
@@ -9550,7 +10526,7 @@ index c65632c..012ab70 100644
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
                      " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
-@@ -2455,6 +3484,27 @@ static void draw_primitive(void)
+@@ -2455,6 +4334,27 @@ static void draw_primitive(void)
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                      s_gpu.tris_drawn - t0,
                      (unsigned long long)(s_gpu.pixels - p0));
@@ -9578,7 +10554,7 @@ index c65632c..012ab70 100644
              if ((s_gpu.xf_mode & 3) == 2)
                  fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                          s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
-@@ -2489,9 +3539,12 @@ static void draw_primitive(void)
+@@ -2489,9 +4389,12 @@ static void draw_primitive(void)
          }
      }
  
@@ -9594,7 +10570,7 @@ index c65632c..012ab70 100644
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
                              " off 0x%08X type %u size %u stride %u\n",
                      s_gpu.prim, s_gpu.idx_count, s_gpu.attr[0].offset,
-@@ -2607,6 +3660,9 @@ static void draw_inline_array(void)
+@@ -2607,6 +4510,9 @@ static void draw_inline_array(void)
          case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
          case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
          case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
@@ -9604,7 +10580,7 @@ index c65632c..012ab70 100644
          default: bytes = 4 * s_gpu.attr[a].size;   break;
          }
          s_gpu.attr[a].offset = off;
-@@ -2617,6 +3673,22 @@ static void draw_inline_array(void)
+@@ -2617,6 +4523,22 @@ static void draw_inline_array(void)
          goto out;
  
      count = (s_gpu.inline_count * 4) / vsize;
@@ -9627,7 +10603,7 @@ index c65632c..012ab70 100644
      if (count < 3 || count > NV_MAX_INDICES)
          goto out;
      for (a = 0; a < NV_VERTEX_ATTRS; a++)
-@@ -2840,6 +3912,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2840,6 +4762,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
      case NV097_SET_TEXTURE_CONTROL1:
          t->pitch = param >> 16;          /* linear formats only */
          break;
@@ -9637,7 +10613,7 @@ index c65632c..012ab70 100644
      case NV097_SET_TEXTURE_IMAGE_RECT:
          t->width  = param >> 16;
          t->height = param & 0xFFFF;
-@@ -2851,12 +3926,367 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2851,12 +4776,367 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          break;
      }
      tex_update_valid(t);
@@ -10005,7 +10981,7 @@ index c65632c..012ab70 100644
      static int inited;
      if (!inited) {
          inited = 1;
-@@ -2956,6 +4386,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2956,6 +5236,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          s_gpu.rc_seen = 1;
          break;
      case 0x1E70: s_gpu.rc.stage_program = param; break;
@@ -10015,7 +10991,7 @@ index c65632c..012ab70 100644
      case 0x17F8: s_gpu.clip_plane_mode = param; break;
  
      /* Alpha test and fog. */
-@@ -2967,8 +4400,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2967,8 +5250,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x029C: s_gpu.fog_mode = param; break;
      case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
@@ -10028,7 +11004,7 @@ index c65632c..012ab70 100644
          break;
      case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
          s_gpu.zpass_enable = param;
-@@ -2980,12 +4417,54 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2980,12 +5267,54 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
           * starts the slot at 0xFFFFFFFF) sees every test incomplete. Burnout
           * 3 culls its world with these, so the race's main view drew only
           * the sky while the cube-map passes, which do not test, drew it all.
@@ -10087,7 +11063,7 @@ index c65632c..012ab70 100644
          memset(mem + at + 12, 0, 4);
          break;
      }
-@@ -3004,8 +4483,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3004,8 +5333,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -10106,7 +11082,7 @@ index c65632c..012ab70 100644
          break;
  
      case NV097_SET_BEGIN_END:
-@@ -3052,19 +4539,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3052,19 +5389,51 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  
          if (!s_gpu.prim)
              break;
@@ -10163,7 +11139,7 @@ index c65632c..012ab70 100644
      case NV097_SET_FLIP_READ:
          if (s_ftrace == 2)
              fprintf(stderr, "[FTRACE] P_READ %u%c", param, 10);
-@@ -3099,6 +4618,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3099,6 +5468,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
@@ -10171,7 +11147,7 @@ index c65632c..012ab70 100644
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -3119,6 +4639,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3119,6 +5489,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -10195,7 +11171,7 @@ index c65632c..012ab70 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-@@ -3146,6 +4683,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3146,6 +5533,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -10204,7 +11180,7 @@ index c65632c..012ab70 100644
  
          if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
              static unsigned n;
-@@ -3177,12 +4716,45 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3177,12 +5566,45 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  
      /* Depth. */
      case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
@@ -10250,7 +11226,7 @@ index c65632c..012ab70 100644
          if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
              s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
              break;
-@@ -3449,6 +5021,20 @@ void nv2a_pb_exec_report(void)
+@@ -3449,6 +5871,28 @@ void nv2a_pb_exec_report(void)
      /* Drawn and skipped separately: "nothing appeared" and "every batch needed
       * a vertex program we do not run" look identical on screen, and only one
       * of them means the rasteriser is broken. */
@@ -10265,13 +11241,21 @@ index c65632c..012ab70 100644
 +                (double)g_nv2a_prof_scan_ticks * 1000.0 / (double)f.QuadPart,
 +                (unsigned long long)g_nv2a_prof_scan_n,
 +                (unsigned long long)g_nv2a_prof_idle_n);
++        fprintf(stderr, "[XF] transform %.0f ms (%llu vertices run, %llu indices, %llu batches,"
++                        " %llu vertices on threads) | setup %.0f ms | gl flush %.0f ms%c",
++                (double)s_xp_xform * 1000.0 / (double)f.QuadPart,
++                (unsigned long long)s_xp_verts, (unsigned long long)s_xp_idx,
++                (unsigned long long)s_xp_batches, (unsigned long long)s_xp_mt,
++                (double)s_xp_setup * 1000.0 / (double)f.QuadPart,
++                (double)s_xp_flush * 1000.0 / (double)f.QuadPart, 10);
++        s_xp_xform = s_xp_setup = s_xp_flush = s_xp_verts = s_xp_idx = s_xp_batches = s_xp_mt = 0;
 +        g_nv2a_prof_swi_ticks = g_nv2a_prof_swi_n = 0;
 +        g_nv2a_prof_scan_ticks = g_nv2a_prof_scan_n = g_nv2a_prof_idle_n = 0;
 +    }
      fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
      fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
                      " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
-@@ -3460,8 +5046,28 @@ void nv2a_pb_exec_report(void)
+@@ -3460,8 +5904,28 @@ void nv2a_pb_exec_report(void)
              s_gpu.tris_drawn, s_gpu.batches_untransformed,
              s_gpu.tris_skipped_offscreen);
      fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
@@ -10302,7 +11286,7 @@ index c65632c..012ab70 100644
      fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
                      " %u drawn; pixels %llu written, %llu depth-failed;"
                      " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
-@@ -3471,6 +5077,28 @@ void nv2a_pb_exec_report(void)
+@@ -3471,6 +5935,28 @@ void nv2a_pb_exec_report(void)
              s_gpu.xf_min[0], s_gpu.xf_max[0], s_gpu.xf_min[1], s_gpu.xf_max[1],
              s_gpu.xf_min[2], s_gpu.xf_max[2]);
      {
@@ -10784,20 +11768,23 @@ index 0000000..59f8da2
 +
 +#endif /* NV2A_REG_TRAP_H */
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
-index 7fae74c..9fd8a5a 100644
+index 7fae74c..d4fd718 100644
 --- a/src/kernel/nv2a_vsh_interp.c
 +++ b/src/kernel/nv2a_vsh_interp.c
-@@ -39,6 +39,9 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
+@@ -39,6 +39,12 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
  static uint32_t s_load_slot, s_load_word, s_start_slot;
  static uint32_t s_const_load, s_const_word;
  static uint32_t s_cxt_write;
++/* Bumped by every write to s_const (uploads and program c[] writes): the
++ * compiled path keeps its broadcast constants while it is unchanged. */
++static uint32_t s_const_gen;
 +/* The program from the start slot, decoded once instead of per vertex (see
 + * decode_program). Any upload or a new start slot invalidates it. */
 +static int s_dec_valid;
  
  static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
  {
-@@ -57,13 +60,20 @@ void nv2a_vsh_program_word(uint32_t word)
+@@ -57,13 +63,20 @@ void nv2a_vsh_program_word(uint32_t word)
  {
      if (s_load_slot < NV2A_VSH_SLOTS)
          s_program[s_load_slot][s_load_word] = word;
@@ -10819,7 +11806,22 @@ index 7fae74c..9fd8a5a 100644
  void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
  
  void nv2a_vsh_set_constant_load(uint32_t index)
-@@ -92,6 +102,7 @@ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
+@@ -76,6 +89,7 @@ void nv2a_vsh_constant_word(uint32_t word)
+ {
+     if (s_const_load < NV2A_VSH_CONSTANTS)
+         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
++    s_const_gen++;
+     if (++s_const_word == 4) {
+         s_const_word = 0;
+         s_const_load++;
+@@ -86,12 +100,14 @@ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
+ {
+     if (index < NV2A_VSH_CONSTANTS)
+         memcpy(s_const[index], v, sizeof s_const[index]);
++    s_const_gen++;
+ }
+ 
+ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
  {
      if (slot < NV2A_VSH_SLOTS)
          memcpy(s_program[slot], words, sizeof s_program[slot]);
@@ -10827,7 +11829,7 @@ index 7fae74c..9fd8a5a 100644
  }
  
  /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
-@@ -159,6 +170,12 @@ static void dump_program(uint32_t start)
+@@ -159,6 +175,12 @@ static void dump_program(uint32_t start)
      fflush(stderr);
  }
  
@@ -10840,7 +11842,15 @@ index 7fae74c..9fd8a5a 100644
  const float *nv2a_vsh_constant(uint32_t index)
  {
      return s_const[index < NV2A_VSH_CONSTANTS ? index : 0];
-@@ -305,12 +322,488 @@ static vec4 run_ilu(uint32_t op, vec4 c)
+@@ -168,6 +190,7 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
+ {
+     if (index < NV2A_VSH_CONSTANTS && comp < 4)
+         memcpy(&s_const[index][comp], &word, 4);
++    s_const_gen++;
+ }
+ 
+ /* ---- execution ----------------------------------------------------------- */
+@@ -305,12 +328,1458 @@ static vec4 run_ilu(uint32_t op, vec4 c)
      return r;
  }
  
@@ -10857,6 +11867,7 @@ index 7fae74c..9fd8a5a 100644
 +} VshDec;
 +static VshDec s_dec[NV2A_VSH_SLOTS];
 +static uint32_t s_dec_n;
++static uint32_t s_in_used;          /* inputs the program reads (bit per v#) */
 +
 +/* ---- the same loop, four components at a time ----------------------------
 + *
@@ -11003,7 +12014,7 @@ index 7fae74c..9fd8a5a 100644
 +        if (d->omask) {
 +            __m128 src = d->out_ilu ? ires : mres;
 +            if (!d->out_o) {                              /* to c[] */
-+                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
++                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS && ++s_const_gen)
 +                    _mm_storeu_ps(s_const[d->oaddr],
 +                                  vsh_blend(_mm_loadu_ps(s_const[d->oaddr]),
 +                                            src, v->out_wr));
@@ -11210,6 +12221,966 @@ index 7fae74c..9fd8a5a 100644
 +    }
 +    return 0;
 +}
++/* ---- the same program, four vertices per register (structure of arrays) --
++ *
++ * vsh_run_sse_batch keeps each vertex's register as one __m128 (x y z w), so
++ * every dot product -- most of a transform program -- is a store, three
++ * scalar adds and a broadcast, and every source read is a byte shuffle. Here
++ * a register is four __m128, one per component, each holding that component
++ * of four vertices: a swizzle is the choice of which of the four to read, a
++ * dot product is four multiplies and three adds straight down the lanes, a
++ * masked write is storing only the components the mask names. The two Cairo
++ * cinematic profiles of 2026-10-17 had the executor at 97% of the frame with
++ * a third of it in vsh_run_sse_batch.
++ *
++ * Exactness: every lane does vsh_run_sse's IEEE operations in vsh_run_sse's
++ * order -- the products of a dot product summed left to right, no fused
++ * multiply-add, min/max/slt/sge as the same compares, rcp/rcc/rsq as the
++ * same divide and square root with the same special cases, and the other ILU
++ * ops through run_ilu itself, lane by lane -- so the outputs are
++ * bit-identical; RECOMP_VSH_BATCHCHECK=1 compares every vertex against
++ * vsh_run_sse. RECOMP_VSH_SOA=0 runs vsh_run_sse_batch instead. */
++#define VSH_G (NV2A_VSH_BATCH / 4)
++typedef struct { __m128 c[4][VSH_G]; } VshSoa;
++
++static __forceinline __m128 vsh_sel(__m128 dst, __m128 src, __m128 mask)
++{
++    return _mm_or_ps(_mm_and_ps(mask, src), _mm_andnot_ps(mask, dst));
++}
++
++static int vsh_run_soa(const float (*in)[NV2A_VSH_INPUTS][4],
++                       Nv2aVshOutput *const *out, uint32_t n)
++{
++    VshSoa T[13], O[13], V[NV2A_VSH_INPUTS];
++    __m128 cb[3][4];                        /* broadcast constant sources   */
++    __m128 gb[3][4][VSH_G];                 /* gathered a0-relative sources */
++    int a0[VSH_G * 4];
++    const uint32_t G = (n + 3) / 4;
++    const __m128 zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f);
++    const __m128 sgn = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));
++    const __m128 inf = _mm_set1_ps(INFINITY);
++    const __m128 rcc_lo = _mm_set1_ps(5.42101e-20f), rcc_hi = _mm_set1_ps(1.884467e19f);
++    uint32_t s, i, c, g, k;
++
++    if (!s_dec_n)
++        return 0;
++    /* Inputs the program reads, transposed; lanes past n are zero. */
++    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
++        if (!(s_in_used & (1u << i)))
++            continue;
++        for (g = 0; g < G; g++) {
++            __m128 r0, r1, r2, r3;
++            uint32_t j = g * 4;
++            r0 = _mm_loadu_ps(in[j][i]);
++            r1 = j + 1 < n ? _mm_loadu_ps(in[j + 1][i]) : zero;
++            r2 = j + 2 < n ? _mm_loadu_ps(in[j + 2][i]) : zero;
++            r3 = j + 3 < n ? _mm_loadu_ps(in[j + 3][i]) : zero;
++            _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
++            V[i].c[0][g] = r0; V[i].c[1][g] = r1;
++            V[i].c[2][g] = r2; V[i].c[3][g] = r3;
++        }
++    }
++    for (i = 0; i < 13; i++)
++        for (c = 0; c < 4; c++)
++            for (g = 0; g < G; g++) {
++                T[i].c[c][g] = zero;
++                /* colours and texture coordinates default to (0,0,0,1) */
++                O[i].c[c][g] = (c == 3 && (i == 3 || i == 4 || i >= 9)) ? one : zero;
++            }
++    for (i = 0; i < G * 4; i++)
++        a0[i] = 0;
++
++    for (s = 0; s < s_dec_n; s++) {
++        const VshDec *d = &s_dec[s];
++        const uint32_t mac = d->mac, ilu = d->ilu;
++        const __m128 *ps[3][4];
++        uint32_t st[3] = {0, 0, 0};
++        __m128 sg[3];
++        const int wr_mac = mac && mac != 13 && d->mac_mask && d->tdst <= 12;
++        const uint32_t it = mac ? 1u : d->tdst;
++        const int wr_ilu = ilu && d->ilu_mask && it <= 12;
++        VshSoa *od = NULL;
++
++        for (k = 0; k < 3; k++) {
++            const VshSrc *sr = &d->src[k];
++            sg[k] = sr->neg ? sgn : zero;
++            if (!(d->need & (1u << k))) {
++                for (c = 0; c < 4; c++) ps[k][c] = &zero;
++                continue;
++            }
++            if (sr->mux == 1) {
++                for (c = 0; c < 4; c++) ps[k][c] = T[sr->reg].c[sr->sw[c]];
++                st[k] = 1;
++            } else if (sr->mux == 2) {
++                for (c = 0; c < 4; c++) ps[k][c] = V[d->in_idx].c[sr->sw[c]];
++                st[k] = 1;
++            } else if (!d->rel) {
++                int ci = (int)d->cidx;
++                if (ci >= NV2A_VSH_CONSTANTS)
++                    ci = 0;
++                for (c = 0; c < 4; c++) {
++                    cb[k][c] = _mm_set1_ps(s_const[ci][sr->sw[c]]);
++                    ps[k][c] = &cb[k][c];
++                }
++            } else {
++                for (g = 0; g < G; g++) {
++                    const float *q[4];
++                    uint32_t l;
++                    for (l = 0; l < 4; l++) {
++                        int ci = (int)d->cidx + a0[g * 4 + l];
++                        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
++                            ci = 0;
++                        q[l] = s_const[ci];
++                    }
++                    for (c = 0; c < 4; c++) {
++                        uint32_t w = sr->sw[c];
++                        gb[k][c][g] = _mm_set_ps(q[3][w], q[2][w], q[1][w], q[0][w]);
++                    }
++                }
++                for (c = 0; c < 4; c++) ps[k][c] = gb[k][c];
++                st[k] = 1;
++            }
++        }
++        if (d->omask && d->out_o)                 /* c[] writes: not in this path */
++            od = d->oaddr == 0 ? &T[12] : d->oaddr < 13 ? &O[d->oaddr] : NULL;
++
++        for (g = 0; g < G; g++) {
++            __m128 A[4], B[4], C[4], M[4], I[4];
++            for (c = 0; c < 4; c++) {
++                A[c] = _mm_xor_ps(ps[0][c][g * st[0]], sg[0]);
++                B[c] = _mm_xor_ps(ps[1][c][g * st[1]], sg[1]);
++                C[c] = _mm_xor_ps(ps[2][c][g * st[2]], sg[2]);
++            }
++            switch (mac) {
++            case 0: M[0] = M[1] = M[2] = M[3] = zero; break;
++            case 2: for (c = 0; c < 4; c++) M[c] = _mm_mul_ps(A[c], B[c]); break;
++            case 3: for (c = 0; c < 4; c++) M[c] = _mm_add_ps(A[c], C[c]); break;
++            case 4: for (c = 0; c < 4; c++)
++                        M[c] = _mm_add_ps(_mm_mul_ps(A[c], B[c]), C[c]);
++                    break;
++            case 5: M[0] = _mm_add_ps(_mm_add_ps(_mm_mul_ps(A[0], B[0]),
++                                                 _mm_mul_ps(A[1], B[1])),
++                                      _mm_mul_ps(A[2], B[2]));
++                    M[1] = M[2] = M[3] = M[0]; break;
++            case 6: M[0] = _mm_add_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(A[0], B[0]),
++                                                            _mm_mul_ps(A[1], B[1])),
++                                                 _mm_mul_ps(A[2], B[2])), B[3]);
++                    M[1] = M[2] = M[3] = M[0]; break;
++            case 7: M[0] = _mm_add_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(A[0], B[0]),
++                                                            _mm_mul_ps(A[1], B[1])),
++                                                 _mm_mul_ps(A[2], B[2])),
++                                      _mm_mul_ps(A[3], B[3]));
++                    M[1] = M[2] = M[3] = M[0]; break;
++            case 8: M[0] = one; M[1] = _mm_mul_ps(A[1], B[1]);
++                    M[2] = A[2]; M[3] = B[3]; break;
++            case 9:  for (c = 0; c < 4; c++)
++                         M[c] = vsh_sel(B[c], A[c], _mm_cmplt_ps(A[c], B[c]));
++                     break;
++            case 10: for (c = 0; c < 4; c++)
++                         M[c] = vsh_sel(B[c], A[c], _mm_cmpge_ps(A[c], B[c]));
++                     break;
++            case 11: for (c = 0; c < 4; c++)
++                         M[c] = _mm_and_ps(_mm_cmplt_ps(A[c], B[c]), one);
++                     break;
++            case 12: for (c = 0; c < 4; c++)
++                         M[c] = _mm_and_ps(_mm_cmpge_ps(A[c], B[c]), one);
++                     break;
++            case 13: {
++                float f[4];
++                uint32_t l;
++                _mm_storeu_ps(f, A[0]);
++                for (l = 0; l < 4; l++)
++                    a0[g * 4 + l] = (int)floorf(f[l] + 0.001f);
++            }
++                /* fall through: the result is A, as for mov */
++            default: for (c = 0; c < 4; c++) M[c] = A[c]; break;
++            }
++            switch (ilu) {
++            case 0: I[0] = I[1] = I[2] = I[3] = zero; break;
++            case 1: for (c = 0; c < 4; c++) I[c] = C[c]; break;
++            case 2:                                         /* rcp */
++                I[0] = vsh_sel(_mm_div_ps(one, C[0]), inf, _mm_cmpeq_ps(C[0], zero));
++                I[1] = I[2] = I[3] = I[0]; break;
++            case 3: {                                       /* rcc */
++                __m128 f = _mm_div_ps(one, C[0]);
++                __m128 neg = _mm_cmplt_ps(f, zero);
++                __m128 lo = _mm_or_ps(rcc_lo, _mm_and_ps(neg, sgn));
++                __m128 hi = _mm_or_ps(rcc_hi, _mm_and_ps(neg, sgn));
++                f = vsh_sel(f, lo, _mm_cmplt_ps(_mm_andnot_ps(sgn, f), rcc_lo));
++                f = vsh_sel(f, hi, _mm_cmpgt_ps(_mm_andnot_ps(sgn, f), rcc_hi));
++                I[0] = I[1] = I[2] = I[3] = f; break;
++            }
++            case 4:                                         /* rsq */
++                I[0] = _mm_div_ps(one, _mm_sqrt_ps(_mm_andnot_ps(sgn, C[0])));
++                I[1] = I[2] = I[3] = I[0]; break;
++            default: {                                      /* exp log lit */
++                float cf[4][4], rf[4][4];
++                uint32_t l;
++                for (c = 0; c < 4; c++) _mm_storeu_ps(cf[c], C[c]);
++                for (l = 0; l < 4; l++) {
++                    vec4 cv, rv;
++                    for (c = 0; c < 4; c++) cv.v[c] = cf[c][l];
++                    rv = run_ilu(ilu, cv);
++                    for (c = 0; c < 4; c++) rf[c][l] = rv.v[c];
++                }
++                for (c = 0; c < 4; c++) I[c] = _mm_loadu_ps(rf[c]);
++                break;
++            }
++            }
++            if (wr_mac)
++                for (c = 0; c < 4; c++)
++                    if (d->mac_mask & (8u >> c)) T[d->tdst].c[c][g] = M[c];
++            if (wr_ilu)
++                for (c = 0; c < 4; c++)
++                    if (d->ilu_mask & (8u >> c)) T[it].c[c][g] = I[c];
++            if (od) {
++                const __m128 *src = d->out_ilu ? I : M;
++                for (c = 0; c < 4; c++)
++                    if (d->omask & (8u >> c)) od->c[c][g] = src[c];
++            }
++        }
++        if (d->final) {
++            static const uint8_t oreg[8] = {12, 3, 4, 5, 9, 10, 11, 12};
++            for (g = 0; g < G; g++) {
++                for (k = 0; k < 8; k++) {
++                    const VshSoa *r = k == 0 ? &T[12] : &O[oreg[k]];
++                    __m128 r0 = r->c[0][g], r1 = r->c[1][g], r2 = r->c[2][g], r3 = r->c[3][g];
++                    float *dst[4];
++                    uint32_t l, j = g * 4;
++                    _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
++                    for (l = 0; l < 4; l++) {
++                        Nv2aVshOutput *o = j + l < n ? out[j + l] : NULL;
++                        dst[l] = !o ? NULL : k == 0 ? o->pos : k == 1 ? o->d0
++                               : k == 2 ? o->d1 : k == 3 ? o->fog : o->tex[k - 4];
++                    }
++                    _mm_storeu_ps(dst[0], r0);
++                    if (dst[1]) _mm_storeu_ps(dst[1], r1);
++                    if (dst[2]) _mm_storeu_ps(dst[2], r2);
++                    if (dst[3]) _mm_storeu_ps(dst[3], r3);
++                }
++            }
++            return 1;
++        }
++    }
++    return 0;
++}
++
++/* ---- the program compiled to a list of block operations ("uops") ---------
++ *
++ * vsh_run_soa still decides, for every instruction and every four vertices,
++ * where each operand comes from, whether it is negated, what the operation
++ * is and which components are written -- and on the capture of 2026-10-17
++ * (45 programs, 36 instructions on average, mostly dp3/dph/mad/mul) that
++ * bookkeeping, not the arithmetic, was the cost: 120 ns a vertex either way.
++ * Here each distinct program is translated once (and cached by content) into
++ * a list of operations whose operands are already resolved to slots of one
++ * register file -- a slot is one component of one register for the four
++ * vertex groups of a block -- so running it is a call per operation and a
++ * short loop of loads, the arithmetic and stores. Components nobody writes
++ * are not computed; constants are broadcast once per block.
++ *
++ * Exactness is vsh_run_soa's: the same IEEE operations in the same order per
++ * lane. Reads before writes: an operation computes all its components before
++ * storing any, and an instruction that uses both units runs its ILU half into
++ * scratch slots first. RECOMP_VSH_BATCHCHECK=1 compares every vertex with
++ * vsh_run_sse. RECOMP_VSH_PATH=soa / batch picks the older block paths. */
++#define VU_NONE   0xFFFFu
++#define VU_ZERO   0u
++#define VU_ONE    1u
++#define VU_T(r, c) (2u + (r) * 4u + (c))           /* R0..R11, R12 = oPos */
++#define VU_O(r, c) (54u + (r) * 4u + (c))          /* o[1..12]            */
++#define VU_V(i, c) (106u + (i) * 4u + (c))         /* v0..v15             */
++#define VU_S(c)   (170u + (c))                     /* ILU scratch         */
++#define VU_GA(k, c) (174u + (k) * 4u + (c))        /* a0-relative gathers */
++#define VU_K0     186u                             /* broadcast constants */
++#define VU_SLOTS  (VU_K0 + NV2A_VSH_CONSTANTS * 4u)
++#define VU_JUNK   VU_SLOTS                         /* stores nobody reads */
++#define VU_MAXOPS (NV2A_VSH_SLOTS * 8)   /* per instruction at most 3 gathers, arl, ilu, mac, copy */
++
++struct VshUop;
++typedef void (*VshUopFn)(const struct VshUop *, __m128 *, uint32_t);
++typedef struct VshUop {
++    __m128   sg[3];                 /* sign masks of A, B, C            */
++    VshUopFn fn;
++    uint16_t a[4], b[4], c[4];      /* operand slots, per entry/component */
++    uint16_t d[8];                  /* destination slots (see each fn)  */
++    uint8_t  n, nd, op;
++    uint8_t  neg;                   /* operands with a sign mask set     */
++    uint16_t cidx;                  /* gather: constant index           */
++} VshUop;
++
++typedef struct VshProg {
++    uint32_t hash, nwords;
++    uint32_t *words;                /* the program, to tell hashes apart */
++    VshUop  *ops;
++    uint32_t nops;
++    uint16_t *kslot;                /* broadcast: slot, constant*4+comp  */
++    uint32_t nk;
++    uint32_t in_used;
++    uint16_t zero_slots[13 * 4];    /* temps read before any write: zero */
++    uint32_t nzero;
++    uint16_t oinit[7 * 4];          /* output components never written    */
++    uint32_t noinit;
++} VshProg;
++
++/* The register file: VU_SLOTS slots, the junk slot, then a0.x of every lane
++ * (VSH_G * 4 ints, one slot's worth). One per thread that runs programs
++ * (Nv2aVshCtx); the executor's own is s_vu_main. */
++#define VU_FILE_VECS ((VU_SLOTS + 2) * VSH_G)
++#define VU_A0(F) ((int *)((F) + (VU_SLOTS + 1) * VSH_G))
++struct Nv2aVshCtx {
++    __m128 *F;
++    const struct VshProg *last;     /* whose constants and defaults F holds */
++    uint32_t last_gen, last_epoch;
++    float junk_out[sizeof(Nv2aVshOutput) / sizeof(float)];
++};
++static __m128 s_vu_file[VU_FILE_VECS];
++static Nv2aVshCtx s_vu_main = { s_vu_file, NULL, 0, 0, {0} };
++static uint32_t s_vu_epoch;         /* bumped when the program cache is emptied */
++#ifdef VSH_BENCH_HOOKS
++static int g_vu_bench_skip;          /* tools/vsh_bench.c: time the rest */
++#endif
++#define VU_F(slot, g) F[(uint32_t)(slot) * VSH_G + (g)]
++
++/* The operation's fields, read once into locals: the compiler cannot know
++ * that the stores into the register file leave the operation alone, and
++ * would re-read every field after every store. */
++#define VU_PTRS(arr, k) const __m128 *const p##arr##k = F + (uint32_t)u->arr[k] * VSH_G
++#define VU_SRC4(arr)  VU_PTRS(arr, 0); VU_PTRS(arr, 1); VU_PTRS(arr, 2); VU_PTRS(arr, 3)
++#define VU_DST(k)     __m128 *const pd##k = F + (uint32_t)u->d[k] * VSH_G
++
++/* Per-component operations: always four entries (unused ones read the zero
++ * slot and store to the junk slot); entry i computes from a[i], b[i], c[i]
++ * and goes to d[2i] and d[2i+1]. */
++#define VU_PERCOMP_(name, EXPR, LD)                                            \
++static void name(const VshUop *u, __m128 *F, uint32_t G)                    \
++{                                                                           \
++    const __m128 sa = u->sg[0], sb = u->sg[1], sc = u->sg[2];               \
++    uint32_t g;                                                             \
++    VU_SRC4(a); VU_SRC4(b); VU_SRC4(c);                                     \
++    VU_DST(0); VU_DST(1); VU_DST(2); VU_DST(3);                             \
++    VU_DST(4); VU_DST(5); VU_DST(6); VU_DST(7);                             \
++    (void)sa; (void)sb; (void)sc;                                           \
++    for (g = 0; g < G; g++) {                                               \
++        __m128 A, B, C, r0, r1, r2, r3;                                     \
++        A = LD(pa0[g], sa); B = LD(pb0[g], sb);             \
++        C = LD(pc0[g], sc); r0 = (EXPR);                            \
++        A = LD(pa1[g], sa); B = LD(pb1[g], sb);             \
++        C = LD(pc1[g], sc); r1 = (EXPR);                            \
++        A = LD(pa2[g], sa); B = LD(pb2[g], sb);             \
++        C = LD(pc2[g], sc); r2 = (EXPR);                            \
++        A = LD(pa3[g], sa); B = LD(pb3[g], sb);             \
++        C = LD(pc3[g], sc); r3 = (EXPR);                            \
++        (void)A; (void)B; (void)C;                                          \
++        pd0[g] = r0; pd1[g] = r0; pd2[g] = r1; pd3[g] = r1;                 \
++        pd4[g] = r2; pd5[g] = r2; pd6[g] = r3; pd7[g] = r3;                 \
++    }                                                                       \
++}
++#define VU_LDX(x, s) _mm_xor_ps(x, s)
++#define VU_LDP(x, s) (x)
++/* name: operands negated per the sign masks; name_p: no operand negated. */
++#define VU_PERCOMP(name, EXPR) VU_PERCOMP_(name, EXPR, VU_LDX) VU_PERCOMP_(name##_p, EXPR, VU_LDP)
++VU_PERCOMP(vu_mov, A)
++VU_PERCOMP(vu_mul, _mm_mul_ps(A, B))
++VU_PERCOMP(vu_add, _mm_add_ps(A, C))
++VU_PERCOMP(vu_mad, _mm_add_ps(_mm_mul_ps(A, B), C))
++VU_PERCOMP(vu_min, vsh_sel(B, A, _mm_cmplt_ps(A, B)))
++VU_PERCOMP(vu_max, vsh_sel(B, A, _mm_cmpge_ps(A, B)))
++VU_PERCOMP(vu_slt, _mm_and_ps(_mm_cmplt_ps(A, B), _mm_set1_ps(1.0f)))
++VU_PERCOMP(vu_sge, _mm_and_ps(_mm_cmpge_ps(A, B), _mm_set1_ps(1.0f)))
++VU_PERCOMP(vu_cmov, C)                          /* ILU mov */
++
++/* Splat operations: one value from a[0..3] / b[0..3] / c[0], to the nd
++ * slots d[0..nd-1]. */
++#define VU_SPLAT_(name, EXPR, LD)                                              \
++static void name(const VshUop *u, __m128 *F, uint32_t G)                    \
++{                                                                           \
++    const __m128 sa = u->sg[0], sb = u->sg[1], sc = u->sg[2];               \
++    __m128 *pd[8];                                                          \
++    const uint32_t nd = u->nd;                                              \
++    uint32_t g, i;                                                          \
++    VU_SRC4(a); VU_SRC4(b); VU_PTRS(c, 0);                                  \
++    (void)sa; (void)sb; (void)sc;                                           \
++    for (i = 0; i < nd; i++) pd[i] = F + (uint32_t)u->d[i] * VSH_G;         \
++    for (g = 0; g < G; g++) {                                               \
++        const __m128 A0 = LD(pa0[g], sa), A1 = LD(pa1[g], sa); \
++        const __m128 A2 = LD(pa2[g], sa), A3 = LD(pa3[g], sa); \
++        const __m128 B0 = LD(pb0[g], sb), B1 = LD(pb1[g], sb); \
++        const __m128 B2 = LD(pb2[g], sb), B3 = LD(pb3[g], sb); \
++        const __m128 C0 = LD(pc0[g], sc);                           \
++        const __m128 r = (EXPR);                                            \
++        (void)A0; (void)A1; (void)A2; (void)A3; (void)B0; (void)B1;        \
++        (void)B2; (void)B3; (void)C0;                                       \
++        for (i = 0; i < nd; i++) pd[i][g] = r;                              \
++    }                                                                       \
++}
++#define VU_SPLAT(name, EXPR) VU_SPLAT_(name, EXPR, VU_LDX) VU_SPLAT_(name##_p, EXPR, VU_LDP)
++VU_SPLAT(vu_dp3, _mm_add_ps(_mm_add_ps(_mm_mul_ps(A0, B0), _mm_mul_ps(A1, B1)),
++                            _mm_mul_ps(A2, B2)))
++VU_SPLAT(vu_dph, _mm_add_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(A0, B0), _mm_mul_ps(A1, B1)),
++                                       _mm_mul_ps(A2, B2)), B3))
++VU_SPLAT(vu_dp4, _mm_add_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(A0, B0), _mm_mul_ps(A1, B1)),
++                                       _mm_mul_ps(A2, B2)), _mm_mul_ps(A3, B3)))
++VU_SPLAT(vu_rcp, vsh_sel(_mm_div_ps(_mm_set1_ps(1.0f), C0), _mm_set1_ps(INFINITY),
++                         _mm_cmpeq_ps(C0, _mm_setzero_ps())))
++VU_SPLAT(vu_rsq, _mm_div_ps(_mm_set1_ps(1.0f),
++                            _mm_sqrt_ps(_mm_andnot_ps(_mm_set1_ps(-0.0f), C0))))
++
++static __forceinline __m128 vu_rcc1(__m128 c)
++{
++    const __m128 sgn = _mm_set1_ps(-0.0f);
++    const __m128 lo0 = _mm_set1_ps(5.42101e-20f), hi0 = _mm_set1_ps(1.884467e19f);
++    __m128 f = _mm_div_ps(_mm_set1_ps(1.0f), c);
++    __m128 ns = _mm_and_ps(_mm_cmplt_ps(f, _mm_setzero_ps()), sgn);
++    f = vsh_sel(f, _mm_or_ps(lo0, ns), _mm_cmplt_ps(_mm_andnot_ps(sgn, f), lo0));
++    f = vsh_sel(f, _mm_or_ps(hi0, ns), _mm_cmpgt_ps(_mm_andnot_ps(sgn, f), hi0));
++    return f;
++}
++VU_SPLAT(vu_rcc, vu_rcc1(C0))
++
++/* Per-component results with one formula per component: component k goes
++ * to d[2k], d[2k+1] (junk when unused). dst: (1, a.y*b.y, a.z, b.w);
++ * exp/log/lit by run_ilu, lane by lane, from c[0..3]. */
++static void vu_dst(const VshUop *u, __m128 *F, uint32_t G)
++{
++    const __m128 sa = u->sg[0], sb = u->sg[1], one = _mm_set1_ps(1.0f);
++    uint32_t g;
++    VU_PTRS(a, 1); VU_PTRS(a, 2); VU_PTRS(b, 1); VU_PTRS(b, 3);
++    VU_DST(0); VU_DST(1); VU_DST(2); VU_DST(3);
++    VU_DST(4); VU_DST(5); VU_DST(6); VU_DST(7);
++    for (g = 0; g < G; g++) {
++        const __m128 r1 = _mm_mul_ps(_mm_xor_ps(pa1[g], sa), _mm_xor_ps(pb1[g], sb));
++        const __m128 r2 = _mm_xor_ps(pa2[g], sa), r3 = _mm_xor_ps(pb3[g], sb);
++        pd0[g] = one; pd1[g] = one; pd2[g] = r1; pd3[g] = r1;
++        pd4[g] = r2; pd5[g] = r2; pd6[g] = r3; pd7[g] = r3;
++    }
++}
++
++static void vu_ilu_scalar(const VshUop *u, __m128 *F, uint32_t G)
++{
++    const __m128 sc = u->sg[2];
++    const uint32_t op = u->op;
++    uint32_t g, k, l;
++    VU_SRC4(c);
++    VU_DST(0); VU_DST(1); VU_DST(2); VU_DST(3);
++    VU_DST(4); VU_DST(5); VU_DST(6); VU_DST(7);
++    for (g = 0; g < G; g++) {
++        float cf[4][4], rf[4][4];
++        __m128 r[4];
++        _mm_storeu_ps(cf[0], _mm_xor_ps(pc0[g], sc));
++        _mm_storeu_ps(cf[1], _mm_xor_ps(pc1[g], sc));
++        _mm_storeu_ps(cf[2], _mm_xor_ps(pc2[g], sc));
++        _mm_storeu_ps(cf[3], _mm_xor_ps(pc3[g], sc));
++        for (l = 0; l < 4; l++) {
++            vec4 cv, rv;
++            for (k = 0; k < 4; k++) cv.v[k] = cf[k][l];
++            rv = run_ilu(op, cv);
++            for (k = 0; k < 4; k++) rf[k][l] = rv.v[k];
++        }
++        for (k = 0; k < 4; k++) r[k] = _mm_loadu_ps(rf[k]);
++        pd0[g] = r[0]; pd1[g] = r[0]; pd2[g] = r[1]; pd3[g] = r[1];
++        pd4[g] = r[2]; pd5[g] = r[2]; pd6[g] = r[3]; pd7[g] = r[3];
++    }
++}
++
++static void vu_arl(const VshUop *u, __m128 *F, uint32_t G)
++{
++    const __m128 sa = u->sg[0];
++    uint32_t g, l;
++    VU_PTRS(a, 0);
++    for (g = 0; g < G; g++) {
++        float f[4];
++        _mm_storeu_ps(f, _mm_xor_ps(pa0[g], sa));
++        for (l = 0; l < 4; l++)
++            VU_A0(F)[g * 4 + l] = (int)floorf(f[l] + 0.001f);
++    }
++}
++
++/* c[cidx + a0.x], lane by lane: component a[k] of it to slot d[k] (k < n). */
++static void vu_gather(const VshUop *u, __m128 *F, uint32_t G)
++{
++    uint32_t g, l, k;
++    for (g = 0; g < G; g++) {
++        const float *q[4];
++        for (l = 0; l < 4; l++) {
++            int ci = (int)u->cidx + VU_A0(F)[g * 4 + l];
++            if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
++                ci = 0;
++            q[l] = s_const[ci];
++        }
++        for (k = 0; k < u->n; k++) {
++            uint32_t w = u->a[k];
++            VU_F(u->d[k], g) = _mm_set_ps(q[3][w], q[2][w], q[1][w], q[0][w]);
++        }
++    }
++}
++
++/* ---- the translator ---- */
++
++/* The variant without negation, for an operation none of whose operands is
++ * negated (most of them). */
++static VshUopFn vu_plain(VshUopFn f)
++{
++    static const VshUopFn tab[][2] = {
++        {vu_mov, vu_mov_p}, {vu_mul, vu_mul_p}, {vu_add, vu_add_p}, {vu_mad, vu_mad_p},
++        {vu_min, vu_min_p}, {vu_max, vu_max_p}, {vu_slt, vu_slt_p}, {vu_sge, vu_sge_p},
++        {vu_cmov, vu_cmov_p}, {vu_dp3, vu_dp3_p}, {vu_dph, vu_dph_p}, {vu_dp4, vu_dp4_p},
++        {vu_rcp, vu_rcp_p}, {vu_rsq, vu_rsq_p}, {vu_rcc, vu_rcc_p}
++    };
++    size_t i;
++    for (i = 0; i < sizeof tab / sizeof tab[0]; i++)
++        if (tab[i][0] == f)
++            return tab[i][1];
++    return f;
++}
++
++static VshProg *s_vu_cache[256];
++static uint32_t s_vu_ncache;
++static VshProg *s_vu_cur;           /* for the decoded program; NULL: compile */
++/* The program whose constants and output defaults the file holds, and the
++ * constants' generation then. */
++static float s_vu_zero_in[NV2A_VSH_INPUTS][4];
++
++/* Where operand k of instruction d reads component c. */
++static uint16_t vu_src_slot(const VshDec *d, int k, int c, VshProg *p,
++                            uint16_t *kmap)
++{
++    const VshSrc *sr = &d->src[k];
++    uint32_t w = sr->sw[c];
++    if (sr->mux == 1)
++        return (uint16_t)VU_T(sr->reg, w);
++    if (sr->mux == 2)
++        return (uint16_t)VU_V(d->in_idx, w);
++    if (d->rel)
++        return (uint16_t)VU_GA(k, c);
++    {
++        uint32_t ci = d->cidx < NV2A_VSH_CONSTANTS ? d->cidx : 0;
++        uint32_t key = ci * 4 + w;
++        if (kmap[key] == VU_NONE) {
++            kmap[key] = (uint16_t)(VU_K0 + p->nk);
++            p->kslot[2 * p->nk] = kmap[key];
++            p->kslot[2 * p->nk + 1] = (uint16_t)key;
++            p->nk++;
++        }
++        return kmap[key];
++    }
++}
++
++static void vu_sources(VshUop *u, const VshDec *d, VshProg *p, uint16_t *kmap)
++{
++    int k, c;
++    for (k = 0; k < 3; k++) {
++        u->sg[k] = d->src[k].neg ? _mm_set1_ps(-0.0f) : _mm_setzero_ps();
++        for (c = 0; c < 4; c++) {
++            uint16_t s = (d->need & (1u << k)) ? vu_src_slot(d, k, c, p, kmap)
++                                               : (uint16_t)VU_ZERO;
++            if (k == 0) u->a[c] = s; else if (k == 1) u->b[c] = s; else u->c[c] = s;
++        }
++        if (!(d->need & (1u << k)))
++            u->sg[k] = _mm_setzero_ps();
++        else if (d->src[k].neg)
++            u->neg |= (uint8_t)(1u << k);
++    }
++}
++
++/* Destinations of one unit's result: per component up to two slots. */
++typedef struct { uint16_t s[4][2]; } VuDst;
++
++static int vu_dst_any(const VuDst *t)
++{
++    int c;
++    for (c = 0; c < 4; c++) if (t->s[c][0] != VU_NONE) return 1;
++    return 0;
++}
++
++static void vu_dst_add(VuDst *t, uint32_t mask, uint32_t base_slot_r0c0)
++{
++    int c;
++    for (c = 0; c < 4; c++) {
++        if (!(mask & (8u >> c)))
++            continue;
++        if (t->s[c][0] == VU_NONE) t->s[c][0] = (uint16_t)(base_slot_r0c0 + c);
++        else                       t->s[c][1] = (uint16_t)(base_slot_r0c0 + c);
++    }
++}
++
++/* Emit "result component c = f(entry c)" for the components that have a
++ * destination, as a per-component uop. */
++static void vu_emit_percomp(VshProg *p, VshUop *u, VshUopFn fn, const VuDst *t)
++{
++    VshUop o = *u;
++    int c;
++    o.fn = fn;
++    o.n = 0;
++    for (c = 0; c < 4; c++) {
++        if (t->s[c][0] == VU_NONE)
++            continue;
++        o.a[o.n] = u->a[c]; o.b[o.n] = u->b[c]; o.c[o.n] = u->c[c];
++        o.d[2 * o.n] = t->s[c][0];
++        o.d[2 * o.n + 1] = t->s[c][1] != VU_NONE ? t->s[c][1] : (uint16_t)VU_JUNK;
++        o.n++;
++    }
++    if (!o.n)
++        return;
++    if (!o.neg)
++        o.fn = vu_plain(fn);
++    for (c = o.n; c < 4; c++) {         /* padding: zero in, junk out */
++        o.a[c] = o.b[c] = o.c[c] = VU_ZERO;
++        o.d[2 * c] = o.d[2 * c + 1] = VU_JUNK;
++    }
++    p->ops[p->nops++] = o;
++}
++
++static void vu_emit_splat(VshProg *p, VshUop *u, VshUopFn fn, const VuDst *t)
++{
++    VshUop o = *u;
++    int c, j;
++    o.fn = o.neg ? fn : vu_plain(fn);
++    o.nd = 0;
++    for (c = 0; c < 4; c++)
++        for (j = 0; j < 2; j++)
++            if (t->s[c][j] != VU_NONE)
++                o.d[o.nd++] = t->s[c][j];
++    if (o.nd)
++        p->ops[p->nops++] = o;
++}
++
++static void vu_emit_comp4(VshProg *p, VshUop *u, VshUopFn fn, const VuDst *t)
++{
++    VshUop o = *u;
++    int c;
++    o.fn = fn;
++    for (c = 0; c < 4; c++) {
++        o.d[2 * c] = t->s[c][0] != VU_NONE ? t->s[c][0] : (uint16_t)VU_JUNK;
++        o.d[2 * c + 1] = t->s[c][1] != VU_NONE ? t->s[c][1] : (uint16_t)VU_JUNK;
++    }
++    if (vu_dst_any(t))
++        p->ops[p->nops++] = o;
++}
++
++static void vu_emit_mac(VshProg *p, VshUop *u, uint32_t mac, const VuDst *t)
++{
++    switch (mac) {
++    case 0: {                                       /* result 0 */
++        VshUop z = *u;
++        int c;
++        for (c = 0; c < 4; c++) z.a[c] = VU_ZERO;
++        z.sg[0] = _mm_setzero_ps();
++        vu_emit_percomp(p, &z, vu_mov, t);
++        break;
++    }
++    case 2:  vu_emit_percomp(p, u, vu_mul, t); break;
++    case 3:  vu_emit_percomp(p, u, vu_add, t); break;
++    case 4:  vu_emit_percomp(p, u, vu_mad, t); break;
++    case 5:  vu_emit_splat(p, u, vu_dp3, t); break;
++    case 6:  vu_emit_splat(p, u, vu_dph, t); break;
++    case 7:  vu_emit_splat(p, u, vu_dp4, t); break;
++    case 8:  vu_emit_comp4(p, u, vu_dst, t); break;
++    case 9:  vu_emit_percomp(p, u, vu_min, t); break;
++    case 10: vu_emit_percomp(p, u, vu_max, t); break;
++    case 11: vu_emit_percomp(p, u, vu_slt, t); break;
++    case 12: vu_emit_percomp(p, u, vu_sge, t); break;
++    default: vu_emit_percomp(p, u, vu_mov, t); break;   /* mov, arl, 14, 15 */
++    }
++}
++
++static void vu_emit_ilu(VshProg *p, VshUop *u, uint32_t ilu, const VuDst *t)
++{
++    switch (ilu) {
++    case 0: {
++        VshUop z = *u;
++        int c;
++        for (c = 0; c < 4; c++) z.a[c] = VU_ZERO;
++        z.sg[0] = _mm_setzero_ps();
++        vu_emit_percomp(p, &z, vu_mov, t);
++        break;
++    }
++    case 1: vu_emit_percomp(p, u, vu_cmov, t); break;
++    case 2: vu_emit_splat(p, u, vu_rcp, t); break;
++    case 3: vu_emit_splat(p, u, vu_rcc, t); break;
++    case 4: vu_emit_splat(p, u, vu_rsq, t); break;
++    default: {
++        VshUop o = *u;
++        o.op = (uint8_t)ilu;
++        vu_emit_comp4(p, &o, vu_ilu_scalar, t);
++        break;
++    }
++    }
++}
++
++static VshProg *vu_compile(uint32_t hash, const uint32_t *words, uint32_t nwords)
++{
++    VshProg *p = (VshProg *)calloc(1, sizeof *p);
++    uint16_t kmap[NV2A_VSH_CONSTANTS * 4];
++    uint8_t written[13 * 4];
++    uint32_t s, k, c;
++
++    if (!p)
++        return NULL;
++    p->ops = (VshUop *)_mm_malloc(sizeof *p->ops * VU_MAXOPS, 16);
++    p->kslot = (uint16_t *)malloc(sizeof *p->kslot * 2 * NV2A_VSH_CONSTANTS * 4);
++    p->words = (uint32_t *)malloc(4u * nwords);
++    if (!p->ops || !p->kslot || !p->words) {
++        if (p->ops) _mm_free(p->ops);
++        free(p->kslot); free(p->words); free(p);
++        return NULL;
++    }
++    memcpy(p->words, words, 4u * nwords);
++    p->hash = hash;
++    p->nwords = nwords;
++    p->in_used = s_in_used;
++    memset(kmap, 0xFF, sizeof kmap);
++    memset(written, 0, sizeof written);
++
++    for (s = 0; s < s_dec_n; s++) {
++        const VshDec *d = &s_dec[s];
++        const uint32_t mac = d->mac, ilu = d->ilu;
++        const int wr_mac = mac && mac != 13 && d->mac_mask && d->tdst <= 12;
++        const uint32_t it = mac ? 1u : d->tdst;
++        const int wr_ilu = ilu && d->ilu_mask && it <= 12;
++        int out_slot = -1;                          /* slot of comp 0 */
++        VshUop u;
++        VuDst dm, di;
++
++        memset(&u, 0, sizeof u);
++        memset(&dm, 0xFF, sizeof dm);
++        memset(&di, 0xFF, sizeof di);
++        vu_sources(&u, d, p, kmap);
++
++        /* Temps read before this program writes them start at zero. */
++        for (k = 0; k < 3; k++) {
++            if (!(d->need & (1u << k)) || d->src[k].mux != 1)
++                continue;
++            for (c = 0; c < 4; c++) {
++                uint32_t r = d->src[k].reg, w = d->src[k].sw[c];
++                if (!written[r * 4 + w]) {
++                    written[r * 4 + w] = 2;         /* zeroed */
++                    p->zero_slots[p->nzero++] = (uint16_t)VU_T(r, w);
++                }
++            }
++        }
++        /* a0-relative operands: gathered first, before anything changes. */
++        if (d->rel)
++            for (k = 0; k < 3; k++) {
++                VshUop gth;
++                if (!(d->need & (1u << k)) || d->src[k].mux == 1 || d->src[k].mux == 2)
++                    continue;
++                memset(&gth, 0, sizeof gth);
++                gth.fn = vu_gather;
++                gth.cidx = d->cidx;
++                gth.n = 4;
++                for (c = 0; c < 4; c++) {
++                    gth.a[c] = d->src[k].sw[c];
++                    gth.d[c] = (uint16_t)VU_GA(k, c);
++                }
++                p->ops[p->nops++] = gth;
++            }
++        if (d->omask && d->out_o)
++            out_slot = d->oaddr == 0 ? (int)VU_T(12, 0)
++                     : d->oaddr < 13 ? (int)VU_O(d->oaddr, 0) : -1;
++        if (wr_mac)
++            vu_dst_add(&dm, d->mac_mask, VU_T(d->tdst, 0));
++        if (wr_ilu)
++            vu_dst_add(&di, d->ilu_mask, VU_T(it, 0));
++        if (out_slot >= 0)
++            vu_dst_add(d->out_ilu ? &di : &dm, d->omask, (uint32_t)out_slot);
++
++        if (mac == 13) {
++            VshUop a = u;
++            a.fn = vu_arl;
++            p->ops[p->nops++] = a;
++        }
++        if (vu_dst_any(&dm) && vu_dst_any(&di)) {
++            /* Both units: the ILU into scratch, then the MAC, then the copy,
++             * so neither sees the other's writes (and the ILU's temp write
++             * lands after the MAC's, as in the scalar loop). */
++            VuDst sc;
++            VshUop cp;
++            memset(&sc, 0xFF, sizeof sc);
++            for (c = 0; c < 4; c++)
++                if (di.s[c][0] != VU_NONE) sc.s[c][0] = (uint16_t)VU_S(c);
++            vu_emit_ilu(p, &u, ilu, &sc);
++            vu_emit_mac(p, &u, mac, &dm);
++            memset(&cp, 0, sizeof cp);
++            for (c = 0; c < 4; c++) cp.a[c] = (uint16_t)VU_S(c);
++            vu_emit_percomp(p, &cp, vu_mov, &di);
++        } else if (vu_dst_any(&dm)) {
++            vu_emit_mac(p, &u, mac, &dm);
++        } else if (vu_dst_any(&di)) {
++            vu_emit_ilu(p, &u, ilu, &di);
++        }
++        for (c = 0; c < 4; c++) {
++            int j;
++            for (j = 0; j < 2; j++) {
++                uint16_t sl = dm.s[c][j] != VU_NONE ? dm.s[c][j] : VU_NONE;
++                if (sl != VU_NONE && sl >= VU_T(0, 0) && sl < VU_T(13, 0) && !written[sl - 2])
++                    written[sl - 2] = 1;
++                sl = di.s[c][j];
++                if (sl != VU_NONE && sl >= VU_T(0, 0) && sl < VU_T(13, 0) && !written[sl - 2])
++                    written[sl - 2] = 1;
++            }
++        }
++    }
++    /* oPos (R12) is an output: zero whatever the program leaves unwritten. */
++    for (c = 0; c < 4; c++)
++        if (!written[12 * 4 + c])
++            p->zero_slots[p->nzero++] = (uint16_t)VU_T(12, c);
++    /* The other outputs keep their defaults where the program never writes. */
++    {
++        static const uint8_t oregs[7] = {3, 4, 5, 9, 10, 11, 12};
++        uint8_t ow[13 * 4];
++        uint32_t i, j;
++        memset(ow, 0, sizeof ow);
++        for (i = 0; i < p->nops; i++) {
++            const VshUop *o = &p->ops[i];
++            uint32_t nd = (o->fn == vu_dp3 || o->fn == vu_dph || o->fn == vu_dp4
++                           || o->fn == vu_rcp || o->fn == vu_rsq || o->fn == vu_rcc) ? o->nd
++                        : (o->fn == vu_gather || o->fn == vu_arl) ? 0 : 8;
++            for (j = 0; j < nd; j++)
++                if (o->d[j] >= VU_O(0, 0) && o->d[j] < VU_O(13, 0))
++                    ow[o->d[j] - VU_O(0, 0)] = 1;
++        }
++        for (i = 0; i < 7; i++)
++            for (c = 0; c < 4; c++)
++                if (!ow[oregs[i] * 4 + c])
++                    p->oinit[p->noinit++] = (uint16_t)VU_O(oregs[i], c);
++    }
++    return p;
++}
++
++static uint32_t vu_program_words(const uint32_t **w)
++{
++    *w = s_program[s_start_slot];
++    return s_dec_n * 4u;
++}
++
++/* The compiled form of the decoded program, from the cache or translated. */
++static VshProg *vu_current(void)
++{
++    const uint32_t *w;
++    uint32_t nw, h = 2166136261u, i;
++
++    if (s_vu_cur)
++        return s_vu_cur;
++    if (!s_dec_n)
++        return NULL;
++    nw = vu_program_words(&w);
++    for (i = 0; i < nw; i++)
++        h = (h ^ w[i]) * 16777619u;
++    for (i = 0; i < s_vu_ncache; i++) {
++        VshProg *p = s_vu_cache[i];
++        if (p->hash == h && p->nwords == nw && !memcmp(p->words, w, 4u * nw))
++            return s_vu_cur = p;
++    }
++    if (s_vu_ncache == 256) {                       /* full: start over */
++        for (i = 0; i < s_vu_ncache; i++) {
++            _mm_free(s_vu_cache[i]->ops);
++            free(s_vu_cache[i]->kslot);
++            free(s_vu_cache[i]->words);
++            free(s_vu_cache[i]);
++        }
++        s_vu_ncache = 0;
++        s_vu_epoch++;
++    }
++    s_vu_cur = vu_compile(h, w, nw);
++    if (s_vu_cur)
++        s_vu_cache[s_vu_ncache++] = s_vu_cur;
++    return s_vu_cur;
++}
++
++static int vsh_run_uop_ctx(Nv2aVshCtx *cx, const VshProg *p,
++                           const float (*in)[NV2A_VSH_INPUTS][4],
++                           Nv2aVshOutput *const *out, uint32_t n)
++{
++    static const uint8_t oreg[8] = {12, 3, 4, 5, 9, 10, 11, 12};
++    __m128 *const F = cx->F;
++    const uint32_t G = (n + 3) / 4;
++    const __m128 zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f);
++    const float (*vin[VSH_G * 4])[4];
++    float *vout[VSH_G * 4];
++    uint32_t i, g, k, j;
++
++    if (!p)
++        return 0;
++    for (g = 0; g < G; g++) {
++        VU_F(VU_ZERO, g) = zero;
++        VU_F(VU_ONE, g) = one;
++    }
++    /* Lanes past n read a zero vertex and write to a junk one. */
++    for (j = 0; j < G * 4; j++) {
++        vin[j] = j < n ? in[j] : (const float (*)[4])s_vu_zero_in;
++        vout[j] = j < n ? (float *)out[j] : cx->junk_out;
++    }
++    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
++        if (!(p->in_used & (1u << i)))
++            continue;
++        for (g = 0; g < G; g++) {
++            __m128 r0 = _mm_loadu_ps(vin[g * 4][i]), r1 = _mm_loadu_ps(vin[g * 4 + 1][i]);
++            __m128 r2 = _mm_loadu_ps(vin[g * 4 + 2][i]), r3 = _mm_loadu_ps(vin[g * 4 + 3][i]);
++            _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
++            VU_F(VU_V(i, 0), g) = r0; VU_F(VU_V(i, 1), g) = r1;
++            VU_F(VU_V(i, 2), g) = r2; VU_F(VU_V(i, 3), g) = r3;
++        }
++    }
++    if (cx->last_epoch != s_vu_epoch)
++        cx->last = NULL;
++    if (p != cx->last || s_const_gen != cx->last_gen) {
++        /* Broadcast constants, for every group: kept while neither the
++         * program nor any constant changes (within a batch, normally). */
++        for (k = 0; k < p->nk; k++) {
++            const uint32_t key = p->kslot[2 * k + 1];
++            const __m128 x = _mm_set1_ps(s_const[key >> 2][key & 3]);
++            const uint32_t sl = p->kslot[2 * k];
++            for (g = 0; g < VSH_G; g++)
++                VU_F(sl, g) = x;
++        }
++        if (p != cx->last)
++            /* colours and texture coordinates default to (0,0,0,1), fog 0 */
++            for (k = 0; k < p->noinit; k++) {
++                const uint32_t sl = p->oinit[k];
++                const __m128 x = ((sl - VU_O(0, 0)) & 3) == 3 && sl != VU_O(5, 3) ? one : zero;
++                for (g = 0; g < VSH_G; g++)
++                    VU_F(sl, g) = x;
++            }
++        cx->last = p;
++        cx->last_gen = s_const_gen;
++        cx->last_epoch = s_vu_epoch;
++    }
++    for (k = 0; k < p->nzero; k++)
++        for (g = 0; g < G; g++)
++            VU_F(p->zero_slots[k], g) = zero;
++    for (g = 0; g < G * 4; g++)
++        VU_A0(F)[g] = 0;
++
++#ifdef VSH_BENCH_HOOKS
++    if (!g_vu_bench_skip)
++#endif
++    for (i = 0; i < p->nops; i++)
++        p->ops[i].fn(&p->ops[i], F, G);
++
++    /* Nv2aVshOutput is pos, d0, d1, fog, tex[0..3]: eight float[4] in a row. */
++    for (g = 0; g < G; g++) {
++        float *const o0 = vout[g * 4], *const o1 = vout[g * 4 + 1];
++        float *const o2 = vout[g * 4 + 2], *const o3 = vout[g * 4 + 3];
++        for (k = 0; k < 8; k++) {
++            const uint32_t b = k == 0 ? VU_T(12, 0) : VU_O(oreg[k], 0);
++            __m128 r0 = VU_F(b, g), r1 = VU_F(b + 1, g), r2 = VU_F(b + 2, g), r3 = VU_F(b + 3, g);
++            _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
++            _mm_storeu_ps(o0 + 4 * k, r0);
++            _mm_storeu_ps(o1 + 4 * k, r1);
++            _mm_storeu_ps(o2 + 4 * k, r2);
++            _mm_storeu_ps(o3 + 4 * k, r3);
++        }
++    }
++    return 1;
++}
++
++static int vsh_run_uop(const float (*in)[NV2A_VSH_INPUTS][4],
++                       Nv2aVshOutput *const *out, uint32_t n)
++{
++    return vsh_run_uop_ctx(&s_vu_main, vu_current(), in, out, n);
++}
++
 +static int s_vsh_mode = -1, s_vsh_chk_ok;
 +static Nv2aVshOutput s_vsh_chk;
 +#else
@@ -11221,6 +13192,9 @@ index 7fae74c..9fd8a5a 100644
 +    uint32_t s, k;
 +
 +    s_dec_n = 0;
++#if VSH_SSE
++    s_in_used = 0;
++#endif
 +    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
 +        const uint32_t *ins = s_program[s];
 +        VshDec *d = &s_dec[s_dec_n++];
@@ -11266,6 +13240,11 @@ index 7fae74c..9fd8a5a 100644
 +            };
 +            d->need = (uint8_t)(mac_need[d->mac] | (d->ilu ? 4 : 0));
 +        }
++#if VSH_SSE
++        for (k = 0; k < 3; k++)
++            if ((d->need & (1u << k)) && d->src[k].mux == 2)
++                s_in_used |= 1u << d->in_idx;
++#endif
 +        if (d->final)
 +            break;
 +    }
@@ -11274,6 +13253,7 @@ index 7fae74c..9fd8a5a 100644
 +        s_dec_n = 0;
 +#if VSH_SSE
 +    vsh_sse_prepare();
++    s_vu_cur = NULL;                /* vu_current finds or compiles it */
 +#endif
 +    s_dec_valid = 1;
 +}
@@ -11330,7 +13310,7 @@ index 7fae74c..9fd8a5a 100644
      float outregs[13][4];
      int a0 = 0;
      uint32_t s;
-@@ -335,8 +828,23 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -335,8 +1804,23 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
          }
      }
  
@@ -11355,7 +13335,7 @@ index 7fae74c..9fd8a5a 100644
      memset(outregs, 0, sizeof outregs);
      outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
      /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
-@@ -344,49 +852,72 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -344,49 +1828,74 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
       * unwritten stage at infinity. */
      outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
  
@@ -11378,6 +13358,8 @@ index 7fae74c..9fd8a5a 100644
 -        if (mac && mac != 13 && mac_mask) {
 -            float *d = tdst == 12 ? opos.v : (tdst < 12 ? temp[tdst].v : NULL);
 -            if (d) write_masked(d, &mres, mac_mask);
+-        }
+-        if (ilu && ilu_mask) {
 +    for (s = 0; s < s_dec_n; s++) {
 +        const VshDec *d = &s_dec[s];
 +        uint32_t mac = d->mac, ilu = d->ilu;
@@ -11411,8 +13393,7 @@ index 7fae74c..9fd8a5a 100644
 +                 /* fall through: the result is A, as for mov */
 +        default: mres[0] = a[0]; mres[1] = a[1]; mres[2] = a[2]; mres[3] = a[3];
 +                 break;
-         }
--        if (ilu && ilu_mask) {
++        }
 +        if (ilu) {
 +            vec4 cv, rv;
 +            memcpy(cv.v, c, sizeof cv.v);
@@ -11431,10 +13412,7 @@ index 7fae74c..9fd8a5a 100644
 -            uint32_t it = mac ? 1u : tdst;
 -            float *d = it == 12 ? opos.v : (it < 12 ? temp[it].v : NULL);
 -            if (d) write_masked(d, &ires, ilu_mask);
-+            uint32_t it = mac ? 1u : d->tdst;
-+            if (it <= 12)
-+                write_mask4(temp[it], ires, d->ilu_mask);
-         }
+-        }
 -        if (omask) {
 -            const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
 -            if (!field(ins, 3, 11, 1)) {                  /* to c[] */
@@ -11444,11 +13422,17 @@ index 7fae74c..9fd8a5a 100644
 -                write_masked(opos.v, src, omask);
 -            } else if (oaddr < 13) {
 -                write_masked(outregs[oaddr], src, omask);
++            uint32_t it = mac ? 1u : d->tdst;
++            if (it <= 12)
++                write_mask4(temp[it], ires, d->ilu_mask);
++        }
 +        if (d->omask) {
 +            const float *src = d->out_ilu ? ires : mres;
 +            if (!d->out_o) {                              /* to c[] */
-+                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
++                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS) {
 +                    write_mask4(s_const[d->oaddr], src, d->omask);
++                    s_const_gen++;
++                }
 +            } else if (d->oaddr == 0) {
 +                write_mask4(temp[12], src, d->omask);
 +            } else if (d->oaddr < 13) {
@@ -11462,7 +13446,7 @@ index 7fae74c..9fd8a5a 100644
              memcpy(out->d0, outregs[3], sizeof out->d0);
              memcpy(out->d1, outregs[4], sizeof out->d1);
              memcpy(out->fog, outregs[5], sizeof out->fog);
-@@ -394,8 +925,73 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -394,8 +1903,178 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
              memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
              memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
              memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
@@ -11502,6 +13486,71 @@ index 7fae74c..9fd8a5a 100644
 +
 +/* The program on n (at most NV2A_VSH_BATCH) vertices at once. Returns what
 + * nv2a_vsh_run does: 1, or 0 when no program is loaded. */
++#if VSH_SSE
++/* RECOMP_VSH_PATH=batch: vsh_run_sse_batch (before 2026-10-17); soa:
++ * vsh_run_soa; anything else: the compiled uop lists (2). */
++static int vsh_path(void)
++{
++    static int path = -1;
++    if (path < 0) {
++        const char *e = getenv("RECOMP_VSH_PATH");
++        path = !e ? 2 : !strcmp(e, "batch") ? 0 : !strcmp(e, "soa") ? 1 : 2;
++    }
++    return path;
++}
++#endif
++
++/* ---- several threads -------------------------------------------------- */
++
++Nv2aVshCtx *nv2a_vsh_ctx_new(void)
++{
++#if VSH_SSE
++    Nv2aVshCtx *c = (Nv2aVshCtx *)calloc(1, sizeof *c);
++    if (!c)
++        return NULL;
++    c->F = (__m128 *)_mm_malloc(sizeof(__m128) * VU_FILE_VECS, 16);
++    if (!c->F) {
++        free(c);
++        return NULL;
++    }
++    memset(c->F, 0, sizeof(__m128) * VU_FILE_VECS);
++    return c;
++#else
++    return NULL;
++#endif
++}
++
++int nv2a_vsh_mt_ready(void)
++{
++#if VSH_SSE
++    static int env = -1;
++    if (env < 0)
++        env = !getenv("RECOMP_VSH_DUMP") && !getenv("RECOMP_VSH_CHECK")
++              && !getenv("RECOMP_VSH_SCALAR") && !getenv("RECOMP_VSH_NOBATCH")
++              && !getenv("RECOMP_VSH_BATCHCHECK") && !getenv("RECOMP_VSH_CAPTURE");
++    if (!env || s_cxt_write || vsh_path() != 2)
++        return 0;
++    if (!s_dec_valid)
++        decode_program();
++    return vu_current() != NULL;
++#else
++    return 0;
++#endif
++}
++
++int nv2a_vsh_run_batch_ctx(Nv2aVshCtx *c, const float (*in)[NV2A_VSH_INPUTS][4],
++                           Nv2aVshOutput *const *out, uint32_t n)
++{
++#if VSH_SSE
++    /* s_vu_cur was found or compiled by nv2a_vsh_mt_ready on the executor
++     * thread; nothing here writes shared state. */
++    return s_vu_cur ? vsh_run_uop_ctx(c, s_vu_cur, in, out, n) : 0;
++#else
++    (void)c; (void)in; (void)out; (void)n;
++    return 0;
++#endif
++}
++
 +int nv2a_vsh_run_batch(const float (*in)[NV2A_VSH_INPUTS][4],
 +                       Nv2aVshOutput *const *out, uint32_t n)
 +{
@@ -11509,9 +13558,49 @@ index 7fae74c..9fd8a5a 100644
 +    static int check = -1;
 +    int r;
 +
++    static FILE *cap;
++    static const char *cap_name;
++    static unsigned long long cap_n, cap_poll;
++    const int path = vsh_path();
++    if (path >= 0 && !cap_name && !cap_poll) {
++        /* RECOMP_VSH_CAPTURE=<file>: once <file>.go exists, every 64th block
++         * (program, constants, inputs) for the offline bench
++         * (openhalo2 tools/vsh_bench.c), 6000 blocks. */
++        cap_name = getenv("RECOMP_VSH_CAPTURE");
++        cap_poll = 1;
++    }
++    if (cap_name && !cap && (cap_poll++ & 4095) == 0) {
++        char go[512];
++        FILE *t;
++        snprintf(go, sizeof go, "%s.go", cap_name);
++        if ((t = fopen(go, "rb")) != NULL) {
++            fclose(t);
++            cap = fopen(cap_name, "wb");
++            if (!cap)
++                cap_name = NULL;
++        }
++    }
 +    if (!s_dec_valid)
 +        decode_program();
-+    r = vsh_run_sse_batch(in, out, n);
++    if (cap && (cap_n++ & 63) == 0) {
++        uint32_t hdr[3], s2;
++        hdr[0] = 0x31485356u;                       /* "VSH1" */
++        for (s2 = s_start_slot; s2 < NV2A_VSH_SLOTS && !field(s_program[s2], 3, 0, 1); s2++)
++            ;
++        hdr[1] = s2 < NV2A_VSH_SLOTS ? s2 + 1 - s_start_slot : 0;
++        hdr[2] = n;
++        fwrite(hdr, 4, 3, cap);
++        fwrite(s_program[s_start_slot], 16, hdr[1], cap);
++        fwrite(s_const, 16, NV2A_VSH_CONSTANTS, cap);
++        fwrite(in, sizeof *in, n, cap);
++        if (cap_n >= 64u * 6000u) {
++            fclose(cap);
++            cap = NULL;
++            cap_name = NULL;
++        }
++    }
++    r = path == 2 ? vsh_run_uop(in, out, n)
++      : path == 1 ? vsh_run_soa(in, out, n) : vsh_run_sse_batch(in, out, n);
 +    if (check < 0)
 +        check = getenv("RECOMP_VSH_BATCHCHECK") != NULL;
 +    if (check && r) {
@@ -11537,7 +13626,7 @@ index 7fae74c..9fd8a5a 100644
 +#endif
 +}
 diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
-index 8acb0af..8570caa 100644
+index 8acb0af..15d355f 100644
 --- a/src/kernel/nv2a_vsh_interp.h
 +++ b/src/kernel/nv2a_vsh_interp.h
 @@ -43,6 +43,9 @@ void nv2a_vsh_set_start_slot(uint32_t slot);          /* _PROGRAM_START     */
@@ -11550,17 +13639,31 @@ index 8acb0af..8570caa 100644
  
  /* Run the program from the start slot on one vertex. Inputs are the ten
   * attribute values as floats. Returns 0 if there is no program to run (no
-@@ -50,6 +53,14 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
+@@ -50,6 +53,28 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
   * transform this batch" rather than drawing garbage. */
  int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
  
 +/* The same program on a block of up to NV2A_VSH_BATCH vertices, with the same
 + * results (see nv2a_vsh_interp.c). nv2a_vsh_batch_ok says whether the batch
 + * about to be drawn may use it. */
-+#define NV2A_VSH_BATCH      16
++#ifndef NV2A_VSH_BATCH
++#define NV2A_VSH_BATCH      32
++#endif
 +int  nv2a_vsh_batch_ok(void);
 +int  nv2a_vsh_run_batch(const float (*in)[NV2A_VSH_INPUTS][4],
 +                        Nv2aVshOutput *const *out, uint32_t n);
++
++/* The compiled block path (nv2a_vsh_run_batch's default) on other threads:
++ * each thread its own context; nv2a_vsh_mt_ready, on the executor thread
++ * before handing out blocks, compiles the current program and says whether
++ * the batch may be run that way (0: use nv2a_vsh_run_batch -- another path,
++ * checks or capture on, a program that writes constants, or none). Programs
++ * and constants must not change while other threads run. */
++typedef struct Nv2aVshCtx Nv2aVshCtx;
++Nv2aVshCtx *nv2a_vsh_ctx_new(void);
++int  nv2a_vsh_mt_ready(void);
++int  nv2a_vsh_run_batch_ctx(Nv2aVshCtx *c, const float (*in)[NV2A_VSH_INPUTS][4],
++                            Nv2aVshOutput *const *out, uint32_t n);
 +
  /* Direct access, for the self-test. */
  void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
