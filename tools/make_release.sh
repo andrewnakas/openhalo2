@@ -5,7 +5,7 @@
 set -e
 V=${1:?usage: make_release.sh <version>}
 R=/d/n64work/openhalo2
-B=/d/n64work/halo2/build/xr
+B=${BUILD:-/d/n64work/halo2/build/xr}
 NAME=OpenHalo2-$V-win64
 OUT=$R/dist/$NAME
 case "$OUT" in "$R"/dist/OpenHalo2-*) ;; *) echo "refusing odd output path $OUT"; exit 1;; esac

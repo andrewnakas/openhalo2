@@ -43,6 +43,28 @@ volume_db = 0        ; master trim in dB, e.g. -6
 log_cap_mb = 64      ; halo2_recomp.log is cut back past this size (0 = never)
 ```
 
+## Online play (free, peer to peer)
+
+There are no game servers. Players connect directly to each other; a small free relay only
+introduces them. Add one of these to `halo2.ini`:
+
+**System link over the internet.** Everyone who uses the same room name sees each other's games
+under Multiplayer > System Link, as if on one LAN (up to 10 players in a room):
+
+```ini
+room = my-friends-room
+```
+
+**Open Live.** The game's own Xbox Live menus (sign in, friends, invites, parties, matchmaking),
+run between players instead of on Microsoft's servers:
+
+```ini
+open_live = 1
+gamertag = YourName
+```
+
+Stats and leaderboards are not kept.
+
 ## Saves and logs
 
 `save\` next to the program is the emulated Xbox hard disk (profiles, game saves, map cache).
@@ -53,8 +75,8 @@ says why. Please attach it to bug reports.
 
 - The picture is the console's 640x480, scaled.
 - Sound effects that the console runs on its audio DSP (reverb in large rooms) are not produced yet.
-- Closing the window quits at once; do not close it while the game is saving.
-- Online play: see below (system link over the internet is in progress).
+- Closing the window waits up to 5 seconds for a save in progress to finish, then quits.
+- Windows only for now; macOS, Linux and browser builds are planned.
 
 ## Legal
 
