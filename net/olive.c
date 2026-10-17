@@ -162,12 +162,13 @@ static void visit_notice(visit_t *v, const char *s)
     host = json_int(s, "\"host\"");
     n = json_members(s, mem, MAX_MEMBERS);
     v->ntarget = 0;
-    if (v->mode == OLIVE_ONE) {
-        if (host && host != v->self) v->target[v->ntarget++] = host;
-    } else {
-        for (i = 0; i < n; i++)
-            if (mem[i] != v->self) v->target[v->ntarget++] = mem[i];
-    }
+    /* OLIVE_ONE asks every member too, and finishes on the first reply: the
+     * relay can keep a member whose process died (killed, crashed) for a
+     * while, and that ghost is the room's oldest member (its "host") when
+     * the holder came back. Other visitors ignore what is not theirs. */
+    (void)host;
+    for (i = 0; i < n; i++)
+        if (mem[i] != v->self) v->target[v->ntarget++] = mem[i];
     if (!v->ntarget) { v->done = 1; return; }
     v->sent = now_ms();
 }
@@ -222,7 +223,7 @@ static void RTC_API on_msg(int ws, const char *msg, int size, void *ptr)
                         r->rtt = (int)(now_ms() - v->sent);
                         v->nrep++;
                     }
-                    if (v->nrep >= v->ntarget) v->done = 1;
+                    if (v->nrep >= v->ntarget || v->mode == OLIVE_ONE) v->done = 1;
                 }
             }
         }

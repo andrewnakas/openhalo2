@@ -361,6 +361,9 @@ static int on_inbox(void *ctx, int from, const uint8_t *m, int len, uint8_t *rep
         }
         n = msg_head(reply, 'k');
         break;
+    case 'M': case 'R': case 'N':
+        unlock();
+        return xo_match_inbox((char)m[0], x, m + 25, len - 25, reply, cap);
     case 'S':
         if (len >= 25 + 8) {
             unlock();

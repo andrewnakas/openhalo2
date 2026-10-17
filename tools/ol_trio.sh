@@ -4,6 +4,7 @@
 # build/xr_c (Charlie); their profiles must already be bound to those
 # accounts (sign in once). copies defaults to "a b c". Sheet:
 #   bash tools/ol_sheet.sh <outdir> <label>
+# Extra environment for one copy: XENV_d="RECOMP_OL_OVERFLOW=1" etc.
 # Stop with: bash tools/ol_kill.sh <outdir>/a <outdir>/b <outdir>/c
 O=${1:?outdir}; L=${2:-a b c}
 T=/d/n64work/openhalo2/tools
@@ -15,9 +16,9 @@ last=
 for k in $L; do last=$k; done
 for k in $L; do
   if [ "$k" = "$last" ]; then
-    XRDIR=/d/n64work/halo2/build/${DIR[$k]} bash $T/ol_boot.sh "$O/$k" RECOMP_OL_GAMERTAG=${TAG[$k]} > "$O/$k.boot.txt" 2>&1
+    XRDIR=/d/n64work/halo2/build/${DIR[$k]} bash $T/ol_boot.sh "$O/$k" RECOMP_OL_GAMERTAG=${TAG[$k]} $(eval echo \$XENV_$k) > "$O/$k.boot.txt" 2>&1
   else
-    (XRDIR=/d/n64work/halo2/build/${DIR[$k]} bash $T/ol_boot.sh "$O/$k" RECOMP_OL_GAMERTAG=${TAG[$k]} > "$O/$k.boot.txt" 2>&1 &)
+    (XRDIR=/d/n64work/halo2/build/${DIR[$k]} bash $T/ol_boot.sh "$O/$k" RECOMP_OL_GAMERTAG=${TAG[$k]} $(eval echo \$XENV_$k) > "$O/$k.boot.txt" 2>&1 &)
     sleep 20
   fi
 done

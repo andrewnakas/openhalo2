@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -100,6 +101,7 @@ static listen_t s_listen[MAX_HOSTED * 2];
 static uint8_t s_xnaddr[36];
 static uint32_t s_scratch;      /* guest scratch for calls into the title's XNet */
 static int s_net;               /* the facilitator is available */
+static uint64_t s_last_qos_host;
 
 #if defined(_WIN32)
 static SRWLOCK s_lk = SRWLOCK_INIT;
@@ -628,7 +630,7 @@ static int h_qos_lookup(void)   /* (n, xnaddrs, kids, keys, n ina, ina, service 
         uint8_t kid[8];
         memcpy(kid, xo_ptr(xo_rd32(kids + 4 * i)), 8);
         r[i] = remote_by_kid(kid);
-        if (r[i]) extra += (uint32_t)(r[i]->qos_len + 3) & ~3u;
+        if (r[i]) { extra += (uint32_t)(r[i]->qos_len + 3) & ~3u; s_last_qos_host = r[i]->xuid; }
     }
     q = xo_qos_alloc(n, extra);
     at = q + 8 + 24 * (n ? n : 1);
@@ -648,6 +650,370 @@ static int h_qos_lookup(void)   /* (n, xnaddrs, kids, keys, n ina, ina, service 
     fprintf(stderr, "  [XO] QoS lookup of %u target(s): answered from the search records\n", n);
     xo_return(0, 12);
     return 1;
+}
+
+/* ---- sessions bigger than a relay room (docs/OPEN_LIVE_DESIGN.md 3.4) -------------------
+ * The relay holds 10 members a room, Halo 2 sessions up to 16. A station the
+ * mesh room turns away ("full"; RECOMP_OL_OVERFLOW=1 forces it, for tests)
+ * joins the session through an external h2net room "x<kid>" instead, whose
+ * signaling goes through the players' inboxes (net/olive.c), and connects to
+ * every member itself:
+ *   'M' kid[8] flag   to the session's host: "I am in this session" (flag 1:
+ *                     outside the mesh room); the host keeps a roster
+ *   'R' kid[8]        to the host: the roster -> 'r' kid[8] n, n x (xuid u64,
+ *                     flag u8), the host first
+ *   'N' kid[8] (u16 len, h2net signaling)...   to a member's inbox
+ * An outside station offers to every room member (the roster, re-read every
+ * 5 s) and to the outside members with a higher id; room members answer. The host of a key the title
+ * registers is the remote whose QoS data carries it (the joiner registers
+ * the host's network session key from that data). */
+
+#define MAX_ROSTER   64
+#define MAX_XID      64
+#define MAX_OUT      16
+#define MAX_MESH     8
+#define OLIVE_MSG_MAX_SAFE 3000
+
+static uint64_t ov_now(void)
+{
+#if defined(_WIN32)
+    return GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+typedef struct { int used; uint8_t kid[8]; uint64_t xuid; int outside; } roster_t;
+typedef struct { int used; uint8_t kid[8]; uint64_t host; int outside, sent_m, visit_m, visit_r; uint64_t next_r; } mesh_t;
+typedef struct { int used; uint64_t xuid; uint8_t kid[8]; int len, visit; uint8_t buf[OLIVE_MSG_MAX_SAFE]; } outbox_t;
+
+static roster_t s_roster[MAX_ROSTER];
+
+static int kid_eq(const uint8_t *a, const uint8_t *b)
+{
+    return !memcmp(a + 1, b + 1, 7) && ((a[0] ^ b[0]) & 0x7F) == 0;
+}
+static uint64_t s_xid[MAX_XID];          /* h2net member ids of external rooms: index + 1 */
+static mesh_t s_mesh[MAX_MESH];
+static outbox_t s_out[MAX_OUT];
+static int s_force_overflow = -1;
+static int s_n_in, s_n_out, s_r_got;     /* diagnostics */
+static uint64_t s_ov_log;
+
+static int xid_of(uint64_t x)
+{
+    int i;
+    for (i = 0; i < MAX_XID; i++) if (s_xid[i] == x) return i + 1;
+    for (i = 0; i < MAX_XID; i++) if (!s_xid[i]) { s_xid[i] = x; return i + 1; }
+    return 0;
+}
+
+static void ext_name(char *out, size_t n, const uint8_t *kid)
+{
+    char k[16];
+    b32(k, kid, 8);
+    snprintf(out, n, "x%s", k);
+}
+
+static void inbox_of(char *out, size_t n, uint64_t xuid)
+{
+    static const char a[] = "0123456789abcdefghjkmnpqrstvwxyz";
+    char k[16];
+    int i, o = 0;
+    for (i = 60; i > -5; i -= 5) k[o++] = a[(i >= 0 ? xuid >> i : xuid << -i) & 31];
+    k[o] = 0;
+    snprintf(out, n, "h2u-%s", k);
+}
+
+static int head(uint8_t *m, char type)
+{
+    uint64_t self = xo_self_xuid();
+    m[0] = (uint8_t)type;
+    memcpy(m + 1, &self, 8);
+    memset(m + 9, 0, 16);
+    strncpy((char *)m + 9, xo_self_gamertag(), 15);
+    return 25;
+}
+
+#ifdef OPENHALO2_NET
+/* h2net's signaling for an external room (any thread): queued per member,
+ * sent by the pump in one inbox visit */
+static int ext_send(void *ctx, int target, const uint8_t *msg, int len)
+{
+    mesh_t *m = &s_mesh[(int)(intptr_t)ctx];
+    outbox_t *o = NULL;
+    uint64_t x;
+    int i;
+    if (target <= 0 || target > MAX_XID || len <= 0) return -1;
+    lock();
+    x = s_xid[target - 1];
+    for (i = 0; i < MAX_OUT && !o; i++)
+        if (s_out[i].used && s_out[i].xuid == x && !memcmp(s_out[i].kid, m->kid, 8) && !s_out[i].visit
+            && s_out[i].len + 2 + len <= (int)sizeof s_out[i].buf) o = &s_out[i];
+    for (i = 0; i < MAX_OUT && !o; i++)
+        if (!s_out[i].used) { o = &s_out[i]; memset(o, 0, sizeof *o); o->used = 1; o->xuid = x; memcpy(o->kid, m->kid, 8); }
+    if (o) {
+        o->buf[o->len] = (uint8_t)len; o->buf[o->len + 1] = (uint8_t)(len >> 8);
+        memcpy(o->buf + o->len + 2, msg, (size_t)len);
+        o->len += 2 + len;
+    }
+    unlock();
+    return o ? 0 : -1;
+}
+#endif
+
+static roster_t *roster_add(const uint8_t *kid, uint64_t xuid, int outside)
+{
+    int i;
+    roster_t *r = NULL;
+    for (i = 0; i < MAX_ROSTER && !r; i++)
+        if (s_roster[i].used && s_roster[i].xuid == xuid && kid_eq(s_roster[i].kid, kid)) r = &s_roster[i];
+    for (i = 0; i < MAX_ROSTER && !r; i++)
+        if (!s_roster[i].used) { r = &s_roster[i]; r->used = 1; memcpy(r->kid, kid, 8); r->xuid = xuid; }
+    if (r) r->outside = outside;
+    return r;
+}
+
+/* the host of a registered key: the remote whose QoS data carries it */
+static uint64_t host_of_key(const uint8_t *kid)
+{
+    int i, j;
+    if (hosted_by_kid(kid)) return xo_self_xuid();
+    for (i = 0; i < MAX_REMOTE; i++) {
+        const remote_t *r = &s_remote[i];
+        if (!r->used) continue;
+        if (!memcmp(r->kid + 1, kid + 1, 7) && ((r->kid[0] ^ kid[0]) & 0x7F) == 0) return r->xuid;
+        for (j = 0; j + 8 <= r->qos_len; j++)      /* the online-peer bit (0x7A8D7) aside */
+            if (!memcmp(r->qos + j + 1, kid + 1, 7) && ((r->qos[j] ^ kid[0]) & 0x7F) == 0) return r->xuid;
+    }
+    return s_last_qos_host;
+}
+
+/* a session key the title registered: track it (mesh_join already joined its room) */
+static void mesh_track(const uint8_t *kid)
+{
+    int i;
+    mesh_t *m = NULL;
+    if (s_force_overflow < 0) {
+        const char *e = getenv("RECOMP_OL_OVERFLOW");
+        s_force_overflow = e && *e && *e != '0';
+    }
+    for (i = 0; i < MAX_MESH && !m; i++) if (s_mesh[i].used && !memcmp(s_mesh[i].kid, kid, 8)) m = &s_mesh[i];
+    for (i = 0; i < MAX_MESH && !m; i++) if (!s_mesh[i].used) m = &s_mesh[i];
+    if (!m) return;
+    memset(m, 0, sizeof *m);
+    m->used = 1;
+    memcpy(m->kid, kid, 8);
+    m->host = host_of_key(kid);
+}
+
+static void mesh_untrack(const uint8_t *kid)
+{
+    int i;
+    for (i = 0; i < MAX_MESH; i++)
+        if (s_mesh[i].used && !memcmp(s_mesh[i].kid, kid, 8)) {
+#ifdef OPENHALO2_NET
+            char room[32];
+            ext_name(room, sizeof room, kid);
+            if (h2net_find(room) >= 0) h2net_leave(room);
+            if (s_mesh[i].visit_m > 0) olive_visit_free(s_mesh[i].visit_m);
+            if (s_mesh[i].visit_r > 0) olive_visit_free(s_mesh[i].visit_r);
+#endif
+            memset(&s_mesh[i], 0, sizeof s_mesh[i]);
+        }
+}
+
+#ifdef OPENHALO2_NET
+static void go_outside(mesh_t *m)
+{
+    char room[32];
+    mesh_name(room, sizeof room, m->kid);
+    if (h2net_find(room) >= 0) h2net_leave(room);
+    ext_name(room, sizeof room, m->kid);
+    h2net_join_ext(room, ext_send, (void *)(intptr_t)(m - s_mesh));
+    m->outside = 1;
+    m->sent_m = 0;          /* tell the host again, flagged */
+    m->next_r = 0;
+    fprintf(stderr, "  [XO] mesh: session %s is outside its relay room: peers through inboxes (%s)\n",
+            room + 1, s_force_overflow ? "forced" : "room full");
+}
+
+/* the roster from the host: connect to whom this station must */
+static void roster_take(mesh_t *m, const uint8_t *r, int n)
+{
+    char room[32];
+    int k, cnt, made = 0;
+    if (n < 10 || r[0] != 'r' || !kid_eq(r + 1, m->kid)) return;
+    cnt = r[9];
+    if (10 + cnt * 9 > n) return;
+    ext_name(room, sizeof room, m->kid);
+    for (k = 0; k < cnt; k++) {
+        uint64_t x;
+        int outside = r[10 + 9 * k + 8], id;
+        memcpy(&x, r + 10 + 9 * k, 8);
+        if (x == xo_self_xuid()) continue;
+        /* one side offers: an outside station to everyone in the room; of
+         * two outside stations, the lower id. Room members only answer. */
+        if (!m->outside) continue;
+        if (outside && x < xo_self_xuid()) continue;
+        if (h2net_find(room) < 0) h2net_join_ext(room, ext_send, (void *)(intptr_t)(m - s_mesh));
+        id = xid_of(x);
+        if (id && !h2net_ext_has(room, id)) { h2net_ext_connect(room, id); made++; }
+    }
+    if (made) fprintf(stderr, "  [XO] mesh: connecting to %d member(s) of %s through their inboxes\n", made, room + 1);
+}
+#endif
+
+/* every pump: room full -> outside; tell the host; fetch the roster; send queued signaling */
+static void overflow_pump(void)
+{
+#ifdef OPENHALO2_NET
+    int i, cnt;
+    uint64_t t = ov_now();
+    for (i = 0; i < MAX_MESH; i++) {
+        mesh_t *m = &s_mesh[i];
+        char room[32];
+        if (!m->used) continue;
+        if (!m->host && (m->host = host_of_key(m->kid)) != 0) {
+            char k[20];
+            hexkid(k, m->kid);
+            fprintf(stderr, "  [XO] mesh: session key %s is hosted by %016llx\n", k, (unsigned long long)m->host);
+        }
+        mesh_name(room, sizeof room, m->kid);
+        if (!m->outside && m->host && m->host != xo_self_xuid()
+            && (s_force_overflow > 0 || h2net_room_full(room)))
+            go_outside(m);
+        if (!m->host || m->host == xo_self_xuid()) continue;
+        if (!m->sent_m && m->visit_m <= 0) {
+            uint8_t msg[40];
+            int n = head(msg, 'M');
+            memcpy(msg + n, m->kid, 8); n += 8;
+            msg[n++] = (uint8_t)m->outside;
+            inbox_of(room, sizeof room, m->host);
+            m->visit_m = olive_visit(room, msg, n, OLIVE_ONE, 4000);
+        } else if (m->visit_m > 0 && olive_visit_poll(m->visit_m, &cnt)) {
+            olive_visit_free(m->visit_m);
+            m->visit_m = 0;
+            m->sent_m = cnt > 0;
+            if (!cnt) m->next_r = t + 3000;
+        }
+        if (m->sent_m && m->visit_r <= 0 && t >= m->next_r) {
+            uint8_t msg[40];
+            int n = head(msg, 'R');
+            memcpy(msg + n, m->kid, 8); n += 8;
+            inbox_of(room, sizeof room, m->host);
+            m->visit_r = olive_visit(room, msg, n, OLIVE_ONE, 4000);
+        } else if (m->visit_r > 0 && olive_visit_poll(m->visit_r, &cnt)) {
+            uint8_t r[OLIVE_MSG_MAX];
+            int n = cnt > 0 ? olive_visit_reply(m->visit_r, 0, r, sizeof r, NULL) : -1;
+            olive_visit_free(m->visit_r);
+            m->visit_r = 0;
+            m->next_r = t + 5000;        /* members come and go: ask again now and then */
+            if (n > 0) { s_r_got++; roster_take(m, r, n); }
+        }
+    }
+    if (t >= s_ov_log) {
+        int any = 0;
+        for (i = 0; i < MAX_MESH; i++) {
+            char room[32], st[600];
+            if (!s_mesh[i].used) continue;
+            ext_name(room, sizeof room, s_mesh[i].kid);
+            if (h2net_find(room) < 0) continue;
+            any = 1;
+            h2net_status(st, sizeof st);
+            fprintf(stderr, "  [XO] mesh %s: host %016llx outside %d, M %d, rosters %d, N in %d out %d | %s\n",
+                    room, (unsigned long long)s_mesh[i].host, s_mesh[i].outside, s_mesh[i].sent_m, s_r_got,
+                    s_n_in, s_n_out, st);
+        }
+        s_ov_log = t + (any ? 5000 : 1000);
+    }
+    for (i = 0; i < MAX_OUT; i++) {
+        outbox_t *o = &s_out[i];
+        if (!o->used) continue;
+        if (o->visit > 0) {
+            if (olive_visit_poll(o->visit, &cnt)) { olive_visit_free(o->visit); memset(o, 0, sizeof *o); }
+        } else if (o->len) {
+            uint8_t msg[OLIVE_MSG_MAX];
+            char room[32];
+            int n, j, busy = 0;
+            /* in order: the next batch to a member waits for the one on its way */
+            for (j = 0; j < MAX_OUT; j++)
+                if (j != i && s_out[j].used && s_out[j].visit > 0 && s_out[j].xuid == o->xuid) busy = 1;
+            if (busy) continue;
+            lock();
+            n = head(msg, 'N');
+            memcpy(msg + n, o->kid, 8); n += 8;
+            memcpy(msg + n, o->buf, (size_t)o->len); n += o->len;
+            o->len = 0;
+            unlock();
+            inbox_of(room, sizeof room, o->xuid);
+            o->visit = olive_visit(room, msg, n, OLIVE_ONE, 4000);
+            s_n_out++;
+            if (o->visit <= 0) memset(o, 0, sizeof *o);
+        }
+    }
+#endif
+}
+
+/* inbox messages for sessions ('M', 'R', 'N'), on the transport thread */
+int xo_match_inbox(char type, uint64_t from, const uint8_t *p, int len, uint8_t *reply, int cap)
+{
+    int n = 0, i;
+    if (len < 8) return 0;
+    switch (type) {
+    case 'M':
+        lock();
+        roster_add(p, from, len > 8 ? p[8] : 0);
+        unlock();
+        reply[0] = 'k';
+        return 1;
+    case 'R':
+        reply[n++] = 'r';
+        memcpy(reply + n, p, 8); n += 8;
+        reply[n++] = 0;
+        {
+            uint64_t self = xo_self_xuid();
+            memcpy(reply + n, &self, 8); n += 8;
+            reply[n++] = 0;
+            reply[9]++;
+        }
+        lock();
+        for (i = 0; i < MAX_ROSTER && n + 9 <= cap && reply[9] < 255; i++) {
+            if (!s_roster[i].used || !kid_eq(s_roster[i].kid, p)) continue;
+            memcpy(reply + n, &s_roster[i].xuid, 8); n += 8;
+            reply[n++] = (uint8_t)s_roster[i].outside;
+            reply[9]++;
+        }
+        unlock();
+        return n;
+    case 'N':
+#ifdef OPENHALO2_NET
+    {
+        char room[32];
+        int k = 8, id, mi = -1;
+        ext_name(room, sizeof room, p);
+        lock();
+        for (i = 0; i < MAX_MESH && mi < 0; i++) if (s_mesh[i].used && kid_eq(s_mesh[i].kid, p)) mi = i;
+        id = xid_of(from);
+        unlock();
+        if (mi < 0 || !id) { reply[0] = 'k'; return 1; }   /* not in that session (any more) */
+        if (h2net_find(room) < 0) h2net_join_ext(room, ext_send, (void *)(intptr_t)mi);
+        s_n_in++;
+        while (k + 2 <= len) {
+            int l = p[k] | p[k + 1] << 8;
+            if (k + 2 + l > len) break;
+            h2net_ext_signal(room, id, p + k + 2, l);
+            k += 2 + l;
+        }
+    }
+#endif
+        reply[0] = 'k';
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 /* ---- dispatch ------------------------------------------------------------------------------ */
@@ -772,6 +1138,9 @@ void xo_match_after(uint32_t va, const uint32_t *a, uint32_t eax)
         if (a[0] && eax == 0) {
             memcpy(kid, xo_ptr(a[0]), 8);
             mesh_join(kid, "key registered");
+            lock();
+            mesh_track(kid);
+            unlock();
         }
         break;
     case 0x3CD0E1:   /* XNetUnregisterKey(&kid) */
@@ -779,6 +1148,7 @@ void xo_match_after(uint32_t va, const uint32_t *a, uint32_t eax)
             hosted_t *h;
             memcpy(kid, xo_ptr(a[0]), 8);
             mesh_leave(kid);
+            mesh_untrack(kid);
             h = hosted_by_kid(kid);
             if (h) {
                 advert_stop((int)(h - s_hosted));
@@ -798,6 +1168,7 @@ void xo_match_pump(void)
 {
 #ifdef OPENHALO2_NET
     int i, members, oldest;
+    overflow_pump();
     for (i = 0; i < MAX_HOSTED; i++) {
         hosted_t *h = &s_hosted[i];
         if (!h->used || !h->advertising || h->hold <= 0) continue;

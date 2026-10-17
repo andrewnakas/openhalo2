@@ -59,6 +59,9 @@ uint32_t xo_qos_alloc(uint32_t n, uint32_t extra);   /* n entries + data bytes *
 
 /* the record of a session we host, as sent to a joiner ('q'); 0 if not ours */
 int  xo_match_record_for_kid(const uint8_t *kid, uint8_t *out, int cap);
+/* inbox messages about sessions ('M' member, 'R' roster, 'N' signaling): p
+ * after the 25-byte head; returns the reply length */
+int  xo_match_inbox(char type, uint64_t from, const uint8_t *p, int len, uint8_t *reply, int cap);
 
 /* openlive_friends.c: friends, presence, requests, invites */
 int  xo_friends_call(uint32_t va);

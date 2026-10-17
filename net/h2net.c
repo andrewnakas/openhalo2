@@ -13,6 +13,12 @@
  * every room, and flooded frames go to all of them. h2net_open is the old
  * one-room form (system link with a room code).
  *
+ * External rooms (h2net_join_ext): a room with no relay WebSocket whose
+ * signaling the caller carries (Open Live: through players' inboxes, for
+ * sessions bigger than a relay room holds). Member ids are the caller's own;
+ * the caller decides who offers (h2net_ext_connect) and hands incoming
+ * signaling to h2net_ext_signal.
+ *
  * Data: one data channel per peer and room ("h2", unordered, maxRetransmits
  * 0); each message is one Ethernet frame. Source MACs seen on a channel are
  * learned so unicast frames go to one peer; unknown and group destinations
@@ -65,6 +71,8 @@ typedef struct {
     int ws_state;               /* 0 connecting, 1 open, 2 closed, 3 error */
     int self, host;
     char err[96];
+    h2net_signal_fn ext;        /* external room: signaling through the caller */
+    void *ext_ctx;
 } room_t;
 
 typedef struct {
@@ -202,10 +210,16 @@ static void signal_send(int room, int target, char type, const char *a, const ch
     m[4] = type;
     memcpy(m + 5, a, la);
     if (b) { m[5 + la] = '\n'; memcpy(m + 6 + la, b, lb); }
-    lock();
-    ws = (room >= 0 && room < MAX_ROOMS && s_room[room].used) ? s_room[room].ws : 0;
-    unlock();
-    if (ws > 0) rtcSendMessage(ws, m, (int)n);
+    {
+        h2net_signal_fn ext = NULL;
+        void *ctx = NULL;
+        lock();
+        ws = (room >= 0 && room < MAX_ROOMS && s_room[room].used) ? s_room[room].ws : 0;
+        if (room >= 0 && room < MAX_ROOMS && s_room[room].used) { ext = s_room[room].ext; ctx = s_room[room].ext_ctx; }
+        unlock();
+        if (ext) ext(ctx, target, (const uint8_t *)m + 4, (int)n - 4);
+        else if (ws > 0) rtcSendMessage(ws, m, (int)n);
+    }
     free(m);
 }
 
@@ -644,6 +658,62 @@ void h2net_leave(const char *room_code)
     memset(&s_room[r], 0, sizeof s_room[r]);
     unlock();
     for (i = 0; i < np; i++) destroy_handles(pcs[i], dcs[i], NULL, 0);
+}
+
+int h2net_join_ext(const char *room_code, h2net_signal_fn fn, void *ctx)
+{
+    int i, r;
+    if (!valid_code(room_code) || !fn) return -1;
+    if ((r = h2net_find(room_code)) >= 0) return r;
+    lock();
+    if (!s_init) { unlock(); return -1; }
+    r = -1;
+    for (i = 0; i < MAX_ROOMS && r < 0; i++)
+        if (!s_room[i].used) r = i;
+    if (r >= 0) {
+        memset(&s_room[r], 0, sizeof s_room[r]);
+        s_room[r].used = 1;
+        s_room[r].ws_state = 1;
+        s_room[r].ext = fn;
+        s_room[r].ext_ctx = ctx;
+        snprintf(s_room[r].code, sizeof s_room[r].code, "%s", room_code);
+    }
+    unlock();
+    return r;
+}
+
+void h2net_ext_signal(const char *room_code, int from, const uint8_t *msg, int len)
+{
+    int r = h2net_find(room_code);
+    if (r < 0 || from <= 0) return;
+    on_signal(r, from, (const char *)msg, len);
+}
+
+int h2net_ext_connect(const char *room_code, int id)
+{
+    int r = h2net_find(room_code);
+    if (r < 0 || id <= 0) return -1;
+    return create_peer(r, id, 1) > 0 ? 0 : -1;
+}
+
+int h2net_ext_has(const char *room_code, int id)
+{
+    int r = h2net_find(room_code), has;
+    if (r < 0) return 0;
+    lock();
+    has = peer_by_id(r, id) != NULL;
+    unlock();
+    return has;
+}
+
+int h2net_room_full(const char *room_code)
+{
+    int r = h2net_find(room_code), full = 0;
+    if (r < 0) return 0;
+    lock();
+    full = !strcmp(s_room[r].err, "room full");
+    unlock();
+    return full;
 }
 
 int h2net_open(const char *room_code, const char *relay_url)

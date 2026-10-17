@@ -44,6 +44,18 @@ void h2net_leave(const char *room_code);
 int  h2net_find(const char *room_code);
 int  h2net_room_peers(const char *room_code);
 
+/* External rooms: no relay; the caller carries the signaling. fn sends one
+ * signaling message (type byte + text) to member `target` of the room. */
+typedef int (*h2net_signal_fn)(void *ctx, int target, const uint8_t *msg, int len);
+int  h2net_join_ext(const char *room_code, h2net_signal_fn fn, void *ctx);
+/* a signaling message from member `from` (> 0) of an external room */
+void h2net_ext_signal(const char *room_code, int from, const uint8_t *msg, int len);
+/* offers a connection to member `id` of an external room */
+int  h2net_ext_connect(const char *room_code, int id);
+int  h2net_ext_has(const char *room_code, int id);
+/* the relay turned the room away (it holds 10 members) */
+int  h2net_room_full(const char *room_code);
+
 /* Queues one Ethernet frame for the other stations (dropped silently if no
  * peer is connected or the frame is malformed). */
 void h2net_send(const uint8_t *f, uint32_t len);

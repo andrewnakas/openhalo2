@@ -6,7 +6,7 @@
  *   hold   be a member of a room and answer what visitors send (a player's
  *          inbox "h2u-...", a matchmaking bucket "h2q-..." that every host
  *          advertising in that bucket holds)
- *   visit  join a room, send one message to its oldest member (OLIVE_ONE)
+ *   visit  join a room, send one message to its holder (OLIVE_ONE: to every member, the first reply ends it; the relay keeps dead members a while)
  *          or to every member (OLIVE_ALL), collect the replies until all
  *          have answered or the time is up, leave
  *
