@@ -22,6 +22,8 @@ cp templates/runtime/recomp_types.h "$TMP/recomp_types.h"
 python /d/n64work/openhalo2/h2lift/mmio_pass.py "$TMP"
 # tiled-aperture pointers: the contiguous window in the web build (see h2lift/tiled_pass.py)
 python /d/n64work/openhalo2/h2lift/tiled_pass.py "$TMP"
+# Open Live: wrappers on the XOnline API and XNet QoS entry points (see h2lift/xo_hle_pass.py)
+python /d/n64work/openhalo2/h2lift/xo_hle_pass.py "$TMP"
 changed=0
 for f in "$TMP"/*; do
   b=$(basename "$f")
