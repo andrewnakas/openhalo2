@@ -76,7 +76,15 @@ add_executable(${PROJECT_NAME} WIN32
 )
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
-target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
+# The toolkit's libraries, named one by one rather than through the
+# 'xboxrecomp' umbrella: the umbrella also carries xbox_apu (code extracted
+# from xemu, LGPL) and xbox_dsound (which links it). The APU is the
+# clean-room model in src/mcpxaudio; the previous one is only linked for A/B
+# with -DOPENHALO2_WITH_OLD_APU=ON (see below).
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    xbox_kernel xbox_d3d8 xbox_input xbox_usb xbox_nv2a xbox_video)
+# xboxrecomp.h includes the HLE DirectSound header; only the header is used.
+target_include_directories(${PROJECT_NAME} PRIVATE ${XBOXRECOMP_DIR}/src/audio)
 
 # Include paths for generated recomp headers
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -150,10 +158,11 @@ if(WIN32 AND OPENHALO2_NET AND EXISTS "${H2NET_VCPKG}/lib/datachannel.lib")
     message(STATUS "Online system link: libdatachannel from ${H2NET_VCPKG}")
 endif()
 
-# Clean-room APU model (src/mcpxaudio, docs/APU_CLEANROOM_DESIGN.md). While
-# OPENHALO2_OLD_APU is on, the previous model (xbox_apu) is linked too and
-# RECOMP_APU_IMPL=old|new|shadow picks at run time (src/apu_select.c).
-option(OPENHALO2_OLD_APU "Also link the previous APU model for A/B" ON)
+# Clean-room APU model (src/mcpxaudio, docs/APU_CLEANROOM_DESIGN.md). With
+# OPENHALO2_WITH_OLD_APU=ON the previous model (xbox_apu) is linked as well and
+# RECOMP_APU_IMPL=old|new|shadow picks at run time (src/apu_select.c); off,
+# xbox_apu and xbox_dsound are not even built.
+option(OPENHALO2_WITH_OLD_APU "Also link the previous (xemu-derived) APU model for A/B" OFF)
 add_library(mcpx_audio STATIC
     src/mcpxaudio/ma_regs.c
     src/mcpxaudio/ma_voice.c
@@ -171,12 +180,14 @@ if(MSVC)
     target_compile_options(mcpx_audio PRIVATE /W3 /O2 /fp:fast)
 endif()
 target_link_libraries(mcpx_audio PRIVATE winmm xaudio2_8 ole32)
-if(NOT OPENHALO2_OLD_APU)
-    target_compile_definitions(mcpx_audio PRIVATE MA_CONTRACT=1)
-endif()
 target_sources(${PROJECT_NAME} PRIVATE src/apu_select.c)
 target_link_libraries(${PROJECT_NAME} PRIVATE mcpx_audio)
-if(OPENHALO2_OLD_APU)
+if(OPENHALO2_WITH_OLD_APU)
+    target_link_libraries(${PROJECT_NAME} PRIVATE xbox_apu)
     # only this file: a target-wide definition would rebuild the generated code
     set_source_files_properties(src/apu_select.c PROPERTIES COMPILE_DEFINITIONS OPENHALO2_OLD_APU=1)
+else()
+    # the contract symbols (g_apu_state, mcpx_apu_*, apu_mixer_*) come from here
+    target_compile_definitions(mcpx_audio PRIVATE MA_CONTRACT=1)
+    set_target_properties(xbox_apu xbox_dsound PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()

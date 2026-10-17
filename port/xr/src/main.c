@@ -40,7 +40,16 @@
 #include <io.h>
 
 /* xboxrecomp runtime headers */
-#include <xbox/xboxrecomp.h>
+/* The toolkit's umbrella header (xbox/xboxrecomp.h) minus apu.h: the APU is
+ * the clean-room model (src/mcpxaudio), reached through apu_select.c. */
+#include "kernel.h"
+#include "xbox_memory_layout.h"
+#include "d3d8_xbox.h"
+#include "dsound_xbox.h"
+#include "xinput_xbox.h"
+#include "nv2a_state.h"
+#include "nv2a_regs.h"
+#include "qemu_shim.h"
 #include "byog.h"
 
 /*

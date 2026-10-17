@@ -6,8 +6,8 @@
  *                         sees the same register writes and guest RAM and
  *                         mixes into its own WAV tap (RECOMP_MA_WAV) for
  *                         tools/apu_ab.py
- * The default is in APU_DEFAULT_IMPL below. Built with OPENHALO2_OLD_APU only
- * while the previous model is still linked; without it only "new" exists.
+ * The default is "new". "old" and "shadow" exist only in a build configured
+ * with -DOPENHALO2_WITH_OLD_APU=ON (OPENHALO2_OLD_APU here).
  */
 #include <stdint.h>
 #include <stdbool.h>
@@ -20,7 +20,7 @@
 #include "mcpxaudio/mcpx_audio.h"
 
 #ifndef APU_DEFAULT_IMPL
-#define APU_DEFAULT_IMPL "old"
+#define APU_DEFAULT_IMPL "new"
 #endif
 
 bool ma_hook_handle_mmio(ma_state *s, PCONTEXT ctx, uintptr_t fault_addr,

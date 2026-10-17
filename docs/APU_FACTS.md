@@ -120,9 +120,29 @@ KeConnectInterrupt with ISR 0x37F28C on HalGetInterruptVector(5) [dis 0x37F2FD-0
 * DSOUND posts commands to GP scratch +0x810 and spins until the word is 0 [dis 0x37E386-0x37E393]; GP scratch page 0 = first entry of the table at RAM[reg 0x2040] [snap1].
 * Each pass DSOUND checks that the word at 0xFE85A018 (pointer at 0x387108) equals 0x00CCCCCC and resets the DSPs otherwise [dis 0x37EC7A-0x37EC8A].
 
-## 9. Open (to be measured in shadow mode)
+## 9. Measured in shadow mode (oracle and new model on one register stream)
 
-* What the multipass voices that read page 0x7FF (GP memory, base 0x7FFxxx) receive with no DSP program running.
-* Volume law and envelope curves as the oracle applies them.
-* The oracle's output fold-down gains and limiter.
-* ADPCM samples per block (64 or 65).
+Source key **[shadow NAME]**: `reports/apu2/NAME/` (oracle `mix.wav`, new `new*.wav`, `out.log`), compared with `tools/apu_ab.py`, `tools/apu2/binab2.py`, `tools/apu2/fitparts.py`.
+
+| Fact | Source |
+|---|---|
+| The previous model processes 8 frames back to back once per 256-sample block, writing each voice's position back after every frame. | [shadow sh_tick] `[MAT]` lines: position deltas of 235 source samples (8 x 29.4) at 5.3 ms intervals |
+| Volume law: attenuation in 1/64 dB, 0xFFF silent; output = bins x 1, no headroom or gain stage between the bins and the 16-bit output (menu music at 0x280 and a buffer at 0 match within 0.01 dB). | [shadow sh_menu18]: 100% of 1 s windows within 0.5 dB, correlation 1.000 |
+| Fold-down: bins 0/6/8 left, 1/7/9 right, 2 to both, effect sends not in the mix. | per-bin energies vs mix, [shadow sh_arm12] |
+| Interpolation: 4-point Hermite (same sample values as the oracle: correlation 1.000 on 44,098 Hz PCM music). | [shadow sh_menu9] |
+| ADPCM: 64 output samples per 36/72-byte block (header sample + 63 nibbles); stream segment counts are frames = blocks x 64. | correlation 0.999 on ADPCM streams [shadow acc_arm2]; segment ctl 0xAD40 = 693 x 64 (trace armory1) |
+| Stream double-buffers are fixed addresses the title refills after each completion (0x2428000 / 0x2438000 for the menu music): a model must latch a segment list and its entries when it starts playing them. | [shadow sh_seg] `[MAS]` log |
+| Multipass voices (+04 bit 26) read the bin named by +04 bits 16-20 (31 for the 3D sources) in list order, and the read empties the bin; each 3D source is inserted just before its HRTF voice. | trace sh_arm1 voice-on order; [shadow sh_arm5] variants |
+| HRTF entries: 0x40 bytes, 31 taps per ear interleaved left/right, sign-magnitude / 128; byte 63 = interaural delay in half samples, positive delays the left ear. Gain: unit energy over both ears, times 0.875 (fitted). | [APUH] prints matched byte for byte (sh_arm1); ITD sign by residual 0.19% vs 0.98% [shadow sh_ivory10]; gain fit [shadow sh_ivory3/10/12] |
+| HRTF voice slots 4-7 (the bin-10 send) carry the filtered left/right output by slot parity. | bin 10 within 0.5 dB in 82% of periods (30% with the dry mono input) [shadow sh_arm13, acc_arm2] |
+| VOICE_RELEASE = method 0x12C: state -> 0x66xxxxxx, +0x34 = release rate x 16 counted down per frame, output scaled by count / (rate x 16), at 0 state 0x77000000 and the voice ends. | trace armory1 at 97.198 s (v149) |
+| Voice end report: after VOICE_OFF or a voice ending, the oracle traps 0x8000/voice (status 0x71 then 0x11 once more). | trace menu1 records 22011-25806 |
+| Notifier for a stream list: k = 0 (list A) / 1 (list B); for an ended buffer voice k = 0. Status 0x61 per completed list. | [snap1], trace menu1 |
+| Mixbins are not saturated at 1.0 (16-bit full scale) in the oracle: its pre-gain peaks reach 2.5 x full scale in Ivory Tower. | [shadow sh_ivory5] |
+| The title's I3DL2 levels (s_sound_driver_globals.reverbs[0]) are in dB: -100 = off, then -12/-12/+4 in the Armory. | `[MA] reverb globals` print, rv_t |
+
+## 10. Not established
+
+* What the oracle does with SetFilter coefficients: a DLS2 biquad at the coded cutoff and an I3DL2 one-pole both change the mix by under 0.1 dB in Ivory Tower; the model keeps the DLS2 low-pass (on by default) and the one-pole off (RECOMP_MA_FILTER).
+* The exact origin of the 0.875 HRTF gain: none of raw, l1, per-ear, max-ear or both-ear RMS normalisations gives it; it is a fitted constant.
+* Envelope curve shapes beyond the release: no voice in the three scenes uses non-zero attack/decay times (the oracle reports ea 1.00 throughout).
