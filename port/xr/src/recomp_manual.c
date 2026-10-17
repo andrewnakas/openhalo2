@@ -46,7 +46,13 @@ typedef void (*recomp_func_t)(void);
 
 /* ── Register state (defined in xbox_memory_layout.c) ──────── */
 
+#if defined(_WIN32)
 #include <windows.h>   /* __try / EXCEPTION_EXECUTE_HANDLER in the not-code log */
+#else
+/* the web build: no structured exceptions; the guarded reads just read */
+#define __try if (1)
+#define __except(filter) else
+#endif
 /* Per-thread, as defined (RECOMP_TLS): a plain extern reads the wrong memory. */
 extern __declspec(thread) uint32_t g_eax, g_ecx, g_esp;
 extern ptrdiff_t g_xbox_mem_offset;

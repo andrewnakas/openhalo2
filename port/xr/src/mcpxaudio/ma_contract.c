@@ -9,7 +9,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include "platform/win32_compat.h"
+#endif
 #include "platform/mmio_decode.h"
 #include "ma_internal.h"
 

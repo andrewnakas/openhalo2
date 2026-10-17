@@ -53,7 +53,15 @@ void     recomp_apu_write(uint32_t off, uint32_t val, int size);
  * write << 31, u32 value}; a read records the value returned. Capped at MB
  * megabytes (default 512). Black-box measurement for the clean-room APU
  * (docs/APU_CLEANROOM_DESIGN.md 3c.1); tools/apu_trace.py reads it. */
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include "platform/win32_compat.h"   /* the web build */
+#include <unistd.h>
+#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+#define GetFileAttributesA(p) (access((p), 0) == 0 ? 0u : INVALID_FILE_ATTRIBUTES)
+#define DeleteFileA(p) (remove(p) == 0)
+#endif
 static FILE *s_tr;
 static long long s_tr_left = -1;
 static LARGE_INTEGER s_tr_t0, s_tr_f;

@@ -14,9 +14,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
 #include <windows.h>
 #include <tlhelp32.h>
 #include <dbghelp.h>
+#else
+#include "platform/win32_compat.h"   /* the web build */
+#endif
 #include "mcpxaudio/mcpx_audio.h"
 
 #ifndef APU_DEFAULT_IMPL
@@ -41,6 +45,7 @@ static ma_state *s_more[4];     /* extra shadows (RECOMP_MA_SHADOWS, RECOMP_MA_C
 ma_state *ma_create_cfg(int mode, const char *cfg, int index);
 volatile int recomp_apu_on;
 
+#if defined(_WIN32)
 /* RECOMP_APU_CPU=1: every 10 s, the CPU time of each thread whose start
  * routine is in an APU model (the previous model's or ours), by symbol, so
  * the two can be compared ([APUCPU] lines). */
@@ -90,6 +95,7 @@ static DWORD WINAPI cpu_reporter(LPVOID arg)
     }
     return 0;
 }
+#endif
 
 /* Called once, where main.c used to call mcpx_apu_init_standalone. */
 int recomp_apu_start(uint8_t *ram_ptr)
@@ -97,8 +103,10 @@ int recomp_apu_start(uint8_t *ram_ptr)
     const char *e = getenv("RECOMP_APU_IMPL");
     const char *impl = (e && *e) ? e : APU_DEFAULT_IMPL;
 
+#if defined(_WIN32)
     if (getenv("RECOMP_APU_CPU"))
         CreateThread(NULL, 0, cpu_reporter, NULL, 0, NULL);
+#endif
 
 #ifdef OPENHALO2_OLD_APU
     if (!strcmp(impl, "old") || !strcmp(impl, "shadow")) {

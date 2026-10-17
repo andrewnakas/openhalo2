@@ -35,9 +35,10 @@ void      xbox_WatchdogStart(void);
 int       recomp_dispatch_init(void);
 void      xbe_entry_point(void);
 
-typedef struct MCPXAPUState MCPXAPUState;
-extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
-extern MCPXAPUState *g_apu_state;
+/* The APU: the clean-room model (port/xr/src/mcpxaudio), started the way main.c
+ * starts it (apu_select.c); its output goes to the page through the shared ring
+ * in mcpxaudio/apu_xaudio2.c (audio.js reads it). */
+extern int recomp_apu_start(uint8_t *ram_ptr);
 
 #define OPFS_DIR  "/opfs"            /* the origin's private file system */
 #define GAME_DIR  OPFS_DIR "/game"
@@ -150,7 +151,7 @@ int main(void)
     printf("Xbox memory mapped. Offset: 0x%lX\n", (unsigned long)g_xbox_mem_offset);
 
     if (getenv("RECOMP_AC97_READY"))
-        g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
+        recomp_apu_start((uint8_t *)xbox_GetMemoryBase());
     xbox_OhciInit();
     xbox_kernel_init();
     xbox_Nv2aRegTrapInit();

@@ -6,10 +6,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#if defined(_WIN32)
 #include <windows.h>
 #include <mmsystem.h>
+#else
+/* the web build (and any POSIX host): the toolkit's Win32 shim */
+#include "platform/win32_compat.h"
+#define timeEndPeriod(ms) ((void)(ms))
+#define TIMER_ALL_ACCESS 0
+#define CreateWaitableTimerExW(a, n, f, acc) ((HANDLE)NULL)
+#endif
 #include "ma_internal.h"
 #include "apu_xaudio2.h"
+#if defined(__EMSCRIPTEN__)
+#define MA_DEVICE_NAME "page ring"   /* audio.js plays it */
+#else
+#define MA_DEVICE_NAME "XAudio2"
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern uint32_t  xbox_AllocThreadTib(void);
@@ -472,7 +485,7 @@ int ma_thread_start(ma_state *s)
         s->device = xa2_init();
     s->thread = CreateThread(NULL, 0, frame_thread, s, 0, NULL);
     fprintf(stderr, "[MA] clean-room APU %s up (%s)\n", s->mode == MA_LIVE ? "live" : "shadow",
-            s->device ? "XAudio2" : "no device");
+            s->device ? MA_DEVICE_NAME : "no device");
     return s->thread ? 0 : -1;
 }
 

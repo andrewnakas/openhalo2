@@ -25,12 +25,20 @@ cc() { src=$1; obj=$2
   # the runtime: line numbers (tools/websym.sh) and full optimisation (the pixel
   # executor and the vertex program interpreter are the frame's cost); RTOPT=-O1 for a quick build
   case "$obj" in */rt/*) dbg="-g ${RTOPT:--O3}";; *) dbg=$LOPT;; esac
+  # the clean-room APU defines the contract symbols itself (as MA_CONTRACT natively)
+  case "$obj" in */rt/ma_*) dbg="$dbg -DMA_CONTRACT=1 -I$G/mcpxaudio";; esac
   emcc -c $CF $dbg "$src" -o "$obj" > "${obj%.o}.log" 2>&1 && rm -f "${obj%.o}.log" || echo "FAIL $src"; }
-export -f cc; export CF LOPT
+export -f cc; export CF LOPT G
 if [ "$1" != "link-only" ]; then
   { for f in $G/recomp/gen/*.c $G/recomp_manual.c $G/mmio_direct.c $G/nvnet.c; do echo "$f $OUT/$LD/$(basename ${f%.c}).o"; done
-    for f in $(find $X/src -name '*.c' -not -path '*/d3d/*' -not -path '*smoke*' -not -name 'nv2a_pb_test.c'); do
+    # The toolkit, as the native build links it (port/xr/CMakeLists.txt): not d3d
+    # (the web draws through the NV2A path), not apu/ or audio/ (the xemu-derived
+    # APU and the DirectSound HLE that links it; the clean-room model in
+    # port/xr/src/mcpxaudio replaces both), not nv2a/ (xemu-derived, includes
+    # qemu_shim.h; the kernel's own nv2a_*.c serve the web).
+    for f in $(find $X/src -name '*.c' -not -path '*/d3d/*' -not -path '*/apu/*' -not -path '*/audio/*'                -not -path '*/nv2a/*' -not -path '*smoke*'); do
       b=$(echo ${f#$X/src/} | tr '/' '_'); echo "$f $OUT/rt/${b%.c}.o"; done
+    for f in $G/mcpxaudio/*.c $G/apu_select.c; do echo "$f $OUT/rt/ma_$(basename ${f%.c}).o"; done
     echo "$W/main_web.c $OUT/rt/main_web.o"; echo "$W/compat_web.c $OUT/rt/compat_web.o"; echo "$W/present_web.c $OUT/rt/present_web.o"
   } | xargs -P 3 -L 1 bash -c 'cc $0 $1'
 fi
