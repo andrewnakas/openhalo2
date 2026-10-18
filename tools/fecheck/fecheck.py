@@ -24,6 +24,7 @@ import os
 import pickle
 import re
 import struct
+import subprocess
 import time
 
 import numpy as np
@@ -85,6 +86,23 @@ BUILTINS = {
     '_CIpow': bytes.fromhex('d9c9d9f1' + 'd9c0d9fcdce9d9c9d9f0d9e8dec1d9fddd d9c3'.replace(' ', '')),
     '_CIfmod': bytes.fromhex('d9c9d9f8dfe09e7af9ddd9c3'),          # fxch; fprem loop; fstp st1
 }
+
+
+def _libm_sse2(ci, two):
+    """VS2022 /arch:SSE2 math (__libm_sse2_<f>_precise): double x in xmm0 (y in xmm1), result in
+    xmm0. Wraps the _CI x87 body: spill to the stack, load onto x87, run it, reload xmm0."""
+    code = bytes.fromhex('83ec10' 'f20f110424')        # sub esp,16; movsd [esp],xmm0
+    if two:
+        code += bytes.fromhex('f20f114c2408')         # movsd [esp+8],xmm1
+    code += bytes.fromhex('dd0424')                     # fld qword [esp]
+    if two:
+        code += bytes.fromhex('dd442408')             # fld qword [esp+8]: st0 = y, st1 = x as for _CI
+    return code + BUILTINS[ci][:-1] + bytes.fromhex('dd1c24' 'f20f100424' '83c410' 'c3')  # fstp; movsd xmm0; add esp; ret
+
+
+for _f, _two in (('sqrt', 0), ('sin', 0), ('cos', 0), ('tan', 0), ('acos', 0), ('asin', 0), ('atan', 0),
+                 ('log', 0), ('log10', 0), ('exp', 0), ('atan2', 1), ('pow', 1)):
+    BUILTINS['_libm_sse2_%s_precise' % _f] = _libm_sse2('_CI' + _f, _two)
 
 
 class Fail(Exception):
@@ -222,6 +240,48 @@ def obj_for(src, decomp, env, fresh=False, out=None):
     return obj
 
 
+_SSIZE = None
+
+
+def struct_size(tname, decomp, env):
+    """sizeof a structure the decomp passes by value, from a one-line probe compile against the
+    header that defines it (the compile error names the array size). Cached in <WORK>; 0 if unknown."""
+    global _SSIZE
+    path = os.path.join(common.WORK, 'struct_sizes.json')
+    if _SSIZE is None:
+        _SSIZE = json.load(open(path)) if os.path.exists(path) else {}
+    name = tname.split()[-1]
+    if name in _SSIZE:
+        return _SSIZE[name]
+    size = 0
+    pat = re.compile(r'^\s*(struct|class|union)\s+%s\b[^;]*$' % re.escape(name), re.M)
+    hdr = next((os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(decomp, 'include')) for f in fs
+                if f.endswith('.h') and pat.search(open(os.path.join(dp, f), errors='replace').read())), None)
+    if hdr:
+        probe = os.path.join(common.WORK, 'tmpobj', 'probe_%d.cpp' % os.getpid())
+        os.makedirs(os.path.dirname(probe), exist_ok=True)
+        open(probe, 'w').write('#include <xtl.h>\n#include "%s"\nchar (*fe_probe)[sizeof(%s)] = 1;\n'
+                               % (hdr.replace('\\', '/'), name))
+        r = subprocess.run([common.CL] + dbuild.BASE + ['/I', common.SHIM, '/I', os.path.join(decomp, 'include'),
+                            '/Fo' + probe + '.obj', probe], capture_output=True, text=True, env=env, errors='replace')
+        m = re.search(r"'char \(\*\)\[(\d+)\]'", r.stdout)
+        size = int(m.group(1)) if m else 0
+    _SSIZE[name] = size
+    try:
+        json.dump(_SSIZE, open(path, 'w'))
+    except OSError:
+        pass
+    return size
+
+
+def sized(sig, decomp, env):
+    """sig with by-value structure parameters given their real size (when the header knows it)."""
+    if sig is None or not sig.params or all(sz for pt, sz in sig.params):
+        return sig
+    ps = [(pt, sz or (struct_size(pt, decomp, env) if pt.startswith('struct') else 0)) for pt, sz in sig.params]
+    return coff.Sig(sig.cc, ps, sig.ret, sig.is_method, sig.varargs)
+
+
 def retail_calls(va, size):
     """Direct call/jmp targets in retail A's bytes (outside A)."""
     body = common.xbe_read(va, size) or b''
@@ -338,7 +398,7 @@ def link(objp, va, size, decomp, env, force=()):
                 target = ('va', v)
                 if typ == coff.IMAGE_REL_I386_REL32 and v not in transp:
                     b.callees.add(v)
-                    b.callee_sig[v] = coff.signature(t.name)
+                    b.callee_sig[v] = sized(coff.signature(t.name), decomp, env)
             if target is None and t.section > 0:
                 tsec = oo.sections[t.section]
                 if tsec.flags & coff.SCN_WRITE and not (tsec.flags & coff.SCN_CODE):
@@ -905,7 +965,10 @@ def run_blob(s, b, mapping, rres, recs):
         sig = b.callee_sig.get(t) if direct else None
         if sig is not None and sig.ret == 'struct':
             sr = with_retbuf(sig)
-            if sr is not None and (not sig.callee_pops() or (r.popped or 0) == (sr.stack_bytes() or 0)
+            # a method returning a class always takes the hidden result pointer in our compile
+            # (retail's LTCG pops can't tell: it may pass it in a register)
+            if sr is not None and (sig.is_method or not sig.callee_pops()
+                                   or (r.popped or 0) == (sr.stack_bytes() or 0)
                                    or (sr.stack_bytes() or 0) == (sig.stack_bytes() or 0)):
                 sig = sr
         cl = sig.locations() if sig else None
@@ -932,7 +995,16 @@ def run_blob(s, b, mapping, rres, recs):
                     args += w_
                     masks += [MASKS.get(pt, 0xFFFFFFFF)] * len(w_)
         else:
-            n = min(max((r.popped or 0) // 4, 0 if direct and sig is not None else 4), len(r.stack))
+            # retail's pops are exact for callee-cleaned calls (thiscall/stdcall/fastcall); an
+            # indirect call that popped nothing is a virtual call without stack arguments.
+            # Only a direct cdecl-looking call (pops 0) keeps the 4-word guess.
+            if r.popped:
+                n = r.popped // 4
+            elif not direct and r.popped == 0:
+                n = 0
+            else:
+                n = 0 if direct and sig is not None else 4
+            n = min(n, len(r.stack))
             args = list(struct.unpack('<%dI' % n, u.mem_read(esp, 4 * n))) if n else []
         rset = set(r.regs) | set(r.stack) | set(getattr(r, 'xlo', None) or [])
         r_hi, b_hi = esp0 + 4 + 4 * rsl, new_esp + 4 + 4 * bsl   # frames incl. incoming argument slots
@@ -1234,6 +1306,17 @@ def main():
     env = common.vcenv()
     for x in a.vas:
         res = check(int(x, 16), a.decomp, env, a.src, a.k)
+        if dbuild.SSE2 and not res.get('verdict', '').startswith('equivalent'):
+            # the x87 build of the same source: VS2022's SSE2 codegen sometimes defeats the
+            # entry search where the x87 one does not; either compile is a fair rendering
+            dbuild.SSE2 = False
+            try:
+                alt = check(int(x, 16), a.decomp, env, a.src, a.k, budget=120)
+            finally:
+                dbuild.SSE2 = True
+            if alt.get('verdict', '').startswith('equivalent'):
+                alt['detail'] = (alt.get('detail') or '') + ' [x87 build]'
+                res = alt
         res['tag'] = a.tag
         print(save(res), flush=True)
 
