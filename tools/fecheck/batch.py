@@ -54,8 +54,7 @@ def main():
     for v in vas:
         p = os.path.join(res_dir, '%08x%s.txt' % (v, a.tag))
         if not os.path.exists(p):
-            open(p, 'w').write('%08x crashed       -       native crash in the emulator (Unicorn)
-' % v)
+            open(p, 'w').write('%08x crashed       -       native crash in the emulator (Unicorn)\n' % v)
     c = collections.Counter()
     for v in vas:
         p = os.path.join(res_dir, '%08x%s.txt' % (v, a.tag))
