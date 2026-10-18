@@ -27,9 +27,12 @@ save_bak() {
 # (only the 1 MB blocks that differ are written back: whole copies of the 2.2 GB partition took
 # ~10 minutes while other jobs loaded the disk)
 save_restore() { for f in $SAVEF; do [ -s "$SAVEBAK/$f" ] && python -c "
-import sys,os
+import sys,os,time
 a,b=sys.argv[1],sys.argv[2]; n=0
-with open(a,'rb') as fa, open(b,'r+b') as fb:
+for t in range(30):
+    try: fb=open(b,'r+b'); break
+    except PermissionError: time.sleep(2)   # the killed game can hold the image for a while
+with open(a,'rb') as fa, fb:
     o=0
     while True:
         x=fa.read(1<<20)
@@ -39,8 +42,9 @@ with open(a,'rb') as fa, open(b,'r+b') as fb:
         o+=len(x)
     fb.truncate(o)
 " "$SAVEBAK/$f" "$XRDIR/save/$f"; done; }
-# lit <png> <x0> <x1> <y>...: index of the brightest row band (the highlight bar)
-lit() { python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');x0,x1=int(sys.argv[2]),int(sys.argv[3]);v=[sum(im.crop((x0,y-4,x1,y+4)).get_flattened_data() if hasattr(im,'get_flattened_data') else im.crop((x0,y-4,x1,y+4)).getdata()) for y in map(int,sys.argv[4:])];print(v.index(max(v)))" "$@" 2>/dev/null; }
+# lit <png> <x0> <x1> <y>...: index of the brightest row band (the highlight bar); -1 when it is
+# not LITM (default 1) times brighter than the next one
+lit() { python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');x0,x1=int(sys.argv[2]),int(sys.argv[3]);v=[sum(im.crop((x0,y-4,x1,y+4)).get_flattened_data() if hasattr(im,'get_flattened_data') else im.crop((x0,y-4,x1,y+4)).getdata()) for y in map(int,sys.argv[4:])];m=float(__import__('os').environ.get('LITM','1'));w=sorted(v);print(v.index(max(v)) if w[-1]>=m*w[-2] else -1)" "$@" 2>/dev/null; }
 # boot <watchdog>: start EXE headless with a live pad file and wait for the title
 boot() {
   : > "$O/pad.txt"
@@ -64,7 +68,7 @@ mainrow() {
     [ "$(logo "$O/row.png")" -gt 1000 ] && break
     [ $i = 4 ] || [ $i = 8 ] && pad a:300 4; sleep 2
   done
-  for i in 1 2 3 4 5 6; do shot row; [ "$(lit "$O/row.png" 405 435 287 315 343 371 399)" = $1 ] && break; pad up:150 3; done
+  for i in 1 2 3 4 5 6; do shot row; [ "$(LITM=1.1 lit "$O/row.png" 405 435 287 315 343 371 399)" = $1 ] && break; pad up:150 3; done
 }
 # camp_level <n>: Campaign -> Campaign Options (Resume 0 / Select Level 1 / Cooperative 2 at
 # y 192 213 235) -> Select Level row n (The Heretic 0, Armory 1, Cairo Station 2 at y 92 114 136;
@@ -87,6 +91,14 @@ lobby() {
   [ "$(python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');print(1 if sum(im.crop((382,70,392,86)).getdata())>160*80 else 0)" "$O/l1.png" 2>/dev/null)" = 1 ] || pad right:300 3
   shot l2; pad a:500 6; shot l3
 }
+# hudwait: wait (up to 4 minutes) for the campaign HUD's shield bar (x 50-130, y 344-360: blue with
+# some red) after a loading frame (no red there) was seen: menus pass the HUD test too, and a
+# fixed wait was too short on a busy machine
+hudwait() { local ld=0 v; for i in $(seq 48); do shot hud
+    v=$(python -c "import sys;from PIL import Image;v=list(Image.open(sys.argv[1]).convert('RGB').crop((50,344,130,360)).getdata());r=sum(p[0] for p in v)/len(v);print('L' if r<5 else 'H' if r>20 and sum(p[2] for p in v)/len(v)>140 else '-')" "$O/hud.png" 2>/dev/null)
+    [ "$v" = L ] && ld=1; [ "$v" = H ] && [ $ld = 1 ] && return 0; sleep 4; done; return 1; }
+# tosetup: a game type or map choice returns to the lobby: if its Game Setup button is lit, enter it
+tosetup() { shot ts; [ "$(python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');print(1 if sum(im.crop((382,70,392,86)).getdata())>160*80 else 0)" "$O/ts.png" 2>/dev/null)" = 1 ] && pad a:500 6; }
 # setuprow <n>: on Custom Game Setup, up/down until row n is lit (Change Map 0, Change Rules 1, Quick Options 2)
 setuprow() {
   for i in 1 2 3 4 5; do shot sr; r=$(lit "$O/sr.png" 90 300 132 154 176); [ "$r" = $1 ] && break
@@ -153,12 +165,18 @@ for s in "${SC[@]}"; do
     # Cairo: melee, jump, crouch, grenade, reload, zoom, flashlight; the pause menu rows and their
     # submenus; Save and Quit; then the main menu's Settings two levels deep
     save_bak || { echo "$s: save backup failed"; continue; }; RESTORE=1
-    camp_level 2 || echo "$s: boot failed"; sleep 50; shot c0
+    camp_level 2 || echo "$s: boot failed"; hudwait || echo "$s: no HUD"; sleep 5; shot c0
     for i in $(seq 8); do pad lup:1500 2; pad b:300 1; pad a:300 1; pad lthumb:300 1; pad lt:300 1; pad rleft:400 1; done
     pad x:300 2; pad y:300 2; pad rthumb:300 2; pad rthumb:300 2; pad white:300 2; pad black:300 2; shot play
-    pad start:300 4; shot p0
-    for r in 1 2 3 4 5; do pad a:300 4; shot p${r}a; pad a:300 4; shot p${r}b; pad b:300 3; pad b:300 3; pad down:150 3; done
-    pad b:300 3; pad start:300 4; shot p9
+    # pause menu (Continue 0, Revert to Last Checkpoint 1, Restart Level 2, Controller Settings 3,
+    # Save and Quit 4; A on Continue resumes, so the menu is reopened for every row)
+    pad start:300 4; shot p0; for i in 1 2 3; do pad down:150 2; done; pad a:300 4; shot p3
+    for r in 1 2 3 4 5 6; do pad a:300 4; shot p3_$r; pad b:300 3; pad down:150 2; done
+    pad b:300 3; pad b:300 3; sleep 2; shot p3x
+    pad start:300 4; pad down:150 2; pad a:300 4; shot p1; pad up:150 2; pad a:300 4; hudwait; shot p1c
+    pad start:300 4; pad down:150 2; pad down:150 2; pad a:300 4; shot p2; pad up:150 2; pad a:300 4; hudwait; shot p2c
+    for i in $(seq 4); do pad lup:1500 2; pad b:300 1; pad lt:300 1; done
+    pad start:300 4; shot p9
     # Save and Quit is the last row (up wraps to it), then confirm
     pad up:150 3; shot q0; pad a:300 4; shot q1; pad up:150 2; pad a:300 15; shot q2
     for i in 1 2 3 4 5 6; do pad up:150 2; done; for i in 1 2 3 4; do pad down:150 2; done; shot m0; pad a:300 5; shot m1
@@ -169,14 +187,14 @@ for s in "${SC[@]}"; do
     save_bak || { echo "$s: save backup failed"; continue; }; RESTORE=1
     lobby 2 || echo "$s: boot failed"
     setuprow 1; pad a:500 5; shot r0; for i in 1 2 3; do pad down:150 2; done; shot r1; pad a:500 5; shot r2; pad a:500 5; shot r3
-    setuprow 0; pad a:500 5; shot c0; for i in 1 2 3 4; do pad down:150 2; done; shot c1; pad a:500 5; shot c2
+    tosetup; setuprow 0; pad a:500 5; shot c0; for i in 1 2 3 4; do pad down:150 2; done; shot c1; pad a:500 5; shot c2
     mpstart; sleep 5; shot end ;;
   syslink)
     # System Link: host a game alone, pick another map and game type, play it
     save_bak || { echo "$s: save backup failed"; continue; }; RESTORE=1
     lobby 3 || echo "$s: boot failed"
     setuprow 0; pad a:500 5; shot c0; for i in 1 2 3 4 5 6; do pad down:150 2; done; shot c1; pad a:500 5; shot c2
-    setuprow 1; pad a:500 5; shot r0; pad down:150 2; shot r1; pad a:500 5; shot r2; pad a:500 5; shot r3
+    tosetup; setuprow 1; pad a:500 5; shot r0; pad down:150 2; shot r1; pad a:500 5; shot r2; pad a:500 5; shot r3
     mpstart; sleep 5; shot end ;;
   *) echo "unknown scenario $s"; continue ;;
   esac
