@@ -49,7 +49,10 @@ add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 # without a manual re-configure. A plain GLOB is evaluated once at configure
 # time, so a newly generated file (an extra chunk, recomp_stubs_unresolved.c)
 # is silently left out of the build and shows up as unresolved externals.
-file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
+# OPENHALO2_GEN_DIR: build from another gen dir (a private copy post-passed by
+# h2lift/fe_pass.py for the decomp-assist bench); default the normal one.
+set(OPENHALO2_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen" CACHE PATH "Generated (lifted) C directory")
+file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "${OPENHALO2_GEN_DIR}/*.c")
 
 # Core game sources
 set(GAME_SOURCES
@@ -146,6 +149,16 @@ endif()
 #     ENABLE_ICALL_TRACE=1
 #     VERBOSE_KERNEL_LOG=1
 # )
+
+# Decomp-assist bench (docs/DECOMP_ASSIST_PLAN.md): function-entry counters,
+# argument samples and state snapshots. Needs OPENHALO2_GEN_DIR pointing at a
+# gen copy passed by h2lift/fe_pass.py. OFF = release, unchanged.
+option(OPENHALO2_FECHECK "Instrumented build for the decomp-assist bench" OFF)
+if(OPENHALO2_FECHECK)
+    target_sources(${PROJECT_NAME} PRIVATE src/fecheck_rt.c)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RECOMP_FECHECK=1)
+    target_include_directories(${PROJECT_NAME} BEFORE PRIVATE ${OPENHALO2_GEN_DIR})
+endif()
 
 # Online system link (net/h2net.c, libdatachannel from vcpkg, static).
 # Built in when the vcpkg tree is there; RECOMP_NET_ROOM picks a room at run time.
