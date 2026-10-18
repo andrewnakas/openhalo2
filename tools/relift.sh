@@ -34,4 +34,7 @@ for f in "$GEN"/recomp_*.c; do
   [ -e "$TMP/$b" ] || { echo "stale (not regenerated): $b"; }
 done
 echo "RELIFT_DONE changed_files=$changed"
+# Hashes of the lifted C a release is tested with: tools/byog/lift.py checks a
+# player's own lift against them (config/gen_manifest.json, commit it with the code).
+python -c "import sys,json; sys.path.insert(0,'/d/n64work/openhalo2/tools/byog'); import lift; json.dump(lift.manifest_of(sys.argv[1]), open(sys.argv[2],'w'), indent=0, sort_keys=True)" "$GEN" /d/n64work/openhalo2/config/gen_manifest.json
 grep -ho 'RECOMP_UNIMPL("[a-z0-9]*' "$GEN"/*.c | sort | uniq -c | sort -rn | grep -E 'lock|mxcsr|cpuid|pushfd|popfd|xchg' || echo "no lock/mxcsr/cpuid/pushfd/popfd sites left untranslated"

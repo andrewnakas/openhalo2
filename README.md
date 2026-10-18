@@ -10,26 +10,43 @@ I'm just scratching the surface but i think this can help us get the project dec
 https://github.com/kirklandsig/halo2-decompiled
 
 
-Halo 2 (original Xbox, 2004) running natively on a PC. The game's own program code was translated
-instruction by instruction into C (a *static recompilation*) and is compiled into this program, beside
-a model of the Xbox hardware it talks to.
+Halo 2 (original Xbox, 2004) running natively on a PC. The game's own program code is translated
+instruction by instruction into C (a *static recompilation*) and compiled into a Windows program,
+beside a model of the Xbox hardware it talks to.
 
-**You need your own copy of the game.** This download contains no game files: no maps, no sounds,
-no textures, no movies. On first start you point it at your Halo 2 disc image and it copies the
-files it needs into a `game` folder next to the program.
+**You need your own copy of the game, and the recompilation is made from it.** This download
+contains nothing from Halo 2: no maps, sounds, textures or movies, and none of the game's program
+code. On first start you point it at your disc image; it copies the game files into a `game`
+folder, then translates *your* copy of the game's program into C and compiles it on your PC.
 
 ## Getting started (Windows 10/11, 64-bit)
 
-1. Unzip anywhere you can write to (not `Program Files`). About 5 GB of free space is needed for the
-   game files and 1.5 GB for the save/cache folder.
-2. Run `halo2_recomp.exe`.
+1. Unzip anywhere you can write to (not `Program Files`). About 10 GB of free space is needed: the
+   game files, the build and the save/cache folder.
+2. Run `OpenHalo2.exe`.
 3. When it asks, choose your disc image: a Redump `.iso` or an XISO, or the `default.xbe` of a copy
    you already extracted. The import takes a few minutes and checks that it is the original retail
    disc (the one version this build runs).
-4. The first start after that copies maps into the emulated hard disk; it can take several minutes.
-   Later starts are quick.
+4. It then builds the game program (`halo2_recomp.exe`) from your copy, once, in a window that shows
+   the progress: about 10-30 minutes on a typical PC. The lifted code is checked against the code
+   this release was tested with before it is compiled.
+   - The compiler (LLVM clang) and the lifter come with the download. Compiling also needs
+     Microsoft's C runtime and Windows SDK libraries. If Visual Studio or its free Build Tools (C++
+     workload) are installed they are used; if not, the build asks you to accept Microsoft's
+     licence and downloads them from Microsoft (about 85 MB) with [xwin](https://github.com/Jake-Shadle/xwin).
+5. The game starts. The first start copies maps into the emulated hard disk; it can take several
+   minutes. Later starts are quick (always start `OpenHalo2.exe`).
 
-Needs a GPU with OpenGL 3.3. No other installs (the program carries its own C runtime).
+Needs a GPU with OpenGL 3.3 and an internet connection for the one Microsoft download (if Visual
+Studio is not installed). The finished program needs no other installs.
+
+### Building it yourself instead
+
+Everything in the download is made from this repository; nothing from the game is in it.
+`port/xr/build_kit.cmd` builds the runtime kit (no game code), `tools/byog/build_launcher.cmd` the
+launcher, and `tools/make_release.sh` packs them with the lifter and compiler. To work on the code,
+`tools/relift.sh` lifts your own `default.xbe` into `port/xr/src/recomp/gen/` and
+`port/xr/build_win.cmd` builds the full program with Visual Studio 2022.
 
 ## Controls
 
@@ -93,7 +110,8 @@ says why. Please attach it to bug reports.
 Halo 2 is a trademark of Microsoft. This project is not affiliated with or endorsed by Microsoft,
 Bungie or 343 Industries. It ships no game data, and it runs only with a copy of the game you own.
 
-The recompiled program code in this executable is derived from the retail game and is provided so
-that owners of the game can play it on current hardware. Open Halo 2's own code, tools and documentation are public domain (CC0 1.0, see `LICENSE`):
+Open Halo 2 does not distribute the game's program code in any form. The recompilation is made on
+your PC from your own copy of the game and stays there. Open Halo 2's own code, tools and
+documentation are public domain (CC0 1.0, see `LICENSE`):
 decompilation projects and anyone else may reuse any of it freely. `NOTICE` lists the third-party
 code it uses and its licences.
