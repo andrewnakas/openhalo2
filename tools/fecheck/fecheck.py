@@ -49,6 +49,7 @@ CODE_N = 0x3F00            # never reused within a run: Unicorn keeps translated
 CAP = 30_000_000
 BLOB_CAP = 8_000_000      # ours: a wrong entry mapping usually loops; keep it short
 RESULTS = os.path.join(common.WORK, 'results')
+DEBUG = bool(os.environ.get('FECHECK_DEBUG'))
 RCACHE = os.path.join(common.WORK, 'rcache_v4')   # bump when retail recording changes
 REGS = ['eax', 'ecx', 'edx', 'ebx', 'esi', 'edi']
 UREG = {r: getattr(X, 'UC_X86_REG_' + r.upper()) for r in REGS + ['esp', 'ebp', 'eip']}
@@ -745,6 +746,17 @@ def word_at(base, idx, vals, w):
     return bytes(out)
 
 
+_CREGS = {}
+
+
+def callee_regs(va):
+    """Register arguments of a retail function (its live-in registers), cached."""
+    if va not in _CREGS:
+        r = common.functions().get(va) if va < KVA else None
+        _CREGS[va] = [x for x in live_in(va, r['size_i']) if x in REGS] if r else []
+    return _CREGS[va]
+
+
 def same_pointee(uc, v, cands, n=32):
     try:
         want = bytes(uc.mem_read(v, 64))
@@ -778,7 +790,17 @@ def run_blob(s, b, mapping, rres, recs):
             if len(stk) < where + len(raw):
                 stk += bytes(where + len(raw) - len(stk))
             stk[where:where + len(raw)] = raw
-    uc.mem_write(new_esp, struct.pack('<I', SENT) + bytes(stk) + bytes(64))
+    # Run ours at retail's own stack pointer when its stack arguments sit where retail's do: then
+    # uninitialised locals hold the same stale bytes in both runs (sources copy whole structures).
+    # Otherwise give our frame a shifted copy of retail's stack.
+    same = all((k == 'stk' and l[0] == 'stk' and l[1] == 4 * w) or (k == 'reg' and l[0] == 'reg')
+               for (k, w, sz), l in zip(mapping, b.sig.locations()))
+    if same:
+        new_esp = esp0
+        uc.mem_write(new_esp, struct.pack('<I', SENT))
+    else:
+        uc.mem_write(new_esp - 0x8000, bytes(uc.mem_read(esp0 - 0x8000, 0x8000)))
+        uc.mem_write(new_esp, struct.pack('<I', SENT) + bytes(stk) + bytes(64))
     bsl = (len(stk) + 3) // 4
     rsl = max([w + (sz + 3) // 4 for k, w, sz in mapping if k == 'stk'], default=0)
     uc.reg_write(X.UC_X86_REG_ESP, new_esp)
@@ -834,8 +856,10 @@ def run_blob(s, b, mapping, rres, recs):
             args = list(struct.unpack('<%dI' % n, u.mem_read(esp, 4 * n))) if n else []
         rset = set(r.regs) | set(r.stack)
         r_hi, b_hi = esp0 + 4 + 4 * rsl, new_esp + 4 + 4 * bsl   # frames incl. incoming argument slots
-        r_fp = fptrs(r.regs + r.stack, r.esp_call, r_hi)
-        b_fp = fptrs(args + list(fregs.values()), esp, b_hi)
+        # frame pointers retail really passed: the callee's live-in registers and the stack bytes it popped
+        r_args = [r.regs[REGS.index(x)] for x in callee_regs(t)] + r.stack[:max(0, (r.popped or 0) // 4)]
+        r_fp = fptrs(r_args, r.esp_call, r_hi) or fptrs(r.regs + r.stack, r.esp_call, r_hi)
+        b_fp = fptrs(args if cl is not None else args + [fregs['ecx'], fregs['edx']], esp, b_hi)
         for i, v in enumerate(args):
             if v in rset or (esp <= v < b_hi and r_fp):
                 continue
@@ -858,6 +882,10 @@ def run_blob(s, b, mapping, rres, recs):
         if not pairs:
             pairs = dict(zip(r_fp, b_fp))
         pk = sorted(pairs)
+        if DEBUG:
+            print('  mock %d %s args %s r_fp %s b_fp %s pairs %s pops %s/%s' % (st['n'], nearest(t), [hex(x) for x in args],
+                  [hex(x) for x in r_fp], [hex(x) for x in b_fp], {hex(k): hex(v) for k, v in pairs.items()}, r.popped,
+                  sig.stack_bytes() if sig else None))
         for a, data in r.writes:
             if r.esp_call - 0x40000 <= a < r.esp_call:
                 continue                       # the callee's own stack
