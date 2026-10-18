@@ -9,12 +9,15 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OPENHALO2 = os.path.normpath(os.path.join(HERE, '..', '..'))
-DECOMP = os.environ.get('FECHECK_DECOMP', 'D:/n64work/halo2-decompiled')
-WORK = os.environ.get('FECHECK_WORK', 'D:/n64work/halo2/build/fecheck')
-SNAPS = os.environ.get('FECHECK_SNAPS', 'D:/n64work/halo2/snaps')
+# openhalo2, halo2-decompiled and halo2 sit side by side under one root
+ROOT = os.environ.get('FECHECK_ROOT', os.path.dirname(OPENHALO2)).replace('\\', '/').rstrip('/')
+HALO2 = ROOT + '/halo2'
+DECOMP = os.environ.get('FECHECK_DECOMP', ROOT + '/halo2-decompiled')
+WORK = os.environ.get('FECHECK_WORK', HALO2 + '/build/fecheck')
+SNAPS = os.environ.get('FECHECK_SNAPS', HALO2 + '/snaps')
 RUNTIME = os.path.join(OPENHALO2, 'runtime')
-XBE = 'D:/n64work/halo2/dirty/game/default.xbe'
-GEN = 'D:/n64work/openhalo2/port/xr/src/recomp/gen'
+XBE = HALO2 + '/dirty/game/default.xbe'
+GEN = os.path.join(OPENHALO2, 'port', 'xr', 'src', 'recomp', 'gen').replace('\\', '/')
 SHIM = os.path.join(HERE, 'xdkshim')
 VCVARS = r'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat'
 CL = r'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x86\cl.exe'

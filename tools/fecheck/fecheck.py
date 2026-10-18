@@ -97,7 +97,7 @@ class Fail(Exception):
 # bytes. A kernel call here returns 0 and pops its arguments: retail and ours both see what retail's
 # run recorded, so the comparison stays fair.
 KVA = 0xFE000000
-KBRIDGE = 'D:/n64work/halo2/third_party/xboxrecomp/src/kernel/kernel_bridge.c'
+KBRIDGE = common.HALO2 + '/third_party/xboxrecomp/src/kernel/kernel_bridge.c'
 THUNKS = 0x411520          # the XBE's kernel thunk table (header 0x158 ^ retail key)
 _KERNEL = None
 
