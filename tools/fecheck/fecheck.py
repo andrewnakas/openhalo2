@@ -22,6 +22,7 @@ import itertools
 import json
 import os
 import pickle
+import re
 import struct
 import time
 
@@ -176,7 +177,7 @@ def transparent():
     global _TRANSP
     if _TRANSP is None:
         t = table()
-        _TRANSP = {t[n] for n in TRANSPARENT_NAMES if n in t} | {v for n, v in t.items() if n.startswith('__CI')}
+        _TRANSP = {t[n] for n in TRANSPARENT_NAMES if n in t} | {v for n, v in t.items() if re.match(r'^_{0,2}CI[a-z0-9]+$', n)}
     return _TRANSP
 
 
@@ -301,7 +302,7 @@ def link(objp, va, size, decomp, env, force=()):
             return None
         try:
             p = obj_for(os.path.join('src', src), decomp, env)
-        except Fail:
+        except (Fail, OSError):
             return None
         oo = get(p)
         s = next((s for s in oo.symbols if _code_sym(oo, s) and resolve(s.name) == v), None)
@@ -321,7 +322,9 @@ def link(objp, va, size, decomp, env, force=()):
                 continue
             target = None
             is_code = t.section > 0 and bool(oo.sections[t.section].flags & coff.SCN_CODE)
-            v = None if (t.section > 0 and t.sclass == 3) else resolve(t.name)
+            v = (table().get(t.name) if t.sclass == 3 else None) if t.section > 0 else resolve(t.name)
+            if v is None and not (t.section > 0 and t.sclass == 3) and t.section > 0:
+                v = resolve(t.name)
             if v is not None and typ == coff.IMAGE_REL_I386_REL32 and (v not in rc or v in force) and v not in transp and v != va:
                 cd = (p, t.section) if (t.section > 0 and is_code) else code_def(t.name)
                 if not cd:
@@ -414,7 +417,7 @@ def live_in(va, size):
     arguments), in order of first read. Walks the control flow inside A."""
     body = common.xbe_read(va, size) or b''
     insns = {i.address: i for i in md.disasm(body, va)}
-    out = []
+    out, late = [], []
     work = [(va, frozenset())]
     seen = set()
     steps = 0
@@ -428,6 +431,8 @@ def live_in(va, size):
             ins = insns[addr]
             mn = ins.mnemonic
             if mn in ('ret', 'int3'):
+                if mn == 'ret' and 'eax' not in written and 'eax' not in out:
+                    late.append('eax')     # returned untouched: an argument passed through
                 break
             try:
                 rd, wr = ins.regs_access()
@@ -456,6 +461,14 @@ def live_in(va, size):
                 op = ops[0] if ops else None
                 tgt = op.imm & 0xFFFFFFFF if op is not None and op.type == CX.X86_OP_IMM else None
                 if mn == 'jmp':
+                    if tgt is None and op is not None and op.type == CX.X86_OP_MEM and op.mem.scale == 4 and op.mem.disp:
+                        for k in range(64):       # a jump table: dd case targets
+                            w = common.xbe_read((op.mem.disp + 4 * k) & 0xFFFFFFFF, 4)
+                            tv = struct.unpack('<I', w)[0] if w else 0
+                            if not va <= tv < va + size:
+                                break
+                            work.append((tv, written))
+                        break
                     if tgt is None or not va <= tgt < va + size:
                         break
                     addr = tgt
@@ -463,7 +476,7 @@ def live_in(va, size):
                 if tgt is not None and va <= tgt < va + size:
                     work.append((tgt, written))
             addr = nxt
-    return out
+    return out + [x for x in late if x not in out]
 
 
 def candidates(sig, live, cap=400):
@@ -896,6 +909,17 @@ def run_blob(s, b, mapping, rres, recs):
                                    or (sr.stack_bytes() or 0) == (sig.stack_bytes() or 0)):
                 sig = sr
         cl = sig.locations() if sig else None
+        if cl is None and sig is not None and sig.params and sig.callee_pops():
+            unk = [i for i, (pt, sz) in enumerate(sig.params) if sz == 0]
+            if len(unk) == 1:
+                ps = list(sig.params)
+                ps[unk[0]] = (ps[unk[0]][0], 4)
+                s4 = coff.Sig(sig.cc, ps, sig.ret, sig.is_method, sig.varargs)
+                guess = 4 + (r.popped or 0) - (s4.stack_bytes() or 0)
+                if 0 < guess <= 64 and guess % 4 == 0:
+                    ps[unk[0]] = (ps[unk[0]][0], guess)
+                    sig = coff.Sig(sig.cc, ps, sig.ret, sig.is_method, sig.varargs)
+                    cl = sig.locations()
         fregs = {x: u.reg_read(UREG[x]) for x in REGS}
         args, masks = [], []
         if cl is not None:
@@ -908,7 +932,7 @@ def run_blob(s, b, mapping, rres, recs):
                     args += w_
                     masks += [MASKS.get(pt, 0xFFFFFFFF)] * len(w_)
         else:
-            n = min((r.popped or 0) // 4, len(r.stack))
+            n = min(max((r.popped or 0) // 4, 0 if direct and sig is not None else 4), len(r.stack))
             args = list(struct.unpack('<%dI' % n, u.mem_read(esp, 4 * n))) if n else []
         rset = set(r.regs) | set(r.stack) | set(getattr(r, 'xlo', None) or [])
         r_hi, b_hi = esp0 + 4 + 4 * rsl, new_esp + 4 + 4 * bsl   # frames incl. incoming argument slots
@@ -1111,6 +1135,10 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             objp = obj_for(r['source'], decomp, env)
         b = link(objp, va, size, decomp, env)
         res['linked'] = ' '.join(b.linked)
+        if b.sig is not None and b.sig.params and b.sig.locations() is None:
+            # by-value structures of unknown size: try one dword each (the snapshots decide)
+            ps = [(pt, sz or 4) for pt, sz in b.sig.params]
+            b.sig = coff.Sig(b.sig.cc, ps, b.sig.ret, b.sig.is_method, b.sig.varargs)
         if b.sig is None or b.sig.locations() is None:
             raise Fail('unbuildable: cannot read the signature of %s' % b.name)
         if not snaps:
