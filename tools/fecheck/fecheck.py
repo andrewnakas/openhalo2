@@ -18,6 +18,7 @@ Results: <WORK>/results/<va><tag>.json + .txt (one line, also printed). Nothing 
 retail bytes beyond the few values of a first difference.
 """
 import argparse
+import collections
 import itertools
 import json
 import os
@@ -1181,6 +1182,33 @@ def retail_cached(path, root, va, size):
     return out
 
 
+_KNOWN = None
+
+
+def known_maps(va, sig):
+    """Entry maps read off retail's disassembly (<WORK>/entry_maps.csv: va,map,evidence with map as
+    fmt_map prints it). Tried before the generic search; the snapshots still decide."""
+    global _KNOWN
+    if _KNOWN is None:
+        _KNOWN = collections.defaultdict(list)
+        for row in common.read_csv(os.path.join(common.WORK, 'entry_maps.csv')):
+            try:
+                _KNOWN[int(row['va'], 16)].append(row['map'])
+            except (KeyError, ValueError):
+                pass
+    loc = sig.locations() if sig else None
+    out = []
+    for text in _KNOWN.get(va, []):
+        parts = [p.strip().split('<-') for p in text.split(',') if p.strip()]
+        if loc is None or len(parts) != len(loc):
+            continue
+        m = []
+        for (pi, w), (kind, where, sz, pt) in zip(parts, loc):
+            m.append(('stk', int(w[3:]), sz) if w.startswith('stk') else ('reg', w, sz))
+        out.append(m)
+    return out
+
+
 def fmt_map(m):
     return ', '.join('p%d<-%s' % (i, w if k == 'reg' else 'stk%d' % w) for i, (k, w, sz) in enumerate(m))
 
@@ -1236,7 +1264,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             first = chosen = None
             for sg in sigs:
                 b.sig = sg
-                for m in candidates(sg, live):
+                for m in known_maps(va, sg) + candidates(sg, live):
                     if first is not None and time.time() - t0 > budget:
                         break
                     verdicts, bad = [], None
