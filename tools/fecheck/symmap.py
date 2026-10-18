@@ -51,7 +51,15 @@ def data_sections():
 def load(path=None):
     """{name: va} from runtime/decomp_symbols.csv (plain and raw names)."""
     p = path or os.path.join(common.RUNTIME, 'decomp_symbols.csv')
-    return {r['name']: int(r['va'], 16) for r in common.read_csv(p)}
+    out = {r['name']: int(r['va'], 16) for r in common.read_csv(p)}
+    # hand-proven additions (name,va,evidence), e.g. by an overnight lane: they win
+    extra = os.path.join(common.WORK, 'extra_symbols.csv')
+    for r in common.read_csv(extra):
+        try:
+            out[r['name'].strip()] = int(r['va'], 16)
+        except (KeyError, ValueError):
+            pass
+    return out
 
 
 def resolve(raw, table):
