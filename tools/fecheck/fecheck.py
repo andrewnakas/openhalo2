@@ -50,7 +50,7 @@ CAP = 30_000_000
 BLOB_CAP = 8_000_000      # ours: a wrong entry mapping usually loops; keep it short
 RESULTS = os.path.join(common.WORK, 'results')
 DEBUG = bool(os.environ.get('FECHECK_DEBUG'))
-RCACHE = os.path.join(common.WORK, 'rcache_v4')   # bump when retail recording changes
+RCACHE = os.path.join(common.WORK, 'rcache_v5')   # bump when retail recording changes
 REGS = ['eax', 'ecx', 'edx', 'ebx', 'esi', 'edi']
 UREG = {r: getattr(X, 'UC_X86_REG_' + r.upper()) for r in REGS + ['esp', 'ebp', 'eip']}
 TRANSPARENT_NAMES = ['__chkstk', '_memcpy', '__allmul', '__aulldiv', '__alldiv', '__ftol2', '__aullshr', '__allshr',
@@ -679,15 +679,22 @@ def run_retail(s, va, size):
             r.xmm0 = bytes(u.mem_read(SCR + 0x140, 16))
             finish(r)
         ins = decode(u, addr)
-        if not ins or ins.mnemonic not in ('call', 'jmp'):
+        if not ins:
             return
+        mn = ins.mnemonic
+        if mn not in ('call', 'jmp'):
+            if not (mn in JCC and ins.operands and ins.operands[0].type == CX.X86_OP_IMM):
+                return
+            t = ins.operands[0].imm & 0xFFFFFFFF
+            if va <= t < va + size or not jcc_taken(mn, u.reg_read(X.UC_X86_REG_EFLAGS), u.reg_read(X.UC_X86_REG_ECX)):
+                return
         t = target_of(u, ins)
-        if ins.mnemonic == 'jmp' and va <= t < va + size:
+        if mn != 'call' and va <= t < va + size:
             return
         if t in transp:
             return
         r = Rec()
-        r.target, r.tail = t, ins.mnemonic == 'jmp'
+        r.target, r.tail = t, mn != 'call'
         r.indirect = ins.operands[0].type != CX.X86_OP_IMM
         r.regs = [u.reg_read(UREG[x]) for x in REGS]
         esp = u.reg_read(X.UC_X86_REG_ESP)
@@ -757,6 +764,16 @@ def callee_regs(va):
     return _CREGS[va]
 
 
+JCC = {'jo', 'jno', 'jb', 'jae', 'je', 'jne', 'jbe', 'ja', 'js', 'jns', 'jp', 'jnp', 'jl', 'jge', 'jle', 'jg', 'jecxz'}
+
+
+def jcc_taken(mn, fl, ecx):
+    cf, pf, zf, sf, of = fl & 1, (fl >> 2) & 1, (fl >> 6) & 1, (fl >> 7) & 1, (fl >> 11) & 1
+    return {'jo': of, 'jno': not of, 'jb': cf, 'jae': not cf, 'je': zf, 'jne': not zf, 'jbe': cf or zf,
+            'ja': not (cf or zf), 'js': sf, 'jns': not sf, 'jp': pf, 'jnp': not pf, 'jl': sf != of,
+            'jge': sf == of, 'jle': zf or sf != of, 'jg': not zf and sf == of, 'jecxz': (ecx & 0xFFFFFFFF) == 0}[mn]
+
+
 def same_pointee(uc, v, cands, n=32):
     try:
         want = bytes(uc.mem_read(v, 64))
@@ -819,12 +836,19 @@ def run_blob(s, b, mapping, rres, recs):
         if st['fail'] or st['pend'] == addr:
             return
         ins = decode(u, addr, cache=False)
-        if not ins or ins.mnemonic not in ('call', 'jmp'):
+        if not ins:
             return
+        mn = ins.mnemonic
+        if mn not in ('call', 'jmp'):
+            if not (mn in JCC and ins.operands and ins.operands[0].type == CX.X86_OP_IMM):
+                return
+            t = ins.operands[0].imm & 0xFFFFFFFF
+            if lo_b <= t < hi_b or not jcc_taken(mn, u.reg_read(X.UC_X86_REG_EFLAGS), u.reg_read(X.UC_X86_REG_ECX)):
+                return     # a conditional tail call (jne function) that is taken: handled like jmp
         t = target_of(u, ins)
         if lo_b <= t < hi_b or t in transp:
             return
-        tail = ins.mnemonic == 'jmp'
+        tail = mn != 'call'
         direct = ins.operands[0].type == CX.X86_OP_IMM
         st['n'] += 1
         ri = st['ri']
