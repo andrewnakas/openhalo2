@@ -94,5 +94,6 @@ Halo 2 is a trademark of Microsoft. This project is not affiliated with or endor
 Bungie or 343 Industries. It ships no game data, and it runs only with a copy of the game you own.
 
 The recompiled program code in this executable is derived from the retail game and is provided so
-that owners of the game can play it on current hardware. See `LICENSE` and `NOTICE` for the licences
-of the original parts of this project and the third-party code it uses.
+that owners of the game can play it on current hardware. Open Halo 2's own code, tools and documentation are public domain (CC0 1.0, see `LICENSE`):
+decompilation projects and anyone else may reuse any of it freely. `NOTICE` lists the third-party
+code it uses and its licences.

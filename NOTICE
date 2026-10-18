@@ -1,14 +1,24 @@
-Open Halo 2 -- third-party notices
+Open Halo 2 -- licence and third-party notices
+
+Open Halo 2's own work (the code, tools, documentation and the changes in
+patches/) is dedicated to the public domain under CC0 1.0 (see LICENSE), so
+decompilation projects and anyone else can reuse any of it without conditions.
+Exceptions: third-party code keeps its own licence (below), and the hunks in
+patches/xboxrecomp-full-vs-193e299.diff that modify the toolkit's xemu-derived
+files under src/apu/ stay LGPL-2.1-or-later. The recompiled game code built into
+the executable comes from the retail game and is not ours to license.
+
 
 1. xboxrecomp (static recompilation toolkit and Xbox runtime)
    https://github.com/sp00nznet/xboxrecomp  -- MIT License, Copyright (c) 2026 sp00nz.
-   Used with the changes in patches/xboxrecomp-full-vs-193e299.diff (same licence).
+   The unmodified toolkit stays MIT; our changes in patches/ are CC0 (see above).
 
 2. halo2-decompiled  https://github.com/kirklandsig/halo2-decompiled -- CC0 1.0.
    Used as a reference for function boundaries and names; no code is compiled in.
+   Our findings (names, notes, tools) are CC0, so they can flow back into it.
 
 3. Audio hardware model (port/xr/src/mcpxaudio) -- original clean-room
-   implementation (docs/APU_CLEANROOM_DESIGN.md, docs/APU_FACTS.md), MIT like
+   implementation (docs/APU_CLEANROOM_DESIGN.md, docs/APU_FACTS.md), CC0 like
    the rest of this project. The toolkit's xemu-derived audio code
    (LGPL-2.1-or-later) is not built or linked into the release
    (reports: linker map check).
