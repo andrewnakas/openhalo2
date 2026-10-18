@@ -169,9 +169,15 @@ def table():
     return _TABLE
 
 
+_TRANSP = None
+
+
 def transparent():
-    t = table()
-    return {t[n] for n in TRANSPARENT_NAMES if n in t}
+    global _TRANSP
+    if _TRANSP is None:
+        t = table()
+        _TRANSP = {t[n] for n in TRANSPARENT_NAMES if n in t} | {v for n, v in t.items() if n.startswith('__CI')}
+    return _TRANSP
 
 
 def resolve(name):
@@ -240,11 +246,21 @@ class Blob:
         self.name = None
 
 
+def with_retbuf(sig):
+    """The signature as compiled when it returns a class by value: a hidden result pointer after `this`
+    (thiscall) or first, and the function returns that pointer in eax."""
+    if sig is None or sig.params is None:
+        return None
+    ps = list(sig.params)
+    ps.insert(1 if sig.cc == 'thiscall' else 0, ('ptr', 4))
+    return coff.Sig(sig.cc, ps, 'ptr', sig.is_method, sig.varargs)
+
+
 def _code_sym(o, s):
     return s.section > 0 and s.sclass in (2, 3) and bool(o.sections[s.section].flags & coff.SCN_CODE) and not s.naux
 
 
-def link(objp, va, size, decomp, env):
+def link(objp, va, size, decomp, env, force=()):
     """Link F (the function at va in objp) into a Blob at BLOB."""
     objs = {}
 
@@ -306,7 +322,7 @@ def link(objp, va, size, decomp, env):
             target = None
             is_code = t.section > 0 and bool(oo.sections[t.section].flags & coff.SCN_CODE)
             v = None if (t.section > 0 and t.sclass == 3) else resolve(t.name)
-            if v is not None and typ == coff.IMAGE_REL_I386_REL32 and v not in rc and v not in transp and v != va:
+            if v is not None and typ == coff.IMAGE_REL_I386_REL32 and (v not in rc or v in force) and v not in transp and v != va:
                 cd = (p, t.section) if (t.section > 0 and is_code) else code_def(t.name)
                 if not cd:
                     b.unlinked.add(v)
@@ -420,7 +436,7 @@ def live_in(va, size):
             rd = {PARTS.get(md.reg_name(r), md.reg_name(r)) for r in rd}
             wr = {PARTS.get(md.reg_name(r), md.reg_name(r)) for r in wr}
             ops = ins.operands
-            if mn in ('xor', 'sub', 'sbb') and len(ops) == 2 and ops[0].type == ops[1].type == CX.X86_OP_REG and ops[0].reg == ops[1].reg:
+            if mn in ('xor', 'sub', 'sbb', 'xorps', 'xorpd', 'pxor', 'subps') and len(ops) == 2 and ops[0].type == ops[1].type == CX.X86_OP_REG and ops[0].reg == ops[1].reg:
                 rd = set()
             if mn in ('or', 'and') and len(ops) == 2 and ops[1].type == CX.X86_OP_IMM and (ops[1].imm & 0xFFFFFFFF) in ((0xFFFFFFFF,) if mn == 'or' else (0,)):
                 rd = set()
@@ -433,7 +449,8 @@ def live_in(va, size):
                     out.append(r)
             written = written | (wr & set(REGS + XREGS))
             if mn == 'call':
-                written = written | {'eax', 'ecx', 'edx'}
+                tgt_ = ops[0].imm & 0xFFFFFFFF if ops and ops[0].type == CX.X86_OP_IMM else None
+                written = written | ({'eax'} if tgt_ is not None and tgt_ in transparent() else {'eax', 'ecx', 'edx'})
             nxt = addr + ins.size
             if mn.startswith('j'):
                 op = ops[0] if ops else None
@@ -449,7 +466,7 @@ def live_in(va, size):
     return out
 
 
-def candidates(sig, live, cap=150):
+def candidates(sig, live, cap=400):
     """Mappings F param -> retail location: ('reg', name, size) / ('stk', slot index, size)."""
     loc = sig.locations() if sig else None
     if loc is None:
@@ -613,7 +630,7 @@ def ld80(b):
 
 class Rec:
     __slots__ = ('target', 'regs', 'stack', 'ret', 'esp_call', 'tail', 'indirect', 'popped', 'eax', 'edx', 'push',
-                 'st0', 'writes', 'top0', 'xmm0')
+                 'st0', 'writes', 'top0', 'xmm0', 'xlo')
 
     def __getstate__(self):
         return {k: getattr(self, k, None) for k in self.__slots__}
@@ -697,6 +714,7 @@ def run_retail(s, va, size):
         r.target, r.tail = t, mn != 'call'
         r.indirect = ins.operands[0].type != CX.X86_OP_IMM
         r.regs = [u.reg_read(UREG[x]) for x in REGS]
+        r.xlo = [u.reg_read(getattr(X, 'UC_X86_REG_XMM%d' % i)) & 0xFFFFFFFF for i in range(8)]
         esp = u.reg_read(X.UC_X86_REG_ESP)
         r.esp_call = esp + (4 if r.tail else 0)   # the callee's first stack argument
         r.stack = list(struct.unpack('<32I', u.mem_read(r.esp_call, 128)))
@@ -863,6 +881,11 @@ def run_blob(s, b, mapping, rres, recs):
         st['ri'] = ri + 1
         esp = u.reg_read(X.UC_X86_REG_ESP) + (4 if tail else 0)
         sig = b.callee_sig.get(t) if direct else None
+        if sig is not None and sig.ret == 'struct':
+            sr = with_retbuf(sig)
+            if sr is not None and (not sig.callee_pops() or (r.popped or 0) == (sr.stack_bytes() or 0)
+                                   or (sr.stack_bytes() or 0) == (sig.stack_bytes() or 0)):
+                sig = sr
         cl = sig.locations() if sig else None
         fregs = {x: u.reg_read(UREG[x]) for x in REGS}
         args, masks = [], []
@@ -878,7 +901,7 @@ def run_blob(s, b, mapping, rres, recs):
         else:
             n = min((r.popped or 0) // 4, len(r.stack))
             args = list(struct.unpack('<%dI' % n, u.mem_read(esp, 4 * n))) if n else []
-        rset = set(r.regs) | set(r.stack)
+        rset = set(r.regs) | set(r.stack) | set(getattr(r, 'xlo', None) or [])
         r_hi, b_hi = esp0 + 4 + 4 * rsl, new_esp + 4 + 4 * bsl   # frames incl. incoming argument slots
         # frame pointers retail really passed: the callee's live-in registers and the stack bytes it popped
         r_args = [r.regs[REGS.index(x)] for x in callee_regs(t)] + r.stack[:max(0, (r.popped or 0) // 4)]
@@ -921,11 +944,15 @@ def run_blob(s, b, mapping, rres, recs):
             u.mem_write(a, data)
         if sig is not None and cl is not None:
             pops = sig.stack_bytes() if sig.callee_pops() else 0
-            if pops != (r.popped or 0) and sig.ret == 'struct' and sig.callee_pops() and r.popped == pops + 4:
-                pops += 4   # the hidden return-buffer pointer
+            pass
         else:
             pops = r.popped or 0
-        code = bytes([0xB8]) + struct.pack('<I', r.eax) + bytes([0xBA]) + struct.pack('<I', r.edx)
+        reax = r.eax
+        if pk and r.esp_call <= reax < r_hi:
+            p_ = max((p for p in pk if p <= reax), default=None)
+            if p_ is not None:
+                reax = reax - p_ + pairs[p_]
+        code = bytes([0xB8]) + struct.pack('<I', reax) + bytes([0xBA]) + struct.pack('<I', r.edx)
         xm = getattr(r, 'xmm0', None)
         if xm:
             u.mem_write(SCR + 0x240, xm)
@@ -1086,37 +1113,58 @@ def check(va, decomp, env, src=None, k=6, budget=240):
         good = [x for x in rr if x[2] is not None]
         if not good:
             raise Fail(rr[0][3])
-        cands = candidates(b.sig, live_in(va, size))
+        live = live_in(va, size)
         loaded = {}
 
         def snap(p, root):
             if p not in loaded:
                 loaded[p] = snapstore.load(p, root)
             return loaded[p]
-        first = chosen = None
-        for m in cands:
-            if first is not None and time.time() - t0 > budget:
+
+        def search(b):
+            """First entry mapping (over the signature variants) that holds on every snapshot."""
+            sigs = [b.sig] + ([with_retbuf(b.sig)] if b.sig.ret == 'struct' and with_retbuf(b.sig) else [])
+            first = chosen = None
+            for sg in sigs:
+                b.sig = sg
+                for m in candidates(sg, live):
+                    if first is not None and time.time() - t0 > budget:
+                        break
+                    verdicts, bad = [], None
+                    for p, root, x, why in good:   # a mapping must hold on every snapshot
+                        v, d = run_blob(snap(p, root), b, m, x[0], x[1])
+                        verdicts.append(v)
+                        if not v.startswith('equivalent'):
+                            bad = (os.path.basename(p), d)
+                            break
+                    if first is None or (bad and len(verdicts) > first[3]):
+                        first = (m, bad, verdicts, len(verdicts), sg)
+                    if bad is None:
+                        return first, (m, verdicts, sg)
+            return first, chosen
+        force = set()
+        first, chosen = search(b)
+        # a callee retail inlines here but calls elsewhere: run our compile of it, then search again
+        while chosen is None and first[1] and 'retail makes no such call here' in first[1][1] and len(force) < 4:
+            nm = first[1][1].split(' to ', 1)[1].split(': retail makes', 1)[0]
+            tv = resolve(nm) if nm in table() else None
+            if tv is None or tv in force:
                 break
-            verdicts, bad = [], None
-            for p, root, x, why in good:   # a mapping must hold on every snapshot
-                v, d = run_blob(snap(p, root), b, m, x[0], x[1])
-                verdicts.append(v)
-                if not v.startswith('equivalent'):
-                    bad = (os.path.basename(p), d)
-                    break
-            if first is None or (bad and len(verdicts) > first[3]):
-                first = (m, bad, verdicts, len(verdicts))
-            if bad is None:
-                chosen = (m, verdicts)
+            force.add(tv)
+            try:
+                b = link(objp, va, size, decomp, env, force=force)
+            except Fail:
                 break
+            res['linked'] = ' '.join(b.linked)
+            first, chosen = search(b)
         if chosen is None and first[1] and 'UNLINKED ' in first[1][1]:
             raise Fail('unbuildable: callee ' + first[1][1].split('UNLINKED ', 1)[1])
         if chosen is None:
-            m, bad, verdicts, n = first
-            res.update(verdict='differs', detail='%s: %s' % bad, mapping=fmt_map(m), tried=len(cands))
+            m, bad, verdicts, n, sg = first
+            res.update(verdict='differs', detail='%s: %s' % bad, mapping=fmt_map(m))
         else:
-            m, verdicts = chosen
-            res['mapping'] = fmt_map(m)
+            m, verdicts, sg = chosen
+            res['mapping'] = fmt_map(m) + (' +retbuf' if sg.params and len(sg.params) > len(coff.signature(b.name).params or []) else '')
             res['eq'] = len(verdicts)
             res['verdict'] = 'equivalent_fp' if 'equivalent_fp' in verdicts else 'equivalent'
             res['detail'] = '%d/%d snapshots agree%s' % (res['eq'], len(rr), '' if len(good) == len(rr) else
