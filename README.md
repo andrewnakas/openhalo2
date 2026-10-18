@@ -5,6 +5,8 @@ https://github.com/andrewnakas/openhalo2/releases
 
 Please support the halo 2 decompolation project as that's the project that we really want to get behind, and i made this project primarily as a helper vehicle to get us to halo 2 full decompilation, so please if you have tokens burning though your claude wallet please lend a hand, if we decompile it that's what unlocked a lot of potential with mods and better porting abilities.  
 
+I'm just scratching the surface but i think this can help us get the project decompiled faster?
+
 https://github.com/kirklandsig/halo2-decompiled
 
 
