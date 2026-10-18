@@ -158,7 +158,7 @@ class Sig:
         for i, (pt, sz) in enumerate(self.params):
             if self.cc == 'thiscall' and i == 0:
                 out.append(('reg', 'ecx', 4, pt))
-            elif regs and sz == 4 and pt in ('int', 'ptr'):
+            elif regs and sz == 4 and pt in ('int', 'ptr', 'i8', 'i16'):
                 out.append(('reg', regs.pop(0), 4, pt))
             else:
                 out.append(('stk', off, sz, pt))
@@ -186,6 +186,10 @@ def _ptype(p):
         return ('double', 8)
     if q in ('__int64',):
         return ('int64', 8)
+    if q in ('char', 'bool'):
+        return ('i8', 4)
+    if q in ('short', 'wchar_t'):
+        return ('i16', 4)
     if q in SIZES:
         return ('int', 4)
     if q.startswith('struct') or q.startswith('class') or q.startswith('union'):

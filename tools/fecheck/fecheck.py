@@ -47,6 +47,7 @@ SCR = STUB + 0x800         # register + fnsave area
 CODE_LO = STUB + 0x1000    # per-call stubs (fnsave/frstor at a retail callee's return, mocks), 64 bytes each,
 CODE_N = 0x3F00            # never reused within a run: Unicorn keeps translated code for rewritten bytes
 CAP = 30_000_000
+BLOB_CAP = 8_000_000      # ours: a wrong entry mapping usually loops; keep it short
 RESULTS = os.path.join(common.WORK, 'results')
 RCACHE = os.path.join(common.WORK, 'rcache')
 REGS = ['eax', 'ecx', 'edx', 'ebx', 'esi', 'edi']
@@ -66,6 +67,10 @@ md.detail = True
 BUILTINS = {
     'memset': bytes.fromhex('578b7c24088b44240c8b4c241089faf3aa89d05fc3'),   # rep stosb
     'memcpy': bytes.fromhex('56578b7c240c8b7424108b4c241489f8f3a45f5ec3'),   # rep movsb
+    '_CIsqrt': bytes.fromhex('d9fac3'),     # fsqrt
+    '_CIsin': bytes.fromhex('d9fec3'),      # fsin
+    '_CIcos': bytes.fromhex('d9ffc3'),      # fcos
+    '_CIatan2': bytes.fromhex('d9f3c3'),    # fpatan: atan(st1 / st0)
 }
 
 
@@ -288,6 +293,8 @@ def link(objp, va, size, decomp, env):
 # ---------------------------------------------------------------- convention
 
 
+MASKS = {'i8': 0xFF, 'i16': 0xFFFF}
+XREGS = ['xmm%d' % i for i in range(8)]   # LTCG passes some float arguments in SSE registers
 PARTS = {'al': 'eax', 'ah': 'eax', 'ax': 'eax', 'cl': 'ecx', 'ch': 'ecx', 'cx': 'ecx', 'dl': 'edx', 'dh': 'edx',
          'dx': 'edx', 'bl': 'ebx', 'bh': 'ebx', 'bx': 'ebx', 'si': 'esi', 'di': 'edi'}
 
@@ -323,10 +330,10 @@ def live_in(va, size):
                 rd = set()
             if mn == 'push' and ops and ops[0].type == CX.X86_OP_REG and md.reg_name(ops[0].reg) in ('ebx', 'esi', 'edi', 'ebp'):
                 rd = set()
-            for r in REGS:
+            for r in REGS + XREGS:
                 if r in rd and r not in written and r not in out:
                     out.append(r)
-            written = written | (wr & set(REGS))
+            written = written | (wr & set(REGS + XREGS))
             if mn == 'call':
                 written = written | {'eax', 'ecx', 'edx'}
             nxt = addr + ins.size
@@ -361,16 +368,26 @@ def candidates(sig, live, cap=40):
                 slot += (sz + 3) // 4
         return m
     out.append(assign({i: where for i, (kind, where, sz, pt) in enumerate(loc) if kind == 'reg'}))
-    small = [i for i, l in enumerate(loc) if l[2] == 4]
+    small = [i for i, l in enumerate(loc) if l[2] == 4 and l[3] != 'float']
+    floats = [i for i, l in enumerate(loc) if l[3] == 'float']
     regs = [r for r in live if r in REGS]
+    xregs = [r for r in live if r in XREGS]
+    xvariants = [{}]
+    for k in range(min(len(xregs), len(floats)), 0, -1):
+        for chosen in itertools.combinations(floats, k):
+            for rs in itertools.permutations(xregs, k):
+                xvariants.insert(len(xvariants) - 1, dict(zip(chosen, rs)))
     for k in range(min(len(regs), len(small)), -1, -1):
         for chosen in itertools.combinations(small, k):
             for rs in itertools.permutations(regs, k):
-                m = assign(dict(zip(chosen, rs)))
-                if m not in out:
-                    out.append(m)
-                if len(out) >= cap:
-                    return out
+                for xv in xvariants:
+                    d_ = dict(zip(chosen, rs))
+                    d_.update(xv)
+                    m = assign(d_)
+                    if m not in out:
+                        out.append(m)
+                    if len(out) >= cap:
+                        return out
     return out
 
 
@@ -650,7 +667,10 @@ def run_blob(s, b, mapping, rres, recs):
     new_esp = esp0 - 0x3000
     stk = bytearray()
     for (kind, where, sz, pt), (mk, mw, msz) in zip(b.sig.locations(), mapping):
-        raw = struct.pack('<I', s[mw]) if mk == 'reg' else bytes(uc.mem_read(esp0 + 4 + 4 * mw, (sz + 3) & ~3))
+        if mk == 'reg' and mw in XREGS:
+            raw = bytes(s['xmm'][XREGS.index(mw)][:4])
+        else:
+            raw = struct.pack('<I', s[mw]) if mk == 'reg' else bytes(uc.mem_read(esp0 + 4 + 4 * mw, (sz + 3) & ~3))
         if kind == 'reg':
             uc.reg_write(UREG[where], struct.unpack('<I', raw[:4])[0])
         else:
@@ -696,13 +716,16 @@ def run_blob(s, b, mapping, rres, recs):
         sig = b.callee_sig.get(t) if direct else None
         cl = sig.locations() if sig else None
         fregs = {x: u.reg_read(UREG[x]) for x in REGS}
-        args = []
+        args, masks = [], []
         if cl is not None:
             for kind, where, sz, pt in cl:
                 if kind == 'reg':
                     args.append(fregs[where])
+                    masks.append(MASKS.get(pt, 0xFFFFFFFF))
                 else:
-                    args += list(struct.unpack('<%dI' % ((sz + 3) // 4), u.mem_read(esp + where, (sz + 3) & ~3)))
+                    w_ = list(struct.unpack('<%dI' % ((sz + 3) // 4), u.mem_read(esp + where, (sz + 3) & ~3)))
+                    args += w_
+                    masks += [MASKS.get(pt, 0xFFFFFFFF)] * len(w_)
         else:
             n = min((r.popped or 0) // 4, 16)
             args = list(struct.unpack('<%dI' % n, u.mem_read(esp, 4 * n))) if n else []
@@ -712,6 +735,9 @@ def run_blob(s, b, mapping, rres, recs):
         for i, v in enumerate(args):
             if v in rset or (esp <= v < new_esp and r_fp):
                 continue
+            mk = masks[i] if i < len(masks) else 0xFFFFFFFF
+            if mk != 0xFFFFFFFF and any((v ^ x) & mk == 0 for x in rset):
+                continue   # a bool/char/short: only its own width is the value
             if lo_b <= v < hi_b and same_pointee(u, v, r.regs + r.stack):
                 continue   # our copy of a literal / constant: same bytes as what retail passed
             return stop('call %d to %s: argument %d = %08x, retail passed no such value (retail regs %s; stack %s)' % (
@@ -757,7 +783,7 @@ def run_blob(s, b, mapping, rres, recs):
     uc.hook_add(UC_HOOK_CODE, lambda u, a, n, d: st.__setitem__('pend', None), begin=CODE_LO, end=CODE_LO + CODE_N * 64 - 1)
     top0 = (uc.reg_read(X.UC_X86_REG_FPSW) >> 11) & 7
     try:
-        uc.emu_start(b.entry, SENT_END, timeout=120_000_000, count=CAP)
+        uc.emu_start(b.entry, SENT_END, timeout=60_000_000, count=rres.get('icount_cap', BLOB_CAP))
     except UcError as e:
         if not st['fail']:
             return 'differs', 'ours faults: %s at %08x' % (e, uc.reg_read(X.UC_X86_REG_EIP))
