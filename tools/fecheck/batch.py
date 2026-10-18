@@ -46,6 +46,16 @@ def main():
         subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
     with ThreadPoolExecutor(a.jobs) as ex:
         list(ex.map(run, chunks))
+    # a native crash (Unicorn) kills the rest of its chunk: run the missing ones alone, then record the crash
+    miss = [v for v in vas if not os.path.exists(os.path.join(res_dir, '%08x%s.txt' % (v, a.tag)))]
+    if miss:
+        with ThreadPoolExecutor(a.jobs) as ex:
+            list(ex.map(run, [[v] for v in miss]))
+    for v in vas:
+        p = os.path.join(res_dir, '%08x%s.txt' % (v, a.tag))
+        if not os.path.exists(p):
+            open(p, 'w').write('%08x crashed       -       native crash in the emulator (Unicorn)
+' % v)
     c = collections.Counter()
     for v in vas:
         p = os.path.join(res_dir, '%08x%s.txt' % (v, a.tag))

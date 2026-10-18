@@ -524,9 +524,18 @@ def code_ranges():
     return _CODE
 
 
+def aligned_copy(a):
+    """A page-aligned copy with a guard margin: Unicorn maps the host buffer directly."""
+    raw = np.zeros(len(a) + 3 * 4096, dtype=np.uint8)
+    off = (-raw.ctypes.data) % 4096
+    out = raw[off:off + len(a)]
+    out[:] = a
+    return out
+
+
 def machine(s):
-    ram = s['ram'].copy()
-    con = s['contig'].copy()
+    ram = aligned_copy(s['ram'])
+    con = aligned_copy(s['contig'])
     for v, raw, vs in code_ranges():
         if v + len(raw) <= len(ram):
             ram[v:v + len(raw)] = np.frombuffer(raw, dtype=np.uint8)
