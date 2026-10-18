@@ -49,7 +49,7 @@ CODE_N = 0x3F00            # never reused within a run: Unicorn keeps translated
 CAP = 30_000_000
 BLOB_CAP = 8_000_000      # ours: a wrong entry mapping usually loops; keep it short
 RESULTS = os.path.join(common.WORK, 'results')
-RCACHE = os.path.join(common.WORK, 'rcache')
+RCACHE = os.path.join(common.WORK, 'rcache_v4')   # bump when retail recording changes
 REGS = ['eax', 'ecx', 'edx', 'ebx', 'esi', 'edi']
 UREG = {r: getattr(X, 'UC_X86_REG_' + r.upper()) for r in REGS + ['esp', 'ebp', 'eip']}
 TRANSPARENT_NAMES = ['__chkstk', '_memcpy', '__allmul', '__aulldiv', '__alldiv', '__ftol2', '__aullshr', '__allshr',
@@ -87,6 +87,63 @@ BUILTINS = {
 
 class Fail(Exception):
     pass
+
+
+# ---------------------------------------------------------------- kernel imports
+# The recomp gives kernel thunk slot i the address 0xFE000000 + 4*i (xboxrecomp kernel_bridge.c, MIT);
+# its stdcall_args_for_ordinal() table (with export names in comments) gives each ordinal's argument
+# bytes. A kernel call here returns 0 and pops its arguments: retail and ours both see what retail's
+# run recorded, so the comparison stays fair.
+KVA = 0xFE000000
+KBRIDGE = 'D:/n64work/halo2/third_party/xboxrecomp/src/kernel/kernel_bridge.c'
+THUNKS = 0x411520          # the XBE's kernel thunk table (header 0x158 ^ retail key)
+_KERNEL = None
+
+
+def kernel():
+    """(slot -> (ordinal, arg bytes), export name -> thunk slot VA)."""
+    global _KERNEL
+    if _KERNEL is None:
+        import re as _re
+        args, names = {}, {}
+        try:
+            for m in _re.finditer(r'case\s+(\d+):\s*return\s+(\d+);\s*/\*\s*(\w+)', open(KBRIDGE, errors='replace').read()):
+                args[int(m.group(1))] = int(m.group(2))
+                names[m.group(3)] = int(m.group(1))
+        except OSError:
+            pass
+        slots, i = {}, 0
+        while True:
+            b = common.xbe_read(THUNKS + 4 * i, 4)
+            v = struct.unpack('<I', b)[0] if b else 0
+            if not v:
+                break
+            slots[i] = (v & 0x7FFFFFFF, args.get(v & 0x7FFFFFFF, 0))
+            i += 1
+        by_ord = {o: THUNKS + 4 * i for i, (o, n) in slots.items()}
+        if 156 in by_ord:   # XAPI GetTickCount = the KeTickCount data export (ordinal 156)
+            BUILTINS['GetTickCount'] = bytes([0xA1]) + struct.pack('<I', by_ord[156]) + bytes([0x8B, 0x00, 0xC3])
+        _KERNEL = (slots, {nm: by_ord[o] for nm, o in names.items() if o in by_ord})
+    return _KERNEL
+
+
+def kernel_hook(uc):
+    slots = kernel()[0]
+    st = {'last': None}
+
+    def on_k(u, addr, size, d):
+        esp = u.reg_read(X.UC_X86_REG_ESP)
+        if st['last'] == (addr, esp):
+            return
+        o, n = slots.get((addr - KVA) // 4, (0, 0))
+        ret = u32(u, esp)
+        u.reg_write(X.UC_X86_REG_EAX, 0)
+        u.reg_write(X.UC_X86_REG_ESP, esp + 4 + n)
+        st['last'] = (addr, esp + 4 + n)
+        u.reg_write(X.UC_X86_REG_EIP, ret)
+    uc.mem_map(KVA, 0x1000)
+    uc.mem_write(KVA, bytes([0xF4]) * 0x1000)
+    uc.hook_add(UC_HOOK_CODE, on_k, begin=KVA, end=KVA + 0xFFF)
 
 
 # ---------------------------------------------------------------- symbols
@@ -268,6 +325,31 @@ def link(objp, va, size, decomp, env):
                     raise Fail('unbuildable: writable data %s has no retail address' % coff.plain_name(t.name))
                 place(p, t.section)
                 target = ('sec', (p, t.section), t.value)
+            if target is None and t.section <= 0 and t.name.startswith('__imp_'):
+                nm = t.name[6:]
+                bare = coff.plain_name(nm)
+                kv = kernel()[1].get(bare)
+                if kv is not None:            # a kernel export: its thunk slot (holds 0xFE000000 + 4*slot)
+                    target = ('va', kv)
+                else:
+                    fv = resolve(nm)
+                    if fv is None and bare in BUILTINS:
+                        key = ('builtin', bare)
+                        if key not in b.placed:
+                            while len(b.data) % 16:
+                                b.data.append(0xCC)
+                            b.placed[key] = BLOB + len(b.data)
+                            b.data += BUILTINS[bare]
+                            b.linked.append(bare)
+                        fv = b.placed[key]
+                    if fv is not None:        # an XAPI routine: a pointer cell like the import table's
+                        key = ('impcell', nm)
+                        if key not in b.placed:
+                            while len(b.data) % 4:
+                                b.data.append(0)
+                            b.placed[key] = BLOB + len(b.data)
+                            b.data += struct.pack('<I', fv)
+                        target = ('sec', key, 0)
             if target is None and coff.plain_name(t.name) in BUILTINS:
                 bn = coff.plain_name(t.name)
                 key = ('builtin', bn)
@@ -451,6 +533,7 @@ def machine(s):
         return True
     uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED, unm)
     uc.mem_write(SENT, SENT_CODE)
+    kernel_hook(uc)
     g = [0, desc(0, access=0x9A), desc(0), desc(s['fs_base'] or 0)]
     uc.mem_write(GDT, b''.join(struct.pack('<Q', d) for d in g))
     uc.reg_write(X.UC_X86_REG_GDTR, (0, GDT, len(g) * 8 - 1, 0))
@@ -871,13 +954,19 @@ def run_blob(s, b, mapping, rres, recs):
         if not len(bad):
             continue
         words = sorted({int(x) & ~3 for x in bad})
-        allfp = len(words) <= 4096
-        for w in words if allfp else []:
-            if not near_float(word_at(base, ri_, rv, w), word_at(base, bi, bv, w)):
-                allfp = False
-                break
-        if allfp:
-            fp = True
+        allok, anyfp = len(words) <= 4096, False
+        for w in words if allok else []:
+            rw, bw = word_at(base, ri_, rv, w), word_at(base, bi, bv, w)
+            bp = struct.unpack('<I', bw)[0]
+            if lo_b <= bp < hi_b and same_pointee(uc, bp, [struct.unpack('<I', rw)[0]]):
+                continue     # a pointer to our copy of a literal that retail has at its own address
+            if near_float(rw, bw):
+                anyfp = True
+                continue
+            allok = False
+            break
+        if allok:
+            fp = fp or anyfp
             continue
         a0 = int(bad[0])
         return 'differs', 'memory: %d bytes differ, first %08x (%s): retail %s ours %s; last %08x' % (
