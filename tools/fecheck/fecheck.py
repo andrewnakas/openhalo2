@@ -57,7 +57,8 @@ TRANSPARENT_NAMES = ['__chkstk', '_memcpy', '__allmul', '__aulldiv', '__alldiv',
 ALIASES = {'__ftol2_sse': '__ftol2', '__ftol': '__ftol2', '__alloca_probe': '__chkstk'}
 # mov [SCR],eax; mov [SCR+4],edx; fnsave [SCR+16]
 SENT_CODE = bytes([0xA3]) + struct.pack('<I', SCR) + bytes([0x89, 0x15]) + struct.pack('<I', SCR + 4) + \
-    bytes([0xDD, 0x35]) + struct.pack('<I', SCR + 16)
+    bytes([0x0F, 0x11, 0x05]) + struct.pack('<I', SCR + 0x100) + \
+    bytes([0xDD, 0x35]) + struct.pack('<I', SCR + 16)   # + movups [SCR+0x100], xmm0 (LTCG float returns)
 SENT_END = SENT + len(SENT_CODE)
 
 md = Cs(CS_ARCH_X86, CS_MODE_32)
@@ -71,6 +72,16 @@ BUILTINS = {
     '_CIsin': bytes.fromhex('d9fec3'),      # fsin
     '_CIcos': bytes.fromhex('d9ffc3'),      # fcos
     '_CIatan2': bytes.fromhex('d9f3c3'),    # fpatan: atan(st1 / st0)
+    '_CItan': bytes.fromhex('d9f2ddd8c3'),  # fptan; fstp st0
+    '_CIacos': bytes.fromhex('d9c0d8c8d9e8dee1d9fad9c9d9f3c3'),   # atan2(sqrt(1-x*x), x)
+    '_CIasin': bytes.fromhex('d9c0d8c8d9e8dee1d9fad9f3c3'),       # atan2(x, sqrt(1-x*x))
+    '_CIatan': bytes.fromhex('d9e8d9f3c3'),                        # atan2(x, 1)
+    '_CIlog': bytes.fromhex('d9edd9c9d9f1c3'),                     # ln2 * log2(x)
+    '_CIlog10': bytes.fromhex('d9ecd9c9d9f1c3'),
+    # 2^t for t in st0: fld st0; frndint; fsub st1,st0; fxch; f2xm1; fld1; faddp; fscale; fstp st1
+    '_CIexp': bytes.fromhex('d9eadec9' + 'd9c0d9fcdce9d9c9d9f0d9e8dec1d9fddd d9c3'.replace(' ', '')),
+    '_CIpow': bytes.fromhex('d9c9d9f1' + 'd9c0d9fcdce9d9c9d9f0d9e8dec1d9fddd d9c3'.replace(' ', '')),
+    '_CIfmod': bytes.fromhex('d9c9d9f8dfe09e7af9ddd9c3'),          # fxch; fprem loop; fstp st1
 }
 
 
@@ -326,8 +337,12 @@ def live_in(va, size):
             rd = {PARTS.get(md.reg_name(r), md.reg_name(r)) for r in rd}
             wr = {PARTS.get(md.reg_name(r), md.reg_name(r)) for r in wr}
             ops = ins.operands
-            if mn == 'xor' and len(ops) == 2 and ops[0].type == ops[1].type == CX.X86_OP_REG and ops[0].reg == ops[1].reg:
+            if mn in ('xor', 'sub', 'sbb') and len(ops) == 2 and ops[0].type == ops[1].type == CX.X86_OP_REG and ops[0].reg == ops[1].reg:
                 rd = set()
+            if mn in ('or', 'and') and len(ops) == 2 and ops[1].type == CX.X86_OP_IMM and (ops[1].imm & 0xFFFFFFFF) in ((0xFFFFFFFF,) if mn == 'or' else (0,)):
+                rd = set()
+            if mn in ('mov', 'lea') and len(ops) == 2 and ops[0].type == ops[1].type == CX.X86_OP_REG and ops[0].reg == ops[1].reg:
+                rd = set()   # mov edi, edi: padding
             if mn == 'push' and ops and ops[0].type == CX.X86_OP_REG and md.reg_name(ops[0].reg) in ('ebx', 'esi', 'edi', 'ebp'):
                 rd = set()
             for r in REGS + XREGS:
@@ -351,7 +366,7 @@ def live_in(va, size):
     return out
 
 
-def candidates(sig, live, cap=40):
+def candidates(sig, live, cap=150):
     """Mappings F param -> retail location: ('reg', name, size) / ('stk', slot index, size)."""
     loc = sig.locations() if sig else None
     if loc is None:
@@ -514,7 +529,7 @@ def ld80(b):
 
 class Rec:
     __slots__ = ('target', 'regs', 'stack', 'ret', 'esp_call', 'tail', 'indirect', 'popped', 'eax', 'edx', 'push',
-                 'st0', 'writes', 'top0')
+                 'st0', 'writes', 'top0', 'xmm0')
 
     def __getstate__(self):
         return {k: getattr(self, k, None) for k in self.__slots__}
@@ -564,7 +579,8 @@ def run_retail(s, va, size):
                 r.eax = u.reg_read(X.UC_X86_REG_EAX)
                 r.edx = u.reg_read(X.UC_X86_REG_EDX)
                 r.popped = u.reg_read(X.UC_X86_REG_ESP) - r.esp_call
-                code = bytes([0xDD, 0x35]) + struct.pack('<I', SCR + 16) + bytes([0xDD, 0x25]) + struct.pack('<I', SCR + 16) + \
+                code = bytes([0x0F, 0x11, 0x05]) + struct.pack('<I', SCR + 0x140) + \
+                    bytes([0xDD, 0x35]) + struct.pack('<I', SCR + 16) + bytes([0xDD, 0x25]) + struct.pack('<I', SCR + 16) + \
                     bytes([0x68]) + struct.pack('<I', addr) + bytes([0xC3])
                 at = stub_addr(u, st)
                 u.mem_write(at, code)
@@ -576,6 +592,7 @@ def run_retail(s, va, size):
             top, sts = fpsave(u.mem_read(SCR + 16, 108))
             r.push = top == ((r.top0 - 1) & 7)
             r.st0 = sts[0] if r.push else None
+            r.xmm0 = bytes(u.mem_read(SCR + 0x140, 16))
             finish(r)
         ins = decode(u, addr)
         if not ins or ins.mnemonic not in ('call', 'jmp'):
@@ -591,7 +608,7 @@ def run_retail(s, va, size):
         r.regs = [u.reg_read(UREG[x]) for x in REGS]
         esp = u.reg_read(X.UC_X86_REG_ESP)
         r.esp_call = esp + (4 if r.tail else 0)   # the callee's first stack argument
-        r.stack = list(struct.unpack('<16I', u.mem_read(r.esp_call, 64)))
+        r.stack = list(struct.unpack('<32I', u.mem_read(r.esp_call, 128)))
         r.ret = SENT if r.tail else addr + ins.size
         r.top0 = (u.reg_read(X.UC_X86_REG_FPSW) >> 11) & 7
         r.writes = []
@@ -614,8 +631,9 @@ def run_retail(s, va, size):
         r.popped = uc.reg_read(X.UC_X86_REG_ESP) - r.esp_call
         r.push = top == ((r.top0 - 1) & 7)
         r.st0 = sts[0] if r.push else None
+        r.xmm0 = bytes(uc.mem_read(SCR + 0x100, 16))
         finish(r)
-    res = dict(eax=eax, edx=edx, push=top == ((top0 - 1) & 7), st0=sts[0])
+    res = dict(eax=eax, edx=edx, push=top == ((top0 - 1) & 7), st0=sts[0], xmm0=bytes(uc.mem_read(SCR + 0x100, 16)))
     res['delta'] = delta(s, ram, con, esp0)
     return res, recs
 
@@ -664,7 +682,7 @@ def run_blob(s, b, mapping, rres, recs):
     uc, ram, con = machine(s)
     esp0 = s['esp']
     uc.mem_write(BLOB, bytes(b.data))
-    new_esp = esp0 - 0x3000
+    new_esp = esp0 - 0x10000
     stk = bytearray()
     for (kind, where, sz, pt), (mk, mw, msz) in zip(b.sig.locations(), mapping):
         if mk == 'reg' and mw in XREGS:
@@ -678,6 +696,8 @@ def run_blob(s, b, mapping, rres, recs):
                 stk += bytes(where + len(raw) - len(stk))
             stk[where:where + len(raw)] = raw
     uc.mem_write(new_esp, struct.pack('<I', SENT) + bytes(stk) + bytes(64))
+    bsl = (len(stk) + 3) // 4
+    rsl = max([w + (sz + 3) // 4 for k, w, sz in mapping if k == 'stk'], default=0)
     uc.reg_write(X.UC_X86_REG_ESP, new_esp)
     transp = transparent()
     st = {'ri': 0, 'fail': None, 'n': 0, 'pend': None, 'stub': 0}
@@ -727,13 +747,14 @@ def run_blob(s, b, mapping, rres, recs):
                     args += w_
                     masks += [MASKS.get(pt, 0xFFFFFFFF)] * len(w_)
         else:
-            n = min((r.popped or 0) // 4, 16)
+            n = min((r.popped or 0) // 4, len(r.stack))
             args = list(struct.unpack('<%dI' % n, u.mem_read(esp, 4 * n))) if n else []
         rset = set(r.regs) | set(r.stack)
-        r_fp = fptrs(r.regs + r.stack, r.esp_call, esp0)
-        b_fp = fptrs(args + list(fregs.values()), esp, new_esp)
+        r_hi, b_hi = esp0 + 4 + 4 * rsl, new_esp + 4 + 4 * bsl   # frames incl. incoming argument slots
+        r_fp = fptrs(r.regs + r.stack, r.esp_call, r_hi)
+        b_fp = fptrs(args + list(fregs.values()), esp, b_hi)
         for i, v in enumerate(args):
-            if v in rset or (esp <= v < new_esp and r_fp):
+            if v in rset or (esp <= v < b_hi and r_fp):
                 continue
             mk = masks[i] if i < len(masks) else 0xFFFFFFFF
             if mk != 0xFFFFFFFF and any((v ^ x) & mk == 0 for x in rset):
@@ -747,9 +768,9 @@ def run_blob(s, b, mapping, rres, recs):
         pairs = {}
         if cl is not None and sig is not None and (r.popped or 0) == (sig.stack_bytes() or 0):
             for kind, where, sz, pt in cl:
-                rv_ = r.regs[REGS.index(where)] if kind == 'reg' else r.stack[where // 4] if where // 4 < 16 else None
+                rv_ = r.regs[REGS.index(where)] if kind == 'reg' else r.stack[where // 4] if where // 4 < len(r.stack) else None
                 bv_ = fregs[where] if kind == 'reg' else struct.unpack('<I', u.mem_read(esp + where, 4))[0]
-                if rv_ is not None and r.esp_call <= rv_ < esp0 and esp <= bv_ < new_esp:
+                if rv_ is not None and r.esp_call <= rv_ < r_hi and esp <= bv_ < b_hi:
                     pairs[rv_] = bv_
         if not pairs:
             pairs = dict(zip(r_fp, b_fp))
@@ -757,7 +778,7 @@ def run_blob(s, b, mapping, rres, recs):
         for a, data in r.writes:
             if r.esp_call - 0x40000 <= a < r.esp_call:
                 continue                       # the callee's own stack
-            if r.esp_call <= a < esp0:         # retail's frame -> ours
+            if r.esp_call <= a < r_hi:         # retail's frame -> ours
                 p_ = max((p for p in pk if p <= a), default=None)
                 if p_ is None:
                     continue
@@ -765,12 +786,20 @@ def run_blob(s, b, mapping, rres, recs):
             u.mem_write(a, data)
         if sig is not None and cl is not None:
             pops = sig.stack_bytes() if sig.callee_pops() else 0
+            if pops != (r.popped or 0) and sig.ret == 'struct' and sig.callee_pops() and r.popped == pops + 4:
+                pops += 4   # the hidden return-buffer pointer
         else:
             pops = r.popped or 0
         code = bytes([0xB8]) + struct.pack('<I', r.eax) + bytes([0xBA]) + struct.pack('<I', r.edx)
+        xm = getattr(r, 'xmm0', None)
+        if xm:
+            u.mem_write(SCR + 0x240, xm)
+            code += bytes([0x0F, 0x10, 0x05]) + struct.pack('<I', SCR + 0x240)  # movups xmm0, [..]
         if r.push:
             u.mem_write(SCR + 0x200, r.st0)
             code += bytes([0xDB, 0x2D]) + struct.pack('<I', SCR + 0x200)        # fld tbyte [..]
+        elif xm and sig is not None and sig.ret in ('float', 'double'):
+            code += bytes([0xD9, 0x05] if sig.ret == 'float' else [0xDD, 0x05]) + struct.pack('<I', SCR + 0x240)  # fld [xmm0]
         if tail:
             code += bytes([0xC2]) + struct.pack('<H', pops)                       # ret N
         else:
@@ -799,9 +828,15 @@ def run_blob(s, b, mapping, rres, recs):
     fp = False
     rk = b.sig.ret
     if rk in ('float', 'double'):
-        if top != ((top0 - 1) & 7) or not rres['push']:
-            return 'differs', 'return: x87 result missing (ours pushed %s, retail %s)' % (top == ((top0 - 1) & 7), rres['push'])
-        a, c = ld80(rres['st0']), ld80(sts[0])
+        if top != ((top0 - 1) & 7):
+            return 'differs', 'return: ours left no x87 result'
+        if rres['push']:
+            a = ld80(rres['st0'])
+        elif rres.get('xmm0'):
+            a = struct.unpack('<f' if rk == 'float' else '<d', rres['xmm0'][:4 if rk == 'float' else 8])[0]
+        else:
+            return 'differs', 'return: retail left no float result'
+        c = ld80(sts[0])
         if rk == 'float':
             a, c = [struct.unpack('<f', struct.pack('<f', x))[0] if abs(x) < 3e38 else x for x in (a, c)]
         if not (a == c or (a != a and c != c)):
@@ -820,9 +855,12 @@ def run_blob(s, b, mapping, rres, recs):
     nsl = max([w + (sz + 3) // 4 for k, w, sz in mapping if k == 'stk'], default=0)
     for off, ri_, rv, bi, bv, base in ((0, rd[0], rd[1], bd[0], bd[1], s['ram']),
                                         (0x80000000, rd[2], rd[3], bd[2], bd[3], s['contig'])):
-        idx = np.union1d(ri_, bi)
         if off == 0:   # A's incoming argument slots may be reused as scratch
-            idx = idx[(idx < esp0 + 4) | (idx >= esp0 + 4 + 4 * nsl)]
+            keep = (ri_ < esp0 + 4) | (ri_ >= esp0 + 4 + 4 * nsl)
+            ri_, rv = ri_[keep], rv[keep]
+            keep = (bi < esp0 + 4) | (bi >= esp0 + 4 + 4 * nsl)
+            bi, bv = bi[keep], bv[keep]
+        idx = np.union1d(ri_, bi)
         if not len(idx):
             continue
         rvals = base[idx].copy()
