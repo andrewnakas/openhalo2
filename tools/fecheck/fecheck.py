@@ -416,6 +416,12 @@ def link(objp, va, size, decomp, env, force=()):
             v = (table().get(t.name) if t.sclass == 3 else None) if t.section > 0 else resolve(t.name)
             if v is None and not (t.section > 0 and t.sclass == 3) and t.section > 0:
                 v = resolve(t.name)
+            if v == va and typ == coff.IMAGE_REL_I386_REL32 and t.section > 0 and is_code:
+                # a self call: retail runs into its own body (not recorded as a call), so ours does too.
+                # VS2022 may also turn it into a jmp to the entry (tail-recursion elimination).
+                place(p, t.section)
+                relocs.append(((p, si), off, typ, ('sec', (p, t.section), t.value)))
+                continue
             if v is not None and typ == coff.IMAGE_REL_I386_REL32 and (v not in rc or v in force) and v not in transp and v != va:
                 cd = (p, t.section) if (t.section > 0 and is_code) else code_def(t.name)
                 if not cd:
@@ -834,8 +840,8 @@ def run_retail(s, va, size):
         t = target_of(u, ins)
         if mn != 'call' and va <= t < va + size:
             return
-        if t in transp:
-            return
+        if t in transp or (t == va and mn == 'call'):
+            return     # a self call runs on, recorded as A's own calls (ours runs its own compile)
         r = Rec()
         r.target, r.tail = t, mn != 'call'
         r.indirect = ins.operands[0].type != CX.X86_OP_IMM
@@ -1403,7 +1409,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
 # ---------------------------------------------------------------- driver
 
 
-RCACHE_FORMAT = 6   # bump with any change to what run_retail records
+RCACHE_FORMAT = 7   # 7: self calls are not recorded (they run on). bump with any change to what run_retail records
 
 
 def rcache_format():
