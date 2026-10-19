@@ -1310,7 +1310,8 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
 def retail_cached(path, root, va, size):
     os.makedirs(RCACHE, exist_ok=True)
     key = os.path.join(RCACHE, '%s__%s.pkl' % (os.path.relpath(root, common.SNAPS).replace(os.sep, '_').replace('/', '_'), os.path.basename(path)))
-    if os.path.exists(key):
+    # a store re-captured later reuses snapshot names: a cache entry older than its snapshot is stale
+    if os.path.exists(key) and os.path.getmtime(key) >= os.path.getmtime(path):
         try:
             return pickle.load(open(key, 'rb'))
         except Exception:
