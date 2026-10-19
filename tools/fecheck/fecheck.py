@@ -49,7 +49,7 @@ SENT = STUB                # return address planted for the function under test
 SCR = STUB + 0x800         # register + fnsave area
 CODE_LO = STUB + 0x1000    # per-call stubs (fnsave/frstor at a retail callee's return, mocks), 64 bytes each,
 CODE_N = 0x3F00            # never reused within a run: Unicorn keeps translated code for rewritten bytes
-CAP = 30_000_000
+CAP = int(os.environ.get("FECHECK_CAP", 30_000_000))
 BLOB_CAP = 8_000_000      # ours: a wrong entry mapping usually loops; keep it short
 RESULTS = os.path.join(common.WORK, 'results')
 DEBUG = bool(os.environ.get('FECHECK_DEBUG'))
@@ -57,7 +57,12 @@ RCACHE = os.path.join(common.WORK, 'rcache_v5')   # bump when retail recording c
 REGS = ['eax', 'ecx', 'edx', 'ebx', 'esi', 'edi']
 UREG = {r: getattr(X, 'UC_X86_REG_' + r.upper()) for r in REGS + ['esp', 'ebp', 'eip']}
 TRANSPARENT_NAMES = ['__chkstk', '_memcpy', '__allmul', '__aulldiv', '__alldiv', '__ftol2', '__aullshr', '__allshr',
-                     '__allrem', '__allshl']
+                     '__allrem', '__allshl',
+                     # XDK push-buffer routines retail's LTCG inlines into some callers: both sides run
+                     # retail's own out-of-line copy, so its writes are compared like the caller's own
+                     'D3DDevice_SetRenderState_ZEnable', 'D3DDevice_SetRenderState_Simple',
+                     'D3DDevice_SetVertexShaderConstant1', 'D3DDevice_SetVertexShaderConstant1Fast',
+                     'D3DDevice_SetVertexShaderConstant4', 'D3DDevice_SetVertexShaderConstantFast_Dwords']
 ALIASES = {'__ftol2_sse': '__ftol2', '__ftol': '__ftol2', '__alloca_probe': '__chkstk'}
 # mov [SCR],eax; mov [SCR+4],edx; fnsave [SCR+16]
 SENT_CODE = bytes([0xA3]) + struct.pack('<I', SCR) + bytes([0x89, 0x15]) + struct.pack('<I', SCR + 4) + \
