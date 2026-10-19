@@ -932,6 +932,24 @@ def callee_regs(va):
     return _CREGS[va]
 
 
+_NARGS = {}
+
+
+def callee_nargs(va):
+    """Dwords of arguments retail function va can read: its live-in registers plus the stack bytes
+    every one of its `ret N` pops. None when not provable (caller-cleaned, mixed or no ret N)."""
+    if va not in _NARGS:
+        r = common.functions().get(va) if va < KVA else None
+        n = None
+        if r:
+            body = common.xbe_read(va, r['size_i']) or b''
+            pops = {(i.operands[0].imm if i.operands else 0) for i in md.disasm(body, va) if i.mnemonic == 'ret'}
+            if len(pops) == 1 and min(pops) > 0:
+                n = len(callee_regs(va)) + min(pops) // 4
+        _NARGS[va] = n
+    return _NARGS[va]
+
+
 JCC = {'jo', 'jno', 'jb', 'jae', 'je', 'jne', 'jbe', 'ja', 'js', 'jns', 'jp', 'jnp', 'jl', 'jge', 'jle', 'jg', 'jecxz'}
 
 
@@ -1242,8 +1260,15 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         r_args = [r.regs[REGS.index(x)] for x in callee_regs(t)] + r.stack[:max(0, (r.popped or 0) // 4)]
         r_fp = fptrs(r_args, r.esp_call, r_hi) or fptrs(r.regs + r.stack, r.esp_call, r_hi)
         b_fp = fptrs(args if cl is not None else args + [fregs['ecx'], fregs['edx']], esp, b_hi)
+        # LTCG drops parameters retail passes as constants (a NULL file, line 0): when retail's callee
+        # provably reads fewer argument dwords than ours passes, that many zero arguments need no match
+        nr = callee_nargs(t) if direct and cl is not None else None
+        spare = max(0, len(args) - nr) if nr is not None else 0
         for i, v in enumerate(args):
             if v in rset or (esp <= v < b_hi and r_fp):
+                continue
+            if v == 0 and spare:
+                spare -= 1
                 continue
             mk = masks[i] if i < len(masks) else 0xFFFFFFFF
             if mk != 0xFFFFFFFF and any((v ^ x) & mk == 0 for x in rset):
