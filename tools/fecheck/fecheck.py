@@ -2067,6 +2067,8 @@ def main():
     a = ap.parse_args()
     global SAVE_TAG
     SAVE_TAG = a.tag
+    if not os.environ.get('FECHECK_NO_REFRESH'):
+        symmap.refresh(a.decomp)
     env = common.vcenv()
     for x in a.vas:
         res = check(int(x, 16), a.decomp, env, a.src, a.k)

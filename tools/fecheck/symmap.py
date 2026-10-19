@@ -139,6 +139,49 @@ def infer(decomp, table, data):
     return out
 
 
+def stale(decomp):
+    """True when runtime/decomp_symbols.csv is older than the decomp tree's sources or config."""
+    p = os.path.join(common.RUNTIME, 'decomp_symbols.csv')
+    if not os.path.exists(p):
+        return True
+    t = os.path.getmtime(p)
+    files = glob.glob(os.path.join(decomp, 'src', '*.cpp')) + glob.glob(os.path.join(decomp, 'src', 'stubs', '*.cpp'))
+    files.append(os.path.join(decomp, 'config', 'functions.csv'))
+    return any(os.path.getmtime(f) > t for f in files if os.path.exists(f))
+
+
+def refresh(decomp, quiet=False):
+    """Rebuild runtime/decomp_symbols.csv from the current tree's markers and functions.csv when it is
+    stale (an upstream rename otherwise keeps the old name and loses the new one). Inferred data rows
+    of the old file are kept for names the markers do not give (the vote needs every object built;
+    `python symmap.py` does the full rebuild)."""
+    if not stale(decomp):
+        return False
+    p = os.path.join(common.RUNTIME, 'decomp_symbols.csv')
+    old = [r for r in common.read_csv(p) if r.get('how', '').startswith('infer')] if os.path.exists(p) else []
+    rows, table = [], {}
+
+    def add(name, kind, va, how, src):
+        if name in table:
+            return
+        table[name] = va
+        rows.append(dict(name=name, kind=kind, va='%08x' % va, how=how, source=src))
+    for m in markers(decomp):
+        if m.kind in ('vcall', 'adjustor'):
+            continue
+        add(m.name, 'stub' if m.stub else m.kind, m.retail, 'marker', os.path.basename(m.path))
+    for va, r in common.functions(decomp).items():
+        if r['name']:
+            add(r['name'], 'function', va, 'csv', '')
+            add(coff.plain_name(r['name']), 'function', va, 'csv', '')
+    for r in old:
+        add(r['name'], r['kind'], int(r['va'], 16), r['how'], r['source'])
+    common.write_csv(p, rows, ['name', 'kind', 'va', 'how', 'source'])
+    if not quiet:
+        print('symmap: refreshed %d names from %s' % (len(rows), decomp), file=sys.stderr)
+    return True
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()

@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import common
 import snapstore
+import symmap
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -27,6 +28,7 @@ def main():
     ap.add_argument('--chunk', type=int, default=20)
     ap.add_argument('--skip-done', action='store_true')
     a = ap.parse_args()
+    symmap.refresh(a.decomp)   # once here, not in each worker
     fn = common.functions(a.decomp)
     snapped = snapstore.counts()
     if a.what.startswith('status:'):
@@ -43,7 +45,7 @@ def main():
     def run(ch):
         cmd = [sys.executable, os.path.join(HERE, 'fecheck.py')] + ['%08x' % v for v in ch] + \
             ['--k', str(a.k), '--decomp', a.decomp] + (['--tag', a.tag] if a.tag else [])
-        subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
+        subprocess.run(cmd, capture_output=True, text=True, cwd=HERE, env=dict(os.environ, FECHECK_NO_REFRESH='1'))
     with ThreadPoolExecutor(a.jobs) as ex:
         list(ex.map(run, chunks))
     # a native crash (Unicorn) kills the rest of its chunk: run the missing ones alone, then record the crash
