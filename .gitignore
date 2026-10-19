@@ -10,3 +10,4 @@ __pycache__/
 build/
 tools/import/bin/
 dist/
+tools/fecheck/link_refs/
