@@ -269,30 +269,47 @@ def obj_for(src, decomp, env, fresh=False, out=None):
 _SSIZE = None
 
 
-def struct_size(tname, decomp, env):
+def struct_size(tname, decomp, env, src=None):
     """sizeof a structure the decomp passes by value, from a one-line probe compile against the
-    header that defines it (the compile error names the array size). Cached in <WORK>; 0 if unknown."""
+    header that defines it (the compile error names the array size), else against the source file
+    src (sources declare some structures themselves). Cached in <WORK>; 0 if unknown."""
     global _SSIZE
     path = os.path.join(common.WORK, 'struct_sizes.json')
     if _SSIZE is None:
         _SSIZE = json.load(open(path)) if os.path.exists(path) else {}
     name = tname.split()[-1]
-    if name in _SSIZE:
+    if _SSIZE.get(name):
         return _SSIZE[name]
+    skey = '%s@%s' % (name, os.path.basename(src)) if src and os.path.exists(src) else None
+    if name in _SSIZE and skey is None:
+        return 0
+    if skey in _SSIZE:
+        return _SSIZE[skey]
+    probe = os.path.join(common.WORK, 'tmpobj', 'probe_%d.cpp' % os.getpid())
+    os.makedirs(os.path.dirname(probe), exist_ok=True)
     size = 0
-    pat = re.compile(r'^\s*(struct|class|union)\s+%s\b[^;]*$' % re.escape(name), re.M)
-    hdr = next((os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(decomp, 'include')) for f in fs
-                if f.endswith('.h') and pat.search(open(os.path.join(dp, f), errors='replace').read())), None)
-    if hdr:
-        probe = os.path.join(common.WORK, 'tmpobj', 'probe_%d.cpp' % os.getpid())
-        os.makedirs(os.path.dirname(probe), exist_ok=True)
-        open(probe, 'w').write('#include <xtl.h>\n#include "%s"\nchar (*fe_probe)[sizeof(%s)] = 1;\n'
-                               % (hdr.replace('\\', '/'), name))
-        r = subprocess.run([common.CL] + dbuild.BASE + ['/I', common.SHIM, '/I', os.path.join(decomp, 'include'),
-                            '/Fo' + probe + '.obj', probe], capture_output=True, text=True, env=env, errors='replace')
+    if name not in _SSIZE:
+        pat = re.compile(r'^\s*(struct|class|union)\s+%s\b[^;]*$' % re.escape(name), re.M)
+        hdr = next((os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(decomp, 'include')) for f in fs
+                    if f.endswith('.h') and pat.search(open(os.path.join(dp, f), errors='replace').read())), None)
+        if hdr:
+            open(probe, 'w').write('#include <xtl.h>\n#include "%s"\nchar (*fe_probe)[sizeof(%s)] = 1;\n'
+                                   % (hdr.replace('\\', '/'), name))
+            r = subprocess.run([common.CL] + dbuild.BASE + ['/I', common.SHIM, '/I', os.path.join(decomp, 'include'),
+                                '/Fo' + probe + '.obj', probe], capture_output=True, text=True, env=env, errors='replace')
+            m = re.search(r"'char \(\*\)\[(\d+)\]'", r.stdout)
+            size = int(m.group(1)) if m else 0
+        _SSIZE[name] = size
+    if not size and skey:
+        # declared in the source file itself: probe with that file included (front end only)
+        open(probe, 'w').write('#include "%s"\nchar (*fe_probe)[sizeof(%s)] = 1;\n'
+                               % (os.path.abspath(src).replace('\\', '/'), name))
+        r = subprocess.run([common.CL] + dbuild.BASE + ['/Zs', '/I', common.SHIM, '/I', os.path.join(decomp, 'include'),
+                            '/I', os.path.dirname(os.path.abspath(src)), probe],
+                           capture_output=True, text=True, env=env, errors='replace', cwd=decomp)
         m = re.search(r"'char \(\*\)\[(\d+)\]'", r.stdout)
         size = int(m.group(1)) if m else 0
-    _SSIZE[name] = size
+        _SSIZE[skey] = size
     try:
         json.dump(_SSIZE, open(path, 'w'))
     except OSError:
@@ -300,11 +317,12 @@ def struct_size(tname, decomp, env):
     return size
 
 
-def sized(sig, decomp, env):
-    """sig with by-value structure parameters given their real size (when the header knows it)."""
+def sized(sig, decomp, env, src=None):
+    """sig with by-value structure parameters given their real size (when the header or the source
+    file src that declares it knows it)."""
     if sig is None or not sig.params or all(sz for pt, sz in sig.params):
         return sig
-    ps = [(pt, sz or (struct_size(pt, decomp, env) if pt.startswith('struct') else 0)) for pt, sz in sig.params]
+    ps = [(pt, sz or (struct_size(pt, decomp, env, src) if pt.startswith('struct') else 0)) for pt, sz in sig.params]
     out = coff.Sig(sig.cc, ps, sig.ret, sig.is_method, sig.varargs)
     out.cptr = getattr(sig, "cptr", frozenset())
     return out
@@ -352,8 +370,8 @@ def _code_sym(o, s):
     return s.section > 0 and s.sclass in (2, 3) and bool(o.sections[s.section].flags & coff.SCN_CODE) and not s.naux
 
 
-def link(objp, va, size, decomp, env, force=()):
-    """Link F (the function at va in objp) into a Blob at BLOB."""
+def link(objp, va, size, decomp, env, force=(), src=None):
+    """Link F (the function at va in objp, compiled from src) into a Blob at BLOB."""
     objs = {}
 
     def get(p):
@@ -435,7 +453,7 @@ def link(objp, va, size, decomp, env, force=()):
                 target = ('va', v)
                 if typ == coff.IMAGE_REL_I386_REL32 and v not in transp:
                     b.callees.add(v)
-                    b.callee_sig[v] = sized(coff.signature(t.name), decomp, env)
+                    b.callee_sig[v] = sized(coff.signature(t.name), decomp, env, src if p == objp else None)
             if target is None and t.section > 0:
                 tsec = oo.sections[t.section]
                 if tsec.flags & coff.SCN_WRITE and not (tsec.flags & coff.SCN_CODE):
@@ -1234,10 +1252,47 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                 continue   # our copy of a literal / constant: same bytes as what retail passed
             return stop('call %d to %s: argument %d = %08x, retail passed no such value (retail regs %s; stack %s)' % (
                 st['n'], nearest(t), i, v, ' '.join('%08x' % x for x in r.regs), ' '.join('%08x' % x for x in r.stack[:6])))
+        kmatch = None
+        if direct and cl is not None:
+            # the callee's retail convention is known: each argument must be the value retail passed
+            # in that parameter's place (the check above only asks for it somewhere)
+            kms = [km for km in (MAPS.get(t) or entry_rows(t)) if len(km) == len(cl)]
+            miss = None
+            for km in kms:
+                miss, ai = None, 0
+                for i, (e, (kind, where, sz, pt)) in enumerate(zip(km, cl)):
+                    k0, ai = ai, ai + (1 if kind == 'reg' else (sz + 3) // 4)
+                    if e is None or sz > 4 or (e[0] == 'reg' and e[1] not in REGS) or (e[0] == 'stk' and e[1] >= len(r.stack)):
+                        continue
+                    v, rv = args[k0], r.regs[REGS.index(e[1])] if e[0] == 'reg' else r.stack[e[1]]
+                    mk = masks[k0] if k0 < len(masks) else 0xFFFFFFFF
+                    if (v ^ rv) & mk == 0 or (esp <= v < b_hi and r.esp_call <= rv < r_hi):
+                        continue   # equal, or a frame pointer each side (paired below)
+                    if lo_b <= v < hi_b and same_pointee(u, v, [rv]):
+                        continue
+                    miss = (i, v, rv, e)
+                    break
+                if miss is None:
+                    kmatch = km
+                    break
+            if kms and miss is not None:
+                i, v, rv, e = miss
+                return stop('call %d to %s: argument %d = %08x, retail passed %08x there (%s, its retail convention)' % (
+                    st['n'], nearest(t), i, v, rv, e[1] if e[0] == 'reg' else 'stk%d' % e[1]))
         # frame pointers retail passed -> ours: by argument position when both sides pass the same
         # stack layout (and ecx/edx), else in address order
         pairs = {}
-        if cl is not None and sig is not None and (r.popped or 0) == (sig.stack_bytes() or 0):
+        if kmatch is not None:
+            # ... and pairs its frame pointers parameter by parameter (the truth, no alternatives)
+            ai = 0
+            for e, (kind, where, sz, pt) in zip(kmatch, cl):
+                k0, ai = ai, ai + (1 if kind == 'reg' else (sz + 3) // 4)
+                if e is None or sz > 4 or (e[0] == 'reg' and e[1] not in REGS) or (e[0] == 'stk' and e[1] >= len(r.stack)):
+                    continue
+                rv_ = r.regs[REGS.index(e[1])] if e[0] == 'reg' else r.stack[e[1]]
+                if r.esp_call <= rv_ < r_hi and esp <= args[k0] < b_hi and rv_ not in pairs:
+                    pairs[rv_] = args[k0]
+        elif cl is not None and sig is not None and (r.popped or 0) == (sig.stack_bytes() or 0):
             for kind, where, sz, pt in cl:
                 rv_ = r.regs[REGS.index(where)] if kind == 'reg' else r.stack[where // 4] if where // 4 < len(r.stack) else None
                 bv_ = fregs[where] if kind == 'reg' else struct.unpack('<I', u.mem_read(esp + where, 4))[0]
@@ -1245,7 +1300,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                     pairs[rv_] = bv_
         if not pairs:
             pairs = dict(zip(r_fp, b_fp))
-        if info is not None or alt:
+        if (info is not None or alt) and not (kmatch is not None and pairs):
             site = (addr - lo_b, t)
             pr = fp_pairings(u, r, t, direct, sig, cl, fregs, esp, r_hi, b_hi, args)
             if pr is not None:
@@ -1665,9 +1720,10 @@ def learn_callee(t, va, size, good, snap, decomp, env, deadline):
             pass
     found, complete = None, True
     try:
-        bc = link(obj_for(row['source'], decomp, env), t, row['size_i'], decomp, env)
+        srct = os.path.join(decomp, row['source'])
+        bc = link(obj_for(row['source'], decomp, env), t, row['size_i'], decomp, env, src=srct)
         if bc.sig is not None and bc.sig.params and bc.sig.locations() is None:
-            bc.sig = sized(bc.sig, decomp, env)
+            bc.sig = sized(bc.sig, decomp, env, srct)
         pops = {r.popped for p, root, x, *_ in good for r in x[1] if r.target == t and not r.tail and r.popped is not None}
         P = pops.pop() if len(pops) == 1 else None
         states = []
@@ -1795,8 +1851,11 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             objp = obj_for(os.path.abspath(src), decomp, env, fresh=True, out=out)
         else:
             objp = obj_for(r['source'], decomp, env)
-        b = link(objp, va, size, decomp, env)
+        srcp = os.path.abspath(src) if src else os.path.join(decomp, r['source'])
+        b = link(objp, va, size, decomp, env, src=srcp)
         res['linked'] = ' '.join(b.linked)
+        if b.sig is not None and b.sig.params and b.sig.locations() is None:
+            b.sig = sized(b.sig, decomp, env, srcp)
         if b.sig is not None and b.sig.params and b.sig.locations() is None:
             # by-value structures of unknown size: try one dword each (the snapshots decide)
             ps = [(pt, sz or 4) for pt, sz in b.sig.params]
@@ -1921,7 +1980,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
                 break
             force.add(tv)
             try:
-                b = link(objp, va, size, decomp, env, force=force)
+                b = link(objp, va, size, decomp, env, force=force, src=srcp)
             except Fail:
                 break
             res['linked'] = ' '.join(b.linked)
