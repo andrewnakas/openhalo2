@@ -197,17 +197,20 @@ def kernel_hook(uc):
 
 _TABLE = None
 _SOURCES = None
+_SRCNAME = None   # retail VA -> C++ name of its @retail marker
 _NEAR = None
 
 
 def table():
-    global _TABLE, _SOURCES
+    global _TABLE, _SOURCES, _SRCNAME
     if _TABLE is None:
         _TABLE = symmap.load()
-        _SOURCES = {}
+        _SOURCES, _SRCNAME = {}, {}
         for r in common.read_csv(os.path.join(common.RUNTIME, 'decomp_symbols.csv')):
             if r['source']:
                 _SOURCES.setdefault(int(r['va'], 16), r['source'])
+                if r['kind'] in ('function', 'method'):
+                    _SRCNAME.setdefault(int(r['va'], 16), r['name'])
         for a, b in ALIASES.items():
             if b in _TABLE:
                 _TABLE.setdefault(a, _TABLE[b])
@@ -264,6 +267,25 @@ def obj_for(src, decomp, env, fresh=False, out=None):
         if not ok:
             raise Fail('unbuildable: compile: ' + ' | '.join(errs[:3]))
     return obj
+
+
+def keep_obj(src, name, va, decomp, env):
+    """Object of a wrapper TU that #includes src and takes the address of `name`: an `inline`
+    function (or one only used inline in its own file) has no out-of-line copy in src's own object,
+    and the real decomp build emits it through its stand-in callers (tools/build.py tu_source); a
+    global holding its address does the same here. None when it does not build."""
+    path = os.path.join(decomp, src)
+    od = dbuild.objdir(decomp)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    cpp = os.path.join(od, 'keep', '%s__%08x.cpp' % (stem, va))
+    obj = cpp[:-4] + '.obj'
+    os.makedirs(os.path.dirname(cpp), exist_ok=True)
+    if os.path.exists(obj) and os.path.getmtime(obj) >= max(os.path.getmtime(path), dbuild.newest_header(decomp)):
+        return obj
+    open(cpp, 'w').write('/* fecheck: emit the inline %s from %s */\n#include "%s"\n'
+                         'auto fe_keep_%08x = &%s;\n' % (name, src, os.path.abspath(path).replace('\\', '/'), va, name))
+    _, ok, errs, obj = dbuild.compile_one(cpp, decomp, env, out=obj, flags_src=path)
+    return obj if ok else None
 
 
 _SSIZE = None
@@ -415,6 +437,12 @@ def link(objp, va, size, decomp, env, force=(), src=None):
             return None
         oo = get(p)
         s = next((s for s in oo.symbols if _code_sym(oo, s) and resolve(s.name) == v), None)
+        if s is None and _SRCNAME.get(v):
+            # an inline function: emitted only where it is used, so make a use
+            p = keep_obj(os.path.join('src', src), _SRCNAME[v], v, decomp, env)
+            if p:
+                oo = get(p)
+                s = next((s for s in oo.symbols if _code_sym(oo, s) and resolve(s.name) == v), None)
         return (p, s.section) if s else None
     place(objp, fsym.section)
     done = set()

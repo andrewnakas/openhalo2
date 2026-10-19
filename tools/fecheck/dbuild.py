@@ -61,18 +61,20 @@ def src_flags(path, decomp):
     return fl
 
 
-def compile_one(path, decomp, env, extra=(), out=None):
+def compile_one(path, decomp, env, extra=(), out=None, flags_src=None):
+    """flags_src: take the // @flags (and include directory) of this source instead of path's
+    (a generated wrapper that #includes it)."""
     stem = os.path.splitext(os.path.basename(path))[0]
     if os.path.basename(os.path.dirname(path)) == 'stubs':
         stem = 'stubs__' + stem
     od = objdir(decomp)
     os.makedirs(od, exist_ok=True)
     obj = out or os.path.join(od, stem + '.obj')
-    fl = src_flags(path, decomp)
+    fl = src_flags(flags_src or path, decomp)
     if '/Ob0' not in fl:
         fl = [f for f in fl if not f.startswith('/Ob')] + ['/Ob1']
     cmd = [common.CL] + BASE + ['/I', common.SHIM, '/I', os.path.join(decomp, 'include'),
-                                '/I', os.path.dirname(os.path.abspath(path))] + fl + list(extra) + ['/Fo' + obj, path]
+                                '/I', os.path.dirname(os.path.abspath(flags_src or path))] + fl + list(extra) + ['/Fo' + obj, path]
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, errors='replace', cwd=decomp)
     errs = [l.strip() for l in r.stdout.splitlines() if ': error' in l or 'fatal error' in l]
     return stem, r.returncode == 0 and os.path.exists(obj), errs[:6], obj
