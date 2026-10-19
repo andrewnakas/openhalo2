@@ -541,7 +541,7 @@ def live_in(va, size, through=False):
             if mn in ('or', 'and') and len(ops) == 2 and ops[1].type == CX.X86_OP_IMM and (ops[1].imm & 0xFFFFFFFF) in ((0xFFFFFFFF,) if mn == 'or' else (0,)):
                 rd = set()
             if mn in ('mov', 'lea') and len(ops) == 2 and ops[0].type == ops[1].type == CX.X86_OP_REG and ops[0].reg == ops[1].reg:
-                rd = set()   # mov edi, edi: padding
+                rd = wr = set()   # mov edi, edi: padding (neither reads nor writes the value)
             if mn == 'push' and ops and ops[0].type == CX.X86_OP_REG and md.reg_name(ops[0].reg) in ('ebx', 'esi', 'edi', 'ebp'):
                 rd = set()
             for r in REGS + XREGS:
