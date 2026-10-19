@@ -62,7 +62,8 @@ TRANSPARENT_NAMES = ['__chkstk', '_memcpy', '__allmul', '__aulldiv', '__alldiv',
                      # retail's own out-of-line copy, so its writes are compared like the caller's own
                      'D3DDevice_SetRenderState_ZEnable', 'D3DDevice_SetRenderState_Simple',
                      'D3DDevice_SetVertexShaderConstant1', 'D3DDevice_SetVertexShaderConstant1Fast',
-                     'D3DDevice_SetVertexShaderConstant4', 'D3DDevice_SetVertexShaderConstantFast_Dwords']
+                     'D3DDevice_SetVertexShaderConstant4', 'D3DDevice_SetVertexShaderConstantFast_Dwords',
+                     'D3DDevice_SetRenderState_FillMode', 'D3DDevice_SetRenderState_CullMode', 'D3DDevice_SetStateBeforeBegin']
 ALIASES = {'__ftol2_sse': '__ftol2', '__ftol': '__ftol2', '__alloca_probe': '__chkstk'}
 # mov [SCR],eax; mov [SCR+4],edx; fnsave [SCR+16]
 SENT_CODE = bytes([0xA3]) + struct.pack('<I', SCR) + bytes([0x89, 0x15]) + struct.pack('<I', SCR + 4) + \
@@ -1545,6 +1546,9 @@ def save(res):
 
 
 def main():
+    if os.name == 'nt' and os.environ.get('FECHECK_PRIORITY', 'low') == 'low':
+        import ctypes   # below normal: overnight rigs play the game beside the checks
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
     ap = argparse.ArgumentParser()
     ap.add_argument('vas', nargs='+')
     ap.add_argument('--decomp', default=common.DECOMP)
