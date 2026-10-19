@@ -1156,7 +1156,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
     rsl = max([w + (sz + 3) // 4 for k, w, sz in mapping if k == 'stk'], default=0)
     uc.reg_write(X.UC_X86_REG_ESP, new_esp)
     transp = transparent()
-    st = {'ri': 0, 'fail': None, 'n': 0, 'pend': None, 'stub': 0}
+    st = {'ri': 0, 'fail': None, 'n': 0, 'pend': None, 'stub': 0, 'fp': False}
     lo_b, hi_b = BLOB, BLOB + len(b.data)
 
     def fptrs(values, lo, hi):
@@ -1227,9 +1227,11 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                     sig = coff.Sig(sig.cc, ps, sig.ret, sig.is_method, sig.varargs)
                     cl = sig.locations()
         fregs = {x: u.reg_read(UREG[x]) for x in REGS}
-        args, masks = [], []
+        args, masks, fidx = [], [], set()
         if cl is not None:
             for kind, where, sz, pt in cl:
+                if pt == 'float' and sz == 4:
+                    fidx.add(len(args))
                 if kind == 'reg':
                     args.append(fregs[where])
                     masks.append(MASKS.get(pt, 0xFFFFFFFF))
@@ -1275,6 +1277,9 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                 continue   # a bool/char/short: only its own width is the value
             if lo_b <= v < hi_b and same_pointee(u, v, r.regs + r.stack):
                 continue   # our copy of a literal / constant: same bytes as what retail passed
+            if i in fidx and any(near_float(struct.pack('<I', v), struct.pack('<I', x)) for x in rset):
+                st['fp'] = True   # a float argument a few ulps off (x87 vs SSE rounding): equivalent_fp at best
+                continue
             return stop('call %d to %s: argument %d = %08x, retail passed no such value (retail regs %s; stack %s)' % (
                 st['n'], nearest(t), i, v, ' '.join('%08x' % x for x in r.regs), ' '.join('%08x' % x for x in r.stack[:6])))
         kmatch = None
@@ -1294,6 +1299,9 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                     if (v ^ rv) & mk == 0 or (esp <= v < b_hi and r.esp_call <= rv < r_hi):
                         continue   # equal, or a frame pointer each side (paired below)
                     if lo_b <= v < hi_b and same_pointee(u, v, [rv]):
+                        continue
+                    if k0 in fidx and near_float(struct.pack('<I', v), struct.pack('<I', rv)):
+                        st['fp'] = True
                         continue
                     miss = (i, v, rv, e)
                     break
@@ -1417,7 +1425,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         return 'differs', 'retail calls %s next (call %d); ours made no more calls' % (nearest(left[0].target), st['n'] + 1)
     eax, edx = struct.unpack('<II', uc.mem_read(SCR, 8))
     top, sts = fpsave(uc.mem_read(SCR + 16, 108))
-    fp = False
+    fp = st['fp']
     rk = b.sig.ret
     if rk in ('float', 'double'):
         if top != ((top0 - 1) & 7):
