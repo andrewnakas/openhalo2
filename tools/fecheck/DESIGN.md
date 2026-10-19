@@ -58,6 +58,30 @@ the hidden result pointer of a class-returning callee) is accepted only when the
 agrees, and then must hold on every snapshot. Entry registers handed untouched to a callee are
 live-in candidates too, tried after the usual ones.
 
+### Known callee conventions
+At an uncertain site whose callee's retail convention is known, the frame pointers pair parameter by
+parameter (retail's value in the location of parameter i with ours for parameter i, ours from the
+callee's declared signature), and only that way: an open search could hide a source that swaps two
+outputs. The convention comes from `<WORK>/entry_maps.csv` (read off retail's disassembly, trusted when
+it pops the bytes retail's callee popped), else it is learned: the states retail A reaches at its calls
+to the callee become snapshots of the callee, its own source is checked on them under every mapping
+consistent with the call sites seen (values that are not frame pointers sit where retail held the same
+value, frame pointers where retail held one, stack parameters in order filling exactly retail's pops,
+grouped by F's entry mapping), and the result is kept only when every agreeing mapping puts each
+pointer parameter in the same place (a callee that only hands its outputs on to its own mocked callees
+cannot tell them apart). Learned maps are cached in `<WORK>/callee_maps`. A merged callee write that
+spans several paired pointers is split at them.
+
+## Retail cache
+`<WORK>/rcache_v6`: one pickle per snapshot holding ('fecheck-rcache', format, result). The format is
+RCACHE_FORMAT plus a hash of the routines that run for real (never recorded as calls); an entry of
+another format, or older than its snapshot, is rerun.
+
+## Builtins
+By-value structures smaller than a dword compare only their own bytes as call arguments (retail pushes
+a register and stores the byte). VS2022's __libm_sse2_pow_precise runs retail's own _CIpow, so pow's
+IEEE edge cases (pow(0,y>0)=0, ...) are retail's.
+
 ## Compare
 Return registers (eax, edx; x87 top for float), all guest memory writes outside the
 stack, and the call sequence. Equal on all K snapshots -> `equivalent`; otherwise
