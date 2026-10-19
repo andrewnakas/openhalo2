@@ -64,7 +64,12 @@ TRANSPARENT_NAMES = ['__chkstk', '_memcpy', '__allmul', '__aulldiv', '__alldiv',
                      'D3DDevice_SetRenderState_ZEnable', 'D3DDevice_SetRenderState_Simple',
                      'D3DDevice_SetVertexShaderConstant1', 'D3DDevice_SetVertexShaderConstant1Fast',
                      'D3DDevice_SetVertexShaderConstant4', 'D3DDevice_SetVertexShaderConstantFast_Dwords',
-                     'D3DDevice_SetRenderState_FillMode', 'D3DDevice_SetRenderState_CullMode', 'D3DDevice_SetStateBeforeBegin']
+                     'D3DDevice_SetRenderState_FillMode', 'D3DDevice_SetRenderState_CullMode', 'D3DDevice_SetStateBeforeBegin',
+                     # CRT qsort sorts in place through a comparator: both sides run retail's copy (which calls
+                     # the comparator each side passes), so the sorted array is compared like any other write
+                     '_qsort']
+# transparent routines that clobber ecx/edx like any cdecl call (the helpers above leave them alone)
+TRANSPARENT_CLOBBER = {'_qsort'}
 ALIASES = {'__ftol2_sse': '__ftol2', '__ftol': '__ftol2', '__alloca_probe': '__chkstk'}
 # mov [SCR],eax; mov [SCR+4],edx; fnsave [SCR+16]
 SENT_CODE = bytes([0xA3]) + struct.pack('<I', SCR) + bytes([0x89, 0x15]) + struct.pack('<I', SCR + 4) + \
@@ -551,7 +556,8 @@ def live_in(va, size, through=False):
             if mn == 'call':
                 tgt_ = ops[0].imm & 0xFFFFFFFF if ops and ops[0].type == CX.X86_OP_IMM else None
                 passed(tgt_, written)
-                written = written | ({'eax'} if tgt_ is not None and tgt_ in transparent() else {'eax', 'ecx', 'edx'})
+                eax_only = tgt_ is not None and tgt_ in transparent() and tgt_ not in {table().get(n) for n in TRANSPARENT_CLOBBER}
+                written = written | ({'eax'} if eax_only else {'eax', 'ecx', 'edx'})
             nxt = addr + ins.size
             if mn.startswith('j'):
                 op = ops[0] if ops else None
