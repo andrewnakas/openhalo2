@@ -143,6 +143,7 @@ class Sig:
     """A function's calling convention as the VS2022 compile sees it (standard conventions only)."""
     def __init__(self, cc, params, ret, is_method=False, varargs=False):
         self.cc, self.params, self.ret, self.is_method, self.varargs = cc, params, ret, is_method, varargs
+        self.cptr = frozenset()   # indices of parameters that point to const (the callee never writes there)
 
     def __repr__(self):
         return 'Sig(%s %s -> %s)' % (self.cc, self.params, self.ret)
@@ -233,6 +234,7 @@ def signature(dec):
     ret = re.sub(r'\b(public|private|protected|static|virtual):?', '', pre).strip()
     args = m.group(3).strip()
     params = []
+    cptr = set()
     varargs = False
     if args and args != 'void':
         for p in _split_top(args):
@@ -240,10 +242,13 @@ def signature(dec):
             if p == '...':
                 varargs = True
                 continue
+            if re.search(r'\bconst\s*[*&]\s*$', p):
+                cptr.add(len(params))
             params.append(_ptype(p))
     is_method = cc == 'thiscall' or ('::' in m.group(2) and 'static' not in pre)
     if cc == 'thiscall':
         params = [('ptr', 4)] + params
+        cptr = {i + 1 for i in cptr}
     if varargs and cc == 'thiscall':
         cc = 'cdecl'
     rt = ret.split()[-1] if ret else 'void'
@@ -267,4 +272,6 @@ def signature(dec):
         rk = 'int'
     else:
         rk = 'struct'
-    return Sig(cc, params, rk, is_method, varargs)
+    sg = Sig(cc, params, rk, is_method, varargs)
+    sg.cptr = frozenset(cptr)
+    return sg

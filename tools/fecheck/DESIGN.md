@@ -45,6 +45,19 @@ the assignment under which F's behaviour (calls + writes + return) agrees with r
 all K snapshots; fall back to the calling-convention analysis in tools/abi_wrap.py and
 the retail `ret N`.
 
+## 6. Frame-pointer pairing
+Callee writes into retail's frame are replayed into ours through a pairing of retail's frame
+pointers with ours. First try: by argument position (same pops and register set) or address
+order, as before. When a run differs and a call site's pairing is not certain (retail's callee
+reads other registers than our declaration passes, or pops differ), the snapshot is run again
+under alternative pairings at those sites: injective maps of the retail pointers the callee's
+writes are based on to the pointers ours passes, where the written extent fits before ours'
+next pointer, retail stack arguments keep our parameter order, and no write goes to a
+pointer-to-const parameter; capped at 24 per site and 48 combinations. A pairing (or flipping
+the hidden result pointer of a class-returning callee) is accepted only when the whole run
+agrees, and then must hold on every snapshot. Entry registers handed untouched to a callee are
+live-in candidates too, tried after the usual ones.
+
 ## Compare
 Return registers (eax, edx; x87 top for float), all guest memory writes outside the
 stack, and the call sequence. Equal on all K snapshots -> `equivalent`; otherwise

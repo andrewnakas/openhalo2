@@ -30,11 +30,14 @@ BASE = ['/nologo', '/c', '/TP', '/Gy', '/GS-', '/arch:IA32', '/Zc:wchar_t-', '/Z
 
 
 def tree_tag(decomp):
-    return hashlib.sha1(os.path.abspath(decomp).lower().encode()).hexdigest()[:8]
+    return hashlib.sha1(os.path.abspath(decomp).lower().encode()).hexdigest()[:8] + ('s2' if SSE2 else '')
 
 
 def objdir(decomp):
     return os.path.join(common.WORK, 'obj', tree_tag(decomp))
+
+
+SSE2 = os.environ.get('FECHECK_SSE2', '1') != '0'   # FECHECK_SSE2=0: plain x87 builds only
 
 
 def src_flags(path, decomp):
@@ -48,6 +51,11 @@ def src_flags(path, decomp):
         v = cfg.get(rel) or cfg.get(os.path.basename(path))
         fl = (v if isinstance(v, str) else ' '.join(v) if v else '/O2 /Gr').split()
     fl = [f for f in fl if f not in ('/GL',)]
+    if SSE2:
+        # vc71 /arch:SSE does float math in scalar SSE (rounded per operation); VS2022's
+        # /arch:SSE keeps it on x87 at extended precision. /arch:SSE2 is the VS2022 flag
+        # that rounds float operations like retail.
+        fl = ['/arch:SSE2' if f == '/arch:SSE' else f for f in fl]
     if '/Gr' not in fl:
         fl.append('/Gr')
     return fl

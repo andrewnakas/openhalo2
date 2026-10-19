@@ -18,12 +18,14 @@ Results: <WORK>/results/<va><tag>.json + .txt (one line, also printed). Nothing 
 retail bytes beyond the few values of a first difference.
 """
 import argparse
+import collections
 import itertools
 import json
 import os
 import pickle
 import re
 import struct
+import subprocess
 import time
 
 import numpy as np
@@ -47,7 +49,7 @@ SENT = STUB                # return address planted for the function under test
 SCR = STUB + 0x800         # register + fnsave area
 CODE_LO = STUB + 0x1000    # per-call stubs (fnsave/frstor at a retail callee's return, mocks), 64 bytes each,
 CODE_N = 0x3F00            # never reused within a run: Unicorn keeps translated code for rewritten bytes
-CAP = 30_000_000
+CAP = int(os.environ.get("FECHECK_CAP", 30_000_000))
 BLOB_CAP = 8_000_000      # ours: a wrong entry mapping usually loops; keep it short
 RESULTS = os.path.join(common.WORK, 'results')
 DEBUG = bool(os.environ.get('FECHECK_DEBUG'))
@@ -55,7 +57,13 @@ RCACHE = os.path.join(common.WORK, 'rcache_v5')   # bump when retail recording c
 REGS = ['eax', 'ecx', 'edx', 'ebx', 'esi', 'edi']
 UREG = {r: getattr(X, 'UC_X86_REG_' + r.upper()) for r in REGS + ['esp', 'ebp', 'eip']}
 TRANSPARENT_NAMES = ['__chkstk', '_memcpy', '__allmul', '__aulldiv', '__alldiv', '__ftol2', '__aullshr', '__allshr',
-                     '__allrem', '__allshl']
+                     '__allrem', '__allshl',
+                     # XDK push-buffer routines retail's LTCG inlines into some callers: both sides run
+                     # retail's own out-of-line copy, so its writes are compared like the caller's own
+                     'D3DDevice_SetRenderState_ZEnable', 'D3DDevice_SetRenderState_Simple',
+                     'D3DDevice_SetVertexShaderConstant1', 'D3DDevice_SetVertexShaderConstant1Fast',
+                     'D3DDevice_SetVertexShaderConstant4', 'D3DDevice_SetVertexShaderConstantFast_Dwords',
+                     'D3DDevice_SetRenderState_FillMode', 'D3DDevice_SetRenderState_CullMode', 'D3DDevice_SetStateBeforeBegin']
 ALIASES = {'__ftol2_sse': '__ftol2', '__ftol': '__ftol2', '__alloca_probe': '__chkstk'}
 # mov [SCR],eax; mov [SCR+4],edx; fnsave [SCR+16]
 SENT_CODE = bytes([0xA3]) + struct.pack('<I', SCR) + bytes([0x89, 0x15]) + struct.pack('<I', SCR + 4) + \
@@ -87,6 +95,23 @@ BUILTINS = {
 }
 
 
+def _libm_sse2(ci, two):
+    """VS2022 /arch:SSE2 math (__libm_sse2_<f>_precise): double x in xmm0 (y in xmm1), result in
+    xmm0. Wraps the _CI x87 body: spill to the stack, load onto x87, run it, reload xmm0."""
+    code = bytes.fromhex('83ec10' 'f20f110424')        # sub esp,16; movsd [esp],xmm0
+    if two:
+        code += bytes.fromhex('f20f114c2408')         # movsd [esp+8],xmm1
+    code += bytes.fromhex('dd0424')                     # fld qword [esp]
+    if two:
+        code += bytes.fromhex('dd442408')             # fld qword [esp+8]: st0 = y, st1 = x as for _CI
+    return code + BUILTINS[ci][:-1] + bytes.fromhex('dd1c24' 'f20f100424' '83c410' 'c3')  # fstp; movsd xmm0; add esp; ret
+
+
+for _f, _two in (('sqrt', 0), ('sin', 0), ('cos', 0), ('tan', 0), ('acos', 0), ('asin', 0), ('atan', 0),
+                 ('log', 0), ('log10', 0), ('exp', 0), ('atan2', 1), ('pow', 1)):
+    BUILTINS['_libm_sse2_%s_precise' % _f] = _libm_sse2('_CI' + _f, _two)
+
+
 class Fail(Exception):
     pass
 
@@ -97,7 +122,7 @@ class Fail(Exception):
 # bytes. A kernel call here returns 0 and pops its arguments: retail and ours both see what retail's
 # run recorded, so the comparison stays fair.
 KVA = 0xFE000000
-KBRIDGE = 'D:/n64work/halo2/third_party/xboxrecomp/src/kernel/kernel_bridge.c'
+KBRIDGE = common.HALO2 + '/third_party/xboxrecomp/src/kernel/kernel_bridge.c'
 THUNKS = 0x411520          # the XBE's kernel thunk table (header 0x158 ^ retail key)
 _KERNEL = None
 
@@ -222,6 +247,50 @@ def obj_for(src, decomp, env, fresh=False, out=None):
     return obj
 
 
+_SSIZE = None
+
+
+def struct_size(tname, decomp, env):
+    """sizeof a structure the decomp passes by value, from a one-line probe compile against the
+    header that defines it (the compile error names the array size). Cached in <WORK>; 0 if unknown."""
+    global _SSIZE
+    path = os.path.join(common.WORK, 'struct_sizes.json')
+    if _SSIZE is None:
+        _SSIZE = json.load(open(path)) if os.path.exists(path) else {}
+    name = tname.split()[-1]
+    if name in _SSIZE:
+        return _SSIZE[name]
+    size = 0
+    pat = re.compile(r'^\s*(struct|class|union)\s+%s\b[^;]*$' % re.escape(name), re.M)
+    hdr = next((os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(decomp, 'include')) for f in fs
+                if f.endswith('.h') and pat.search(open(os.path.join(dp, f), errors='replace').read())), None)
+    if hdr:
+        probe = os.path.join(common.WORK, 'tmpobj', 'probe_%d.cpp' % os.getpid())
+        os.makedirs(os.path.dirname(probe), exist_ok=True)
+        open(probe, 'w').write('#include <xtl.h>\n#include "%s"\nchar (*fe_probe)[sizeof(%s)] = 1;\n'
+                               % (hdr.replace('\\', '/'), name))
+        r = subprocess.run([common.CL] + dbuild.BASE + ['/I', common.SHIM, '/I', os.path.join(decomp, 'include'),
+                            '/Fo' + probe + '.obj', probe], capture_output=True, text=True, env=env, errors='replace')
+        m = re.search(r"'char \(\*\)\[(\d+)\]'", r.stdout)
+        size = int(m.group(1)) if m else 0
+    _SSIZE[name] = size
+    try:
+        json.dump(_SSIZE, open(path, 'w'))
+    except OSError:
+        pass
+    return size
+
+
+def sized(sig, decomp, env):
+    """sig with by-value structure parameters given their real size (when the header knows it)."""
+    if sig is None or not sig.params or all(sz for pt, sz in sig.params):
+        return sig
+    ps = [(pt, sz or (struct_size(pt, decomp, env) if pt.startswith('struct') else 0)) for pt, sz in sig.params]
+    out = coff.Sig(sig.cc, ps, sig.ret, sig.is_method, sig.varargs)
+    out.cptr = getattr(sig, "cptr", frozenset())
+    return out
+
+
 def retail_calls(va, size):
     """Direct call/jmp targets in retail A's bytes (outside A)."""
     body = common.xbe_read(va, size) or b''
@@ -253,8 +322,11 @@ def with_retbuf(sig):
     if sig is None or sig.params is None:
         return None
     ps = list(sig.params)
-    ps.insert(1 if sig.cc == 'thiscall' else 0, ('ptr', 4))
-    return coff.Sig(sig.cc, ps, 'ptr', sig.is_method, sig.varargs)
+    at = 1 if sig.cc == 'thiscall' else 0
+    ps.insert(at, ('ptr', 4))
+    out = coff.Sig(sig.cc, ps, 'ptr', sig.is_method, sig.varargs)
+    out.cptr = frozenset(i + (i >= at) for i in getattr(sig, 'cptr', ()))
+    return out
 
 
 def _code_sym(o, s):
@@ -338,7 +410,7 @@ def link(objp, va, size, decomp, env, force=()):
                 target = ('va', v)
                 if typ == coff.IMAGE_REL_I386_REL32 and v not in transp:
                     b.callees.add(v)
-                    b.callee_sig[v] = coff.signature(t.name)
+                    b.callee_sig[v] = sized(coff.signature(t.name), decomp, env)
             if target is None and t.section > 0:
                 tsec = oo.sections[t.section]
                 if tsec.flags & coff.SCN_WRITE and not (tsec.flags & coff.SCN_CODE):
@@ -412,12 +484,21 @@ PARTS = {'al': 'eax', 'ah': 'eax', 'ax': 'eax', 'cl': 'ecx', 'ch': 'ecx', 'cx': 
          'dx': 'edx', 'bl': 'ebx', 'bh': 'ebx', 'bx': 'ebx', 'si': 'esi', 'di': 'edi'}
 
 
-def live_in(va, size):
+def live_in(va, size, through=False):
     """Registers retail A reads before writing them on some path from its entry (its register
-    arguments), in order of first read. Walks the control flow inside A."""
+    arguments), in order of first read. Walks the control flow inside A.
+    through: also registers A hands untouched to a direct callee that reads them (an argument
+    passed straight through), appended after the others."""
     body = common.xbe_read(va, size) or b''
     insns = {i.address: i for i in md.disasm(body, va)}
-    out, late = [], []
+    out, late, thru = [], [], []
+
+    def passed(tgt, written):
+        if not through or tgt is None or va <= tgt < va + size:
+            return
+        for x in callee_regs(tgt):
+            if x not in written and x not in thru:
+                thru.append(x)
     work = [(va, frozenset())]
     seen = set()
     steps = 0
@@ -455,6 +536,7 @@ def live_in(va, size):
             written = written | (wr & set(REGS + XREGS))
             if mn == 'call':
                 tgt_ = ops[0].imm & 0xFFFFFFFF if ops and ops[0].type == CX.X86_OP_IMM else None
+                passed(tgt_, written)
                 written = written | ({'eax'} if tgt_ is not None and tgt_ in transparent() else {'eax', 'ecx', 'edx'})
             nxt = addr + ins.size
             if mn.startswith('j'):
@@ -470,13 +552,15 @@ def live_in(va, size):
                             work.append((tv, written))
                         break
                     if tgt is None or not va <= tgt < va + size:
+                        passed(tgt, written)   # a tail call
                         break
                     addr = tgt
                     continue
                 if tgt is not None and va <= tgt < va + size:
                     work.append((tgt, written))
             addr = nxt
-    return out + [x for x in late if x not in out]
+    out = out + [x for x in late if x not in out]
+    return out + [x for x in thru if x not in out]
 
 
 def candidates(sig, live, cap=400):
@@ -830,7 +914,102 @@ def same_pointee(uc, v, cands, n=32):
     return False
 
 
-def run_blob(s, b, mapping, rres, recs):
+PAIR_CAP = 24
+
+
+def fp_pairings(u, r, t, direct, sig, cl, fregs, esp, r_hi, b_hi, args):
+    """Frame-pointer pairings for one mocked call. Returns (sound, candidates, val) or None
+    when no callee write (or returned pointer) lands in retail's frame.
+
+    sound: retail's callee reads exactly the registers our declaration passes and pops the
+    same stack bytes, so pairing by argument position is the truth (no alternatives).
+    candidates: [(locmap, {retail fp: ours fp})], every injective assignment of the retail
+    frame pointers the callee's writes are based on to the frame pointers ours passes, whose
+    written extent fits before ours' next frame pointer. A locmap names argument locations
+    (('r', reg) / ('s', retail stack index | ours byte offset)), so a choice made at one call
+    site carries over to its other invocations and to other snapshots."""
+    regs = callee_regs(t) if direct else []
+    if not regs and not direct:
+        regs = ['ecx']                       # a method call through a vtable: `this`
+    ours_stk = [(where, sz) for kind, where, sz, pt in (cl or []) if kind == 'stk']
+    n_r = max((r.popped or 0) // 4, max([(w + 4) // 4 for w, sz in ours_stk], default=0) if cl is not None
+              else len(args), 0)
+    rlocs = [('r', x) for x in regs if x in REGS] + [('s', i) for i in range(min(n_r, len(r.stack)))]
+    ro = set()
+    if cl is not None:
+        olocs = [('r', w) if k == 'reg' else ('s', w) for k, w, sz, pt in cl if k == 'reg' and w in REGS or k == 'stk' and sz <= 4]
+        ro = {('r', w) if k == 'reg' else ('s', w) for i, (k, w, sz, pt) in enumerate(cl) if i in getattr(sig, 'cptr', ())}
+    else:
+        olocs = [('s', 4 * i) for i in range(len(args))] + [('r', 'ecx'), ('r', 'edx')]
+
+    oidx = {l: i for i, l in enumerate(olocs)}
+
+    def rval(l):
+        v = r.regs[REGS.index(l[1])] if l[0] == 'r' else r.stack[l[1]]
+        return v if r.esp_call <= v < r_hi else None
+
+    def oval(l):
+        v = fregs[l[1]] if l[0] == 'r' else struct.unpack('<I', u.mem_read(esp + l[1], 4))[0]
+        return v if esp <= v < b_hi else None
+
+    def val(rl, ol):
+        return rval(rl), oval(ol)
+    rv = {}
+    for l in rlocs:
+        v = rval(l)
+        if v is not None and v not in rv:
+            rv[v] = l
+    ov = {}
+    for l in olocs:
+        v = oval(l)
+        if v is not None and v not in ov:
+            ov[v] = l
+    if not rv:
+        return None
+    rk = sorted(rv)
+    ext = {}
+    for a, data in r.writes:
+        if r.esp_call <= a < r_hi:
+            p_ = max((p for p in rk if p <= a), default=None)
+            if p_ is not None:
+                ext[p_] = max(ext.get(p_, 0), a + len(data) - p_)
+    if r.esp_call <= r.eax < r_hi:
+        p_ = max((p for p in rk if p <= r.eax), default=None)
+        if p_ is not None:
+            ext.setdefault(p_, 1)
+    if not ext:
+        return None
+    sound = (direct and sig is not None and cl is not None and (r.popped or 0) == (sig.stack_bytes() or 0)
+             and set(regs) & set(REGS) == {w for k, w, sz, pt in cl if k == 'reg'})
+    need = sorted(ext)
+    ok = sorted(ov)
+    if DEBUG:
+        print('    fp_pairings %s sound=%s need %s ours %s' % (nearest(t), sound, {rv[n]: (hex(n), hex(ext[n])) for n in need},
+              {ov[o]: hex(o) for o in ok}))
+    room = {v: min([w for w in ok if w > v] + [b_hi]) - v for v in ok}
+    cands = []
+    for perm in itertools.permutations(ok + [None] * max(0, len(need) - len(ok)), len(need)):
+        if any(o is not None and (room[o] < ext[n] or ov[o] in ro) for n, o in zip(need, perm)):
+            continue
+        pm = {n: o for n, o in zip(need, perm) if o is not None}
+        if not pm:
+            continue
+        lm = tuple((rv[n], ov[o]) for n, o in pm.items())
+        # LTCG moves arguments into registers but never reorders the ones it leaves on the stack:
+        # retail stack arguments keep our parameter order
+        st_ = sorted((rl[1], oidx[ol]) for rl, ol in lm if rl[0] == 's')
+        if any(st_[i][1] > st_[i + 1][1] for i in range(len(st_) - 1)):
+            continue
+        if all(c[0] != lm for c in cands):
+            cands.append((lm, pm))
+        if len(cands) >= PAIR_CAP:
+            break
+    return sound, cands, val
+
+
+def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
+    """alt: call site -> frame-pointer pairing to use there (see fp_pairings); info: dict that
+    collects, per call site whose positional pairing is not certain, the alternative pairings."""
     uc, ram, con = machine(s)
     esp0 = s['esp']
     uc.mem_write(BLOB, bytes(b.data))
@@ -905,8 +1084,20 @@ def run_blob(s, b, mapping, rres, recs):
         sig = b.callee_sig.get(t) if direct else None
         if sig is not None and sig.ret == 'struct':
             sr = with_retbuf(sig)
-            if sr is not None and (not sig.callee_pops() or (r.popped or 0) == (sr.stack_bytes() or 0)
-                                   or (sr.stack_bytes() or 0) == (sig.stack_bytes() or 0)):
+            # a method returning a class always takes the hidden result pointer in our compile
+            # (retail's LTCG pops can't tell: it may pass it in a register)
+            use = sr is not None and (sig.is_method or not sig.callee_pops()
+                                      or (r.popped or 0) == (sr.stack_bytes() or 0)
+                                      or (sr.stack_bytes() or 0) == (sig.stack_bytes() or 0))
+            if sr is not None and not sig.is_method:
+                # a small POD comes back in eax without a result pointer: when retail's pops only
+                # agree by coincidence (another convention), the snapshots decide
+                rbk = ('rb', addr - lo_b, t)
+                if alt and alt.get(rbk):
+                    use = not use
+                elif info is not None and rbk not in info:
+                    info[rbk] = [True]
+            if use:
                 sig = sr
         cl = sig.locations() if sig else None
         if cl is None and sig is not None and sig.params and sig.callee_pops():
@@ -932,7 +1123,16 @@ def run_blob(s, b, mapping, rres, recs):
                     args += w_
                     masks += [MASKS.get(pt, 0xFFFFFFFF)] * len(w_)
         else:
-            n = min(max((r.popped or 0) // 4, 0 if direct and sig is not None else 4), len(r.stack))
+            # retail's pops are exact for callee-cleaned calls (thiscall/stdcall/fastcall); an
+            # indirect call that popped nothing is a virtual call without stack arguments.
+            # Only a direct cdecl-looking call (pops 0) keeps the 4-word guess.
+            if r.popped:
+                n = r.popped // 4
+            elif not direct and r.popped == 0:
+                n = 0
+            else:
+                n = 0 if direct and sig is not None else 4
+            n = min(n, len(r.stack))
             args = list(struct.unpack('<%dI' % n, u.mem_read(esp, 4 * n))) if n else []
         rset = set(r.regs) | set(r.stack) | set(getattr(r, 'xlo', None) or [])
         r_hi, b_hi = esp0 + 4 + 4 * rsl, new_esp + 4 + 4 * bsl   # frames incl. incoming argument slots
@@ -961,6 +1161,23 @@ def run_blob(s, b, mapping, rres, recs):
                     pairs[rv_] = bv_
         if not pairs:
             pairs = dict(zip(r_fp, b_fp))
+        if info is not None or alt:
+            site = (addr - lo_b, t)
+            pr = fp_pairings(u, r, t, direct, sig, cl, fregs, esp, r_hi, b_hi, args)
+            if pr is not None:
+                sound, cands, val = pr
+                if site in (alt or {}):
+                    got = {}
+                    for rl, ol in alt[site]:
+                        rv_, bv_ = val(rl, ol)
+                        if rv_ is not None and bv_ is not None and rv_ not in got:
+                            got[rv_] = bv_
+                    if got:
+                        pairs = got
+                elif info is not None and not sound:
+                    cs = [c for c in cands if {k: v for k, v in pairs.items() if k in c[1]} != c[1]]
+                    if cs and site not in info:
+                        info[site] = [c[0] for c in cs]
         pk = sorted(pairs)
         if DEBUG:
             print('  mock %d %s args %s r_fp %s b_fp %s pairs %s pops %s/%s' % (st['n'], nearest(t), [hex(x) for x in args],
@@ -1093,7 +1310,8 @@ def run_blob(s, b, mapping, rres, recs):
 def retail_cached(path, root, va, size):
     os.makedirs(RCACHE, exist_ok=True)
     key = os.path.join(RCACHE, '%s__%s.pkl' % (os.path.relpath(root, common.SNAPS).replace(os.sep, '_').replace('/', '_'), os.path.basename(path)))
-    if os.path.exists(key):
+    # a store re-captured later reuses snapshot names: a cache entry older than its snapshot is stale
+    if os.path.exists(key) and os.path.getmtime(key) >= os.path.getmtime(path):
         try:
             return pickle.load(open(key, 'rb'))
         except Exception:
@@ -1109,8 +1327,50 @@ def retail_cached(path, root, va, size):
     return out
 
 
+_KNOWN = None
+
+
+def known_maps(va, sig):
+    """Entry maps read off retail's disassembly (<WORK>/entry_maps.csv: va,map,evidence with map as
+    fmt_map prints it). Tried before the generic search; the snapshots still decide."""
+    global _KNOWN
+    if _KNOWN is None:
+        _KNOWN = collections.defaultdict(list)
+        for row in common.read_csv(os.path.join(common.WORK, 'entry_maps.csv')):
+            try:
+                _KNOWN[int(row['va'], 16)].append(row['map'])
+            except (KeyError, ValueError):
+                pass
+    loc = sig.locations() if sig else None
+    out = []
+    for text in _KNOWN.get(va, []):
+        parts = [p.strip().split('<-') for p in text.split(',') if p.strip()]
+        if loc is None or len(parts) != len(loc):
+            continue
+        m = []
+        for (pi, w), (kind, where, sz, pt) in zip(parts, loc):
+            m.append(('stk', int(w[3:]), sz) if w.startswith('stk') else ('reg', w, sz))
+        out.append(m)
+    return out
+
+
+def fmt_alts(alts):
+    def loc(l, ours):
+        return l[1] if l[0] == 'r' else ('stk+%x' % l[1] if ours else 'stk%d' % l[1])
+    out = []
+    for k, lm in sorted((alts or {}).items(), key=lambda kv: kv[0][-2:]):
+        if k[0] == 'rb':
+            out.append('%s@+%x: result pointer flipped' % (nearest(k[2]), k[1]))
+        else:
+            out.append('%s@+%x: %s' % (nearest(k[1]), k[0], ', '.join('%s->%s' % (loc(a, 0), loc(b_, 1)) for a, b_ in lm)))
+    return '; '.join(out)
+
+
 def fmt_map(m):
     return ', '.join('p%d<-%s' % (i, w if k == 'reg' else 'stk%d' % w) for i, (k, w, sz) in enumerate(m))
+
+
+SAVE_TAG = None   # main() sets it: check() then saves a provisional verdict before risky retries
 
 
 def check(va, decomp, env, src=None, k=6, budget=240):
@@ -1151,6 +1411,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
         if not good:
             raise Fail(rr[0][3])
         live = live_in(va, size)
+        live2 = live_in(va, size, through=True)   # pass-through registers: tried after the others
         loaded = {}
 
         def snap(p, root):
@@ -1158,29 +1419,89 @@ def check(va, decomp, env, src=None, k=6, budget=240):
                 loaded[p] = snapstore.load(p, root)
             return loaded[p]
 
-        def search(b):
-            """First entry mapping (over the signature variants) that holds on every snapshot."""
+        def paired(p, root, x, m, b, alts, todo):
+            """Run one snapshot again under alternative frame-pointer pairings at the call sites
+            whose positional pairing is uncertain (todo: site -> locmaps). Combinations over the
+            sites, fewest changed sites first, capped; the first whole run that agrees wins."""
+            sites = [k for k in todo if k not in alts][:5]
+            combos = []
+            for nchg in range(1, len(sites) + 1):
+                for ss in itertools.combinations(sites, nchg):
+                    for pick in itertools.product(*[todo[k] for k in ss]):
+                        combos.append(dict(zip(ss, pick)))
+                        if len(combos) >= 2 * PAIR_CAP:
+                            break
+            for c in combos[:2 * PAIR_CAP]:
+                if time.time() - t0 > budget:
+                    break
+                a2 = {**alts, **c}
+                v, d = run_blob(snap(p, root), b, m, x[0], x[1], alt=a2)
+                if DEBUG:
+                    print('  pairing %s -> %s %s' % (fmt_alts(a2), v, d[:160]))
+                if v.startswith('equivalent'):
+                    return v, a2
+            return None, None
+
+        def search(b, retry=False):
+            """First entry mapping (over the signature variants) that holds on every snapshot.
+            retry: also try alternative frame-pointer pairings (only mappings whose failing run
+            met an uncertain pairing in the first pass, recorded in amb_seen)."""
             sigs = [b.sig] + ([with_retbuf(b.sig)] if b.sig.ret == 'struct' and with_retbuf(b.sig) else [])
             first = chosen = None
             for sg in sigs:
                 b.sig = sg
-                for m in candidates(sg, live):
+                ms = known_maps(va, sg) + candidates(sg, live)
+                if live2 != live:
+                    ms += [m_ for m_ in candidates(sg, live2) if m_ not in ms]
+                for m in ms:
                     if first is not None and time.time() - t0 > budget:
                         break
-                    verdicts, bad = [], None
+                    mk = (id(b), fmt_map(m), len(sg.params or []))
+                    if retry and mk not in amb_seen:
+                        continue
+                    verdicts, bad, alts, done = [], None, {}, []
                     for p, root, x, why in good:   # a mapping must hold on every snapshot
-                        v, d = run_blob(snap(p, root), b, m, x[0], x[1])
+                        info = {}
+                        v, d = run_blob(snap(p, root), b, m, x[0], x[1], alt=alts or None, info=info)
+                        if not v.startswith('equivalent') and info:
+                            if not retry:
+                                amb_seen.add(mk)
+                            else:
+                                v2, a2 = paired(p, root, x, m, b, alts, info)
+                                if v2:
+                                    v, alts = v2, a2
+                                    # every earlier snapshot must agree under the same pairings
+                                    for p_, root_, x_ in done:
+                                        v3, d3 = run_blob(snap(p_, root_), b, m, x_[0], x_[1], alt=alts)
+                                        if not v3.startswith('equivalent'):
+                                            v, d = v3, '%s (under the pairing %s)' % (d3, fmt_alts(alts))
+                                            break
                         verdicts.append(v)
+                        done.append((p, root, x))
                         if not v.startswith('equivalent'):
                             bad = (os.path.basename(p), d)
                             break
                     if first is None or (bad and len(verdicts) > first[3]):
                         first = (m, bad, verdicts, len(verdicts), sg)
                     if bad is None:
+                        res['pairing'] = fmt_alts(alts)
                         return first, (m, verdicts, sg)
             return first, chosen
+
+        amb_seen = set()
+
+        def search2(b):
+            first, chosen = search(b)
+            if chosen is None and amb_seen:
+                if SAVE_TAG is not None and first is not None and first[1]:
+                    # the retry can drive Unicorn into a native crash: leave the first pass's verdict
+                    pv = dict(res, verdict='differs', detail='%s: %s' % first[1], mapping=fmt_map(first[0]),
+                              tag=SAVE_TAG, t=round(time.time() - t0, 1))
+                    save(pv)
+                f2, chosen = search(b, retry=True)
+            return first, chosen
         force = set()
-        first, chosen = search(b)
+        first, chosen = search2(b)
         # a callee retail inlines here but calls elsewhere: run our compile of it, then search again
         while chosen is None and first[1] and 'retail makes no such call here' in first[1][1] and len(force) < 4:
             nm = first[1][1].split(' to ', 1)[1].split(': retail makes', 1)[0]
@@ -1193,7 +1514,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             except Fail:
                 break
             res['linked'] = ' '.join(b.linked)
-            first, chosen = search(b)
+            first, chosen = search2(b)
         if chosen is None and first[1] and 'UNLINKED ' in first[1][1]:
             raise Fail('unbuildable: callee ' + first[1][1].split('UNLINKED ', 1)[1])
         if chosen is None:
@@ -1206,6 +1527,8 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             res['verdict'] = 'equivalent_fp' if 'equivalent_fp' in verdicts else 'equivalent'
             res['detail'] = '%d/%d snapshots agree%s' % (res['eq'], len(rr), '' if len(good) == len(rr) else
                                                           ' (%d retail runs untestable)' % (len(rr) - len(good)))
+            if res.get('pairing'):
+                res['detail'] += ' [frame pointers paired: %s]' % res['pairing']
     except Fail as e:
         res['verdict'], _, res['detail'] = str(e).partition(': ')
     res['t'] = round(time.time() - t0, 1)
@@ -1224,6 +1547,9 @@ def save(res):
 
 
 def main():
+    if os.name == 'nt' and os.environ.get('FECHECK_PRIORITY', 'low') == 'low':
+        import ctypes   # below normal: overnight rigs play the game beside the checks
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
     ap = argparse.ArgumentParser()
     ap.add_argument('vas', nargs='+')
     ap.add_argument('--decomp', default=common.DECOMP)
@@ -1231,9 +1557,22 @@ def main():
     ap.add_argument('--k', type=int, default=6)
     ap.add_argument('--tag', default='')
     a = ap.parse_args()
+    global SAVE_TAG
+    SAVE_TAG = a.tag
     env = common.vcenv()
     for x in a.vas:
         res = check(int(x, 16), a.decomp, env, a.src, a.k)
+        if dbuild.SSE2 and not res.get('verdict', '').startswith('equivalent'):
+            # the x87 build of the same source: VS2022's SSE2 codegen sometimes defeats the
+            # entry search where the x87 one does not; either compile is a fair rendering
+            dbuild.SSE2 = False
+            try:
+                alt = check(int(x, 16), a.decomp, env, a.src, a.k, budget=120)
+            finally:
+                dbuild.SSE2 = True
+            if alt.get('verdict', '').startswith('equivalent'):
+                alt['detail'] = (alt.get('detail') or '') + ' [x87 build]'
+                res = alt
         res['tag'] = a.tag
         print(save(res), flush=True)
 
