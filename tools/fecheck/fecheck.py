@@ -1283,7 +1283,10 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         else:
             pops = r.popped or 0
         reax = r.eax
-        if pk and r.esp_call <= reax < r_hi:
+        # a bool/char/short result is only its low bits: the rest of eax is whatever retail's callee
+        # left there, never a pointer into the frame to carry over to ours
+        narrow = sig is not None and sig.ret in ('bool', 'char', 'short')
+        if pk and not narrow and r.esp_call <= reax < r_hi:
             p_ = max((p for p in pk if p <= reax), default=None)
             if p_ is not None:
                 reax = reax - p_ + pairs[p_]
