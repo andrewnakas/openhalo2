@@ -82,15 +82,21 @@ setuplit() { python -c "import sys;from PIL import Image;im=Image.open(sys.argv[
 # start <A|B> <mac> <watchdog>: start that copy headless (cwd = its folder), remember its PID
 start() {
   use $1; local d; [ $1 = A ] && d=$DIRA || d=$DIRB
+  # one game per copy folder: a second one (another rig's) fails on the shared save images with
+  # sharing violations; wait for the folder to be free (up to COPY_WAIT s, default 3 hours)
+  local w=0; while [ -n "$(powershell -NoProfile -c "Get-Process h2fe -ea 0 | ?{\$_.Path -like '$(cygpath -w $d)\\*'} | %{ \$_.Id }" | tr -d '\r')" ]; do
+    [ $w -ge ${COPY_WAIT:-10800} ] && return 1; sleep 30; w=$((w + 30)); done
   : > "$O/pad.txt"; rm -f "$O/fe.bin" "$O"/fb*.bmp "$O/dumpflag"
   local E=(RECOMP_APU_MUTE=1 RECOMP_FB_DUMP_REPORT=0 RECOMP_FE_OUT="$(cygpath -m "$O")/fe.bin" RECOMP_MAC=$2 RECOMP_NIC_FRAMES=${NIC_FRAMES:-0} "${XENV[@]}")
   # (the runtime creates only the last directory level)
   [ -n "$FE_SNAP_ROOT" ] && { mkdir -p "$(cygpath -u "$FE_SNAP_ROOT")/$1/$S"; E+=(RECOMP_FE_SNAP_DIR="$FE_SNAP_ROOT/$1/$S"); }
   ( cd $d && exec env "${E[@]}" RECOMP_WATCHDOG_SECS=$3 RECOMP_PB_REPORT_MS=5000 RECOMP_PAD_LIVE="$(cygpath -m "$O")/pad.txt" \
       RECOMP_FB_DUMP_FLIPS="$(cygpath -m "$O")/dumpflag" RECOMP_FB_DUMP="$(cygpath -m "$O")/fb" ./$EXE > "$O/out.log" 2>&1 ) &
-  local p= i; for i in $(seq 20); do sleep 1
-    p=$(powershell -NoProfile -c "Get-Process h2fe -ea 0 | ?{\$_.Path -like '$(cygpath -w $d)\\*'} | %{ \$_.PriorityClass='$PRIO'; \$_.Id }" | tr -d '\r' | head -1)
-    [ -n "$p" ] && break; done
+  # the Windows PID of exactly the process started here (the subshell execs the game): never a
+  # lookup by folder, which picked up another rig's game in the same folder (and killed it)
+  local bp=$! p= i; for i in $(seq 20); do sleep 1
+    p=$(cat /proc/$bp/winpid 2>/dev/null | tr -d '\r'); [ -n "$p" ] && break; done
+  [ -n "$p" ] && powershell -NoProfile -c "(Get-Process -Id $p -ea 0).PriorityClass='$PRIO'" > /dev/null 2>&1
   PID[$1]=$p; echo "$p" > "$O/pid"; [ -n "$p" ]
 }
 # waittitle: until the copy has presented 1100 frames (the title)
