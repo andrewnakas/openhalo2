@@ -10,4 +10,4 @@ __pycache__/
 build/
 tools/import/bin/
 dist/
-tools/byog/bin/
+tools/fecheck/link_refs/

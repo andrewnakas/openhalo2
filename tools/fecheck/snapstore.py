@@ -22,7 +22,8 @@ _PAGES = {}
 
 def roots():
     """Every store directory (one per rig scenario) under common.SNAPS."""
-    return sorted(os.path.dirname(p) for p in glob.glob(os.path.join(common.SNAPS, '*', 'pages.dat')) + glob.glob(os.path.join(common.SNAPS, '*', '*', 'pages.dat')))
+    return sorted(os.path.dirname(p) for p in glob.glob(os.path.join(common.SNAPS, '*', 'pages.dat')) + glob.glob(os.path.join(common.SNAPS, '*', '*', 'pages.dat'))
+                  + glob.glob(os.path.join(common.SNAPS, '*', '*', '*', 'pages.dat')))   # link rigs: <run>/<copy>/<scenario>
 
 
 def index(va=None):
