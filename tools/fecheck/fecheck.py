@@ -64,7 +64,12 @@ TRANSPARENT_NAMES = ['__chkstk', '_memcpy', '__allmul', '__aulldiv', '__alldiv',
                      'D3DDevice_SetRenderState_ZEnable', 'D3DDevice_SetRenderState_Simple',
                      'D3DDevice_SetVertexShaderConstant1', 'D3DDevice_SetVertexShaderConstant1Fast',
                      'D3DDevice_SetVertexShaderConstant4', 'D3DDevice_SetVertexShaderConstantFast_Dwords',
-                     'D3DDevice_SetRenderState_FillMode', 'D3DDevice_SetRenderState_CullMode', 'D3DDevice_SetStateBeforeBegin']
+                     'D3DDevice_SetRenderState_FillMode', 'D3DDevice_SetRenderState_CullMode', 'D3DDevice_SetStateBeforeBegin',
+                     # CRT qsort sorts in place through a comparator: both sides run retail's copy (which calls
+                     # the comparator each side passes), so the sorted array is compared like any other write
+                     '_qsort']
+# transparent routines that clobber ecx/edx like any cdecl call (the helpers above leave them alone)
+TRANSPARENT_CLOBBER = {'_qsort'}
 ALIASES = {'__ftol2_sse': '__ftol2', '__ftol': '__ftol2', '__alloca_probe': '__chkstk'}
 # mov [SCR],eax; mov [SCR+4],edx; fnsave [SCR+16]
 SENT_CODE = bytes([0xA3]) + struct.pack('<I', SCR) + bytes([0x89, 0x15]) + struct.pack('<I', SCR + 4) + \
@@ -264,30 +269,47 @@ def obj_for(src, decomp, env, fresh=False, out=None):
 _SSIZE = None
 
 
-def struct_size(tname, decomp, env):
+def struct_size(tname, decomp, env, src=None):
     """sizeof a structure the decomp passes by value, from a one-line probe compile against the
-    header that defines it (the compile error names the array size). Cached in <WORK>; 0 if unknown."""
+    header that defines it (the compile error names the array size), else against the source file
+    src (sources declare some structures themselves). Cached in <WORK>; 0 if unknown."""
     global _SSIZE
     path = os.path.join(common.WORK, 'struct_sizes.json')
     if _SSIZE is None:
         _SSIZE = json.load(open(path)) if os.path.exists(path) else {}
     name = tname.split()[-1]
-    if name in _SSIZE:
+    if _SSIZE.get(name):
         return _SSIZE[name]
+    skey = '%s@%s' % (name, os.path.basename(src)) if src and os.path.exists(src) else None
+    if name in _SSIZE and skey is None:
+        return 0
+    if skey in _SSIZE:
+        return _SSIZE[skey]
+    probe = os.path.join(common.WORK, 'tmpobj', 'probe_%d.cpp' % os.getpid())
+    os.makedirs(os.path.dirname(probe), exist_ok=True)
     size = 0
-    pat = re.compile(r'^\s*(struct|class|union)\s+%s\b[^;]*$' % re.escape(name), re.M)
-    hdr = next((os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(decomp, 'include')) for f in fs
-                if f.endswith('.h') and pat.search(open(os.path.join(dp, f), errors='replace').read())), None)
-    if hdr:
-        probe = os.path.join(common.WORK, 'tmpobj', 'probe_%d.cpp' % os.getpid())
-        os.makedirs(os.path.dirname(probe), exist_ok=True)
-        open(probe, 'w').write('#include <xtl.h>\n#include "%s"\nchar (*fe_probe)[sizeof(%s)] = 1;\n'
-                               % (hdr.replace('\\', '/'), name))
-        r = subprocess.run([common.CL] + dbuild.BASE + ['/I', common.SHIM, '/I', os.path.join(decomp, 'include'),
-                            '/Fo' + probe + '.obj', probe], capture_output=True, text=True, env=env, errors='replace')
+    if name not in _SSIZE:
+        pat = re.compile(r'^\s*(struct|class|union)\s+%s\b[^;]*$' % re.escape(name), re.M)
+        hdr = next((os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(decomp, 'include')) for f in fs
+                    if f.endswith('.h') and pat.search(open(os.path.join(dp, f), errors='replace').read())), None)
+        if hdr:
+            open(probe, 'w').write('#include <xtl.h>\n#include "%s"\nchar (*fe_probe)[sizeof(%s)] = 1;\n'
+                                   % (hdr.replace('\\', '/'), name))
+            r = subprocess.run([common.CL] + dbuild.BASE + ['/I', common.SHIM, '/I', os.path.join(decomp, 'include'),
+                                '/Fo' + probe + '.obj', probe], capture_output=True, text=True, env=env, errors='replace')
+            m = re.search(r"'char \(\*\)\[(\d+)\]'", r.stdout)
+            size = int(m.group(1)) if m else 0
+        _SSIZE[name] = size
+    if not size and skey:
+        # declared in the source file itself: probe with that file included (front end only)
+        open(probe, 'w').write('#include "%s"\nchar (*fe_probe)[sizeof(%s)] = 1;\n'
+                               % (os.path.abspath(src).replace('\\', '/'), name))
+        r = subprocess.run([common.CL] + dbuild.BASE + ['/Zs', '/I', common.SHIM, '/I', os.path.join(decomp, 'include'),
+                            '/I', os.path.dirname(os.path.abspath(src)), probe],
+                           capture_output=True, text=True, env=env, errors='replace', cwd=decomp)
         m = re.search(r"'char \(\*\)\[(\d+)\]'", r.stdout)
         size = int(m.group(1)) if m else 0
-    _SSIZE[name] = size
+        _SSIZE[skey] = size
     try:
         json.dump(_SSIZE, open(path, 'w'))
     except OSError:
@@ -295,11 +317,12 @@ def struct_size(tname, decomp, env):
     return size
 
 
-def sized(sig, decomp, env):
-    """sig with by-value structure parameters given their real size (when the header knows it)."""
+def sized(sig, decomp, env, src=None):
+    """sig with by-value structure parameters given their real size (when the header or the source
+    file src that declares it knows it)."""
     if sig is None or not sig.params or all(sz for pt, sz in sig.params):
         return sig
-    ps = [(pt, sz or (struct_size(pt, decomp, env) if pt.startswith('struct') else 0)) for pt, sz in sig.params]
+    ps = [(pt, sz or (struct_size(pt, decomp, env, src) if pt.startswith('struct') else 0)) for pt, sz in sig.params]
     out = coff.Sig(sig.cc, ps, sig.ret, sig.is_method, sig.varargs)
     out.cptr = getattr(sig, "cptr", frozenset())
     return out
@@ -347,8 +370,8 @@ def _code_sym(o, s):
     return s.section > 0 and s.sclass in (2, 3) and bool(o.sections[s.section].flags & coff.SCN_CODE) and not s.naux
 
 
-def link(objp, va, size, decomp, env, force=()):
-    """Link F (the function at va in objp) into a Blob at BLOB."""
+def link(objp, va, size, decomp, env, force=(), src=None):
+    """Link F (the function at va in objp, compiled from src) into a Blob at BLOB."""
     objs = {}
 
     def get(p):
@@ -411,6 +434,12 @@ def link(objp, va, size, decomp, env, force=()):
             v = (table().get(t.name) if t.sclass == 3 else None) if t.section > 0 else resolve(t.name)
             if v is None and not (t.section > 0 and t.sclass == 3) and t.section > 0:
                 v = resolve(t.name)
+            if v == va and typ == coff.IMAGE_REL_I386_REL32 and t.section > 0 and is_code:
+                # a self call: retail runs into its own body (not recorded as a call), so ours does too.
+                # VS2022 may also turn it into a jmp to the entry (tail-recursion elimination).
+                place(p, t.section)
+                relocs.append(((p, si), off, typ, ('sec', (p, t.section), t.value)))
+                continue
             if v is not None and typ == coff.IMAGE_REL_I386_REL32 and (v not in rc or v in force) and v not in transp and v != va:
                 cd = (p, t.section) if (t.section > 0 and is_code) else code_def(t.name)
                 if not cd:
@@ -424,7 +453,7 @@ def link(objp, va, size, decomp, env, force=()):
                 target = ('va', v)
                 if typ == coff.IMAGE_REL_I386_REL32 and v not in transp:
                     b.callees.add(v)
-                    b.callee_sig[v] = sized(coff.signature(t.name), decomp, env)
+                    b.callee_sig[v] = sized(coff.signature(t.name), decomp, env, src if p == objp else None)
             if target is None and t.section > 0:
                 tsec = oo.sections[t.section]
                 if tsec.flags & coff.SCN_WRITE and not (tsec.flags & coff.SCN_CODE):
@@ -541,7 +570,7 @@ def live_in(va, size, through=False):
             if mn in ('or', 'and') and len(ops) == 2 and ops[1].type == CX.X86_OP_IMM and (ops[1].imm & 0xFFFFFFFF) in ((0xFFFFFFFF,) if mn == 'or' else (0,)):
                 rd = set()
             if mn in ('mov', 'lea') and len(ops) == 2 and ops[0].type == ops[1].type == CX.X86_OP_REG and ops[0].reg == ops[1].reg:
-                rd = set()   # mov edi, edi: padding
+                rd = wr = set()   # mov edi, edi: padding (neither reads nor writes the value)
             if mn == 'push' and ops and ops[0].type == CX.X86_OP_REG and md.reg_name(ops[0].reg) in ('ebx', 'esi', 'edi', 'ebp'):
                 rd = set()
             for r in REGS + XREGS:
@@ -551,7 +580,8 @@ def live_in(va, size, through=False):
             if mn == 'call':
                 tgt_ = ops[0].imm & 0xFFFFFFFF if ops and ops[0].type == CX.X86_OP_IMM else None
                 passed(tgt_, written)
-                written = written | ({'eax'} if tgt_ is not None and tgt_ in transparent() else {'eax', 'ecx', 'edx'})
+                eax_only = tgt_ is not None and tgt_ in transparent() and tgt_ not in {table().get(n) for n in TRANSPARENT_CLOBBER}
+                written = written | ({'eax'} if eax_only else {'eax', 'ecx', 'edx'})
             nxt = addr + ins.size
             if mn.startswith('j'):
                 op = ops[0] if ops else None
@@ -828,8 +858,8 @@ def run_retail(s, va, size):
         t = target_of(u, ins)
         if mn != 'call' and va <= t < va + size:
             return
-        if t in transp:
-            return
+        if t in transp or (t == va and mn == 'call'):
+            return     # a self call runs on, recorded as A's own calls (ours runs its own compile)
         r = Rec()
         r.target, r.tail = t, mn != 'call'
         r.indirect = ins.operands[0].type != CX.X86_OP_IMM
@@ -900,6 +930,24 @@ def callee_regs(va):
         r = common.functions().get(va) if va < KVA else None
         _CREGS[va] = [x for x in live_in(va, r['size_i']) if x in REGS] if r else []
     return _CREGS[va]
+
+
+_NARGS = {}
+
+
+def callee_nargs(va):
+    """Dwords of arguments retail function va can read: its live-in registers plus the stack bytes
+    every one of its `ret N` pops. None when not provable (caller-cleaned, mixed or no ret N)."""
+    if va not in _NARGS:
+        r = common.functions().get(va) if va < KVA else None
+        n = None
+        if r:
+            body = common.xbe_read(va, r['size_i']) or b''
+            pops = {(i.operands[0].imm if i.operands else 0) for i in md.disasm(body, va) if i.mnemonic == 'ret'}
+            if len(pops) == 1 and min(pops) > 0:
+                n = len(callee_regs(va)) + min(pops) // 4
+        _NARGS[va] = n
+    return _NARGS[va]
 
 
 JCC = {'jo', 'jno', 'jb', 'jae', 'je', 'jne', 'jbe', 'ja', 'js', 'jns', 'jp', 'jnp', 'jl', 'jge', 'jle', 'jg', 'jecxz'}
@@ -1108,7 +1156,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
     rsl = max([w + (sz + 3) // 4 for k, w, sz in mapping if k == 'stk'], default=0)
     uc.reg_write(X.UC_X86_REG_ESP, new_esp)
     transp = transparent()
-    st = {'ri': 0, 'fail': None, 'n': 0, 'pend': None, 'stub': 0}
+    st = {'ri': 0, 'fail': None, 'n': 0, 'pend': None, 'stub': 0, 'fp': False}
     lo_b, hi_b = BLOB, BLOB + len(b.data)
 
     def fptrs(values, lo, hi):
@@ -1179,9 +1227,11 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                     sig = coff.Sig(sig.cc, ps, sig.ret, sig.is_method, sig.varargs)
                     cl = sig.locations()
         fregs = {x: u.reg_read(UREG[x]) for x in REGS}
-        args, masks = [], []
+        args, masks, fidx = [], [], set()
         if cl is not None:
             for kind, where, sz, pt in cl:
+                if pt == 'float' and sz == 4:
+                    fidx.add(len(args))
                 if kind == 'reg':
                     args.append(fregs[where])
                     masks.append(MASKS.get(pt, 0xFFFFFFFF))
@@ -1212,20 +1262,70 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         r_args = [r.regs[REGS.index(x)] for x in callee_regs(t)] + r.stack[:max(0, (r.popped or 0) // 4)]
         r_fp = fptrs(r_args, r.esp_call, r_hi) or fptrs(r.regs + r.stack, r.esp_call, r_hi)
         b_fp = fptrs(args if cl is not None else args + [fregs['ecx'], fregs['edx']], esp, b_hi)
+        # LTCG drops parameters retail passes as constants (a NULL file, line 0): when retail's callee
+        # provably reads fewer argument dwords than ours passes, that many zero arguments need no match
+        nr = callee_nargs(t) if direct and cl is not None else None
+        spare = max(0, len(args) - nr) if nr is not None else 0
         for i, v in enumerate(args):
             if v in rset or (esp <= v < b_hi and r_fp):
+                continue
+            if v == 0 and spare:
+                spare -= 1
                 continue
             mk = masks[i] if i < len(masks) else 0xFFFFFFFF
             if mk != 0xFFFFFFFF and any((v ^ x) & mk == 0 for x in rset):
                 continue   # a bool/char/short: only its own width is the value
             if lo_b <= v < hi_b and same_pointee(u, v, r.regs + r.stack):
                 continue   # our copy of a literal / constant: same bytes as what retail passed
+            if i in fidx and any(near_float(struct.pack('<I', v), struct.pack('<I', x)) for x in rset):
+                st['fp'] = True   # a float argument a few ulps off (x87 vs SSE rounding): equivalent_fp at best
+                continue
             return stop('call %d to %s: argument %d = %08x, retail passed no such value (retail regs %s; stack %s)' % (
                 st['n'], nearest(t), i, v, ' '.join('%08x' % x for x in r.regs), ' '.join('%08x' % x for x in r.stack[:6])))
+        kmatch = None
+        if direct and cl is not None:
+            # the callee's retail convention is known: each argument must be the value retail passed
+            # in that parameter's place (the check above only asks for it somewhere)
+            kms = [km for km in (MAPS.get(t) or entry_rows(t)) if len(km) == len(cl)]
+            miss = None
+            for km in kms:
+                miss, ai = None, 0
+                for i, (e, (kind, where, sz, pt)) in enumerate(zip(km, cl)):
+                    k0, ai = ai, ai + (1 if kind == 'reg' else (sz + 3) // 4)
+                    if e is None or sz > 4 or (e[0] == 'reg' and e[1] not in REGS) or (e[0] == 'stk' and e[1] >= len(r.stack)):
+                        continue
+                    v, rv = args[k0], r.regs[REGS.index(e[1])] if e[0] == 'reg' else r.stack[e[1]]
+                    mk = masks[k0] if k0 < len(masks) else 0xFFFFFFFF
+                    if (v ^ rv) & mk == 0 or (esp <= v < b_hi and r.esp_call <= rv < r_hi):
+                        continue   # equal, or a frame pointer each side (paired below)
+                    if lo_b <= v < hi_b and same_pointee(u, v, [rv]):
+                        continue
+                    if k0 in fidx and near_float(struct.pack('<I', v), struct.pack('<I', rv)):
+                        st['fp'] = True
+                        continue
+                    miss = (i, v, rv, e)
+                    break
+                if miss is None:
+                    kmatch = km
+                    break
+            if kms and miss is not None:
+                i, v, rv, e = miss
+                return stop('call %d to %s: argument %d = %08x, retail passed %08x there (%s, its retail convention)' % (
+                    st['n'], nearest(t), i, v, rv, e[1] if e[0] == 'reg' else 'stk%d' % e[1]))
         # frame pointers retail passed -> ours: by argument position when both sides pass the same
         # stack layout (and ecx/edx), else in address order
         pairs = {}
-        if cl is not None and sig is not None and (r.popped or 0) == (sig.stack_bytes() or 0):
+        if kmatch is not None:
+            # ... and pairs its frame pointers parameter by parameter (the truth, no alternatives)
+            ai = 0
+            for e, (kind, where, sz, pt) in zip(kmatch, cl):
+                k0, ai = ai, ai + (1 if kind == 'reg' else (sz + 3) // 4)
+                if e is None or sz > 4 or (e[0] == 'reg' and e[1] not in REGS) or (e[0] == 'stk' and e[1] >= len(r.stack)):
+                    continue
+                rv_ = r.regs[REGS.index(e[1])] if e[0] == 'reg' else r.stack[e[1]]
+                if r.esp_call <= rv_ < r_hi and esp <= args[k0] < b_hi and rv_ not in pairs:
+                    pairs[rv_] = args[k0]
+        elif cl is not None and sig is not None and (r.popped or 0) == (sig.stack_bytes() or 0):
             for kind, where, sz, pt in cl:
                 rv_ = r.regs[REGS.index(where)] if kind == 'reg' else r.stack[where // 4] if where // 4 < len(r.stack) else None
                 bv_ = fregs[where] if kind == 'reg' else struct.unpack('<I', u.mem_read(esp + where, 4))[0]
@@ -1233,7 +1333,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                     pairs[rv_] = bv_
         if not pairs:
             pairs = dict(zip(r_fp, b_fp))
-        if info is not None or alt:
+        if (info is not None or alt) and not (kmatch is not None and pairs):
             site = (addr - lo_b, t)
             pr = fp_pairings(u, r, t, direct, sig, cl, fregs, esp, r_hi, b_hi, args)
             if pr is not None:
@@ -1283,7 +1383,10 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         else:
             pops = r.popped or 0
         reax = r.eax
-        if pk and r.esp_call <= reax < r_hi:
+        # a bool/char/short result is only its low bits: the rest of eax is whatever retail's callee
+        # left there, never a pointer into the frame to carry over to ours
+        narrow = sig is not None and sig.ret in ('bool', 'char', 'short')
+        if pk and not narrow and r.esp_call <= reax < r_hi:
             p_ = max((p for p in pk if p <= reax), default=None)
             if p_ is not None:
                 reax = reax - p_ + pairs[p_]
@@ -1322,7 +1425,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         return 'differs', 'retail calls %s next (call %d); ours made no more calls' % (nearest(left[0].target), st['n'] + 1)
     eax, edx = struct.unpack('<II', uc.mem_read(SCR, 8))
     top, sts = fpsave(uc.mem_read(SCR + 16, 108))
-    fp = False
+    fp = st['fp']
     rk = b.sig.ret
     if rk in ('float', 'double'):
         if top != ((top0 - 1) & 7):
@@ -1394,7 +1497,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
 # ---------------------------------------------------------------- driver
 
 
-RCACHE_FORMAT = 6   # bump with any change to what run_retail records
+RCACHE_FORMAT = 7   # 7: self calls are not recorded (they run on). bump with any change to what run_retail records
 
 
 def rcache_format():
@@ -1650,9 +1753,10 @@ def learn_callee(t, va, size, good, snap, decomp, env, deadline):
             pass
     found, complete = None, True
     try:
-        bc = link(obj_for(row['source'], decomp, env), t, row['size_i'], decomp, env)
+        srct = os.path.join(decomp, row['source'])
+        bc = link(obj_for(row['source'], decomp, env), t, row['size_i'], decomp, env, src=srct)
         if bc.sig is not None and bc.sig.params and bc.sig.locations() is None:
-            bc.sig = sized(bc.sig, decomp, env)
+            bc.sig = sized(bc.sig, decomp, env, srct)
         pops = {r.popped for p, root, x, *_ in good for r in x[1] if r.target == t and not r.tail and r.popped is not None}
         P = pops.pop() if len(pops) == 1 else None
         states = []
@@ -1780,8 +1884,11 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             objp = obj_for(os.path.abspath(src), decomp, env, fresh=True, out=out)
         else:
             objp = obj_for(r['source'], decomp, env)
-        b = link(objp, va, size, decomp, env)
+        srcp = os.path.abspath(src) if src else os.path.join(decomp, r['source'])
+        b = link(objp, va, size, decomp, env, src=srcp)
         res['linked'] = ' '.join(b.linked)
+        if b.sig is not None and b.sig.params and b.sig.locations() is None:
+            b.sig = sized(b.sig, decomp, env, srcp)
         if b.sig is not None and b.sig.params and b.sig.locations() is None:
             # by-value structures of unknown size: try one dword each (the snapshots decide)
             ps = [(pt, sz or 4) for pt, sz in b.sig.params]
@@ -1906,7 +2013,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
                 break
             force.add(tv)
             try:
-                b = link(objp, va, size, decomp, env, force=force)
+                b = link(objp, va, size, decomp, env, force=force, src=srcp)
             except Fail:
                 break
             res['linked'] = ' '.join(b.linked)
