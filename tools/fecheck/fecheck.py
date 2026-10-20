@@ -370,6 +370,7 @@ class Blob:
         self.callees = set()  # retail VAs F calls directly (mocked)
         self.linked = []      # names of functions linked in
         self.unlinked = set() # retail VAs retail never calls directly whose source does not build
+        self.run_retail = set() # library routines with no source that ours calls and retail does not: ours runs retail's copy
         self.entry = None
         self.sig = None
         self.name = None
@@ -385,6 +386,49 @@ def with_retbuf(sig):
     ps.insert(at, ('ptr', 4))
     out = coff.Sig(sig.cc, ps, 'ptr', sig.is_method, sig.varargs)
     out.cptr = frozenset(i + (i >= at) for i in getattr(sig, 'cptr', ()))
+    return out
+
+
+_EXTDEFS = {}
+
+
+def extdefs(decomp):
+    """{raw symbol name: [object stems]} of the external code symbols the tree's objects define
+    (cached per object mtime in <objdir>/extdefs.json): a callee with no retail address (retail
+    inlines it everywhere) defined in another decomp source."""
+    od = dbuild.objdir(decomp)
+    if od in _EXTDEFS:
+        return _EXTDEFS[od]
+    cp = os.path.join(od, 'extdefs.json')
+    try:
+        cache = json.load(open(cp))
+    except (OSError, ValueError):
+        cache = {}
+    out, dirty = {}, False
+    for f in sorted(os.listdir(od)) if os.path.isdir(od) else ():
+        if not f.endswith('.obj'):
+            continue
+        stem, mt = f[:-4], os.path.getmtime(os.path.join(od, f))
+        ent = cache.get(stem)
+        if not ent or ent[0] != mt:
+            try:
+                o = coff.Coff(os.path.join(od, f))
+                names = sorted({s.name for s in o.symbols if s.section > 0 and s.sclass == 2 and not s.naux
+                                and o.sections[s.section].flags & coff.SCN_CODE})
+            except Exception:
+                names = []
+            ent = cache[stem] = [mt, names]
+            dirty = True
+        for n in ent[1]:
+            out.setdefault(n, []).append(stem)
+    if dirty:
+        try:
+            tmp = cp + '.%d' % os.getpid()
+            json.dump(cache, open(tmp, 'w'))
+            os.replace(tmp, cp)
+        except OSError:
+            pass
+    _EXTDEFS[od] = out
     return out
 
 
@@ -470,6 +514,14 @@ def link(objp, va, size, decomp, env, force=(), src=None):
                 continue
             if v is not None and typ == coff.IMAGE_REL_I386_REL32 and (v not in rc or v in force) and v not in transp and v != va:
                 cd = (p, t.section) if (t.section > 0 and is_code) else code_def(t.name)
+                row = common.functions(decomp).get(v) if not cd and v not in rc else None
+                if row and not row['source'] and row['owner'].startswith('xdk:libcmt'):
+                    # a CRT routine retail's code never calls here (retail inlined its caller, and the
+                    # routine with it): ours runs retail's own copy, so its effects are compared too
+                    b.run_retail.add(v)
+                    b.linked.append('retail:' + coff.plain_name(t.name))
+                    relocs.append(((p, si), off, typ, ('va', v)))
+                    continue
                 if not cd:
                     b.unlinked.add(v)
                 if cd:   # retail inlined it (or reaches it another way): run our compile of it
@@ -523,6 +575,22 @@ def link(objp, va, size, decomp, env, force=(), src=None):
                     b.data += builtin_code(bn)
                     b.linked.append(bn)
                 target = ('sec', key, 0)
+            if target is None and v is None and t.section <= 0 and typ in (coff.IMAGE_REL_I386_REL32, coff.IMAGE_REL_I386_DIR32):
+                # no retail address (inlined everywhere) and defined in another decomp source: run ours
+                stems = extdefs(decomp).get(t.name)
+                if stems:
+                    st_ = stems[0]
+                    sp = os.path.join('src', 'stubs', st_[7:] + '.cpp') if st_.startswith('stubs__') else os.path.join('src', st_ + '.cpp')
+                    try:
+                        xp = obj_for(sp, decomp, env)
+                        xo = get(xp)
+                        xs = next((s for s in xo.symbols if s.name == t.name and _code_sym(xo, s)), None)
+                    except (Fail, OSError):
+                        xs = None
+                    if xs is not None:
+                        place(xp, xs.section)
+                        b.linked.append(coff.plain_name(t.name))
+                        target = ('sec', (xp, xs.section), xs.value)
             if target is None:
                 unresolved.add(coff.plain_name(t.name))
                 continue
@@ -1208,7 +1276,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
             if lo_b <= t < hi_b or not jcc_taken(mn, u.reg_read(X.UC_X86_REG_EFLAGS), u.reg_read(X.UC_X86_REG_ECX)):
                 return     # a conditional tail call (jne function) that is taken: handled like jmp
         t = target_of(u, ins)
-        if lo_b <= t < hi_b or t in transp:
+        if lo_b <= t < hi_b or t in transp or t in b.run_retail:
             return
         tail = mn != 'call'
         direct = ins.operands[0].type == CX.X86_OP_IMM
