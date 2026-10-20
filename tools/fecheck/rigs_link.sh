@@ -103,7 +103,14 @@ boot() { local c=$1 mac; [ $c = A ] && mac=$MACA || mac=$MACB
   for k in 1 2; do start $c $mac ${WD:-5400} && waittitle && return 0
     [ -n "${PID[$c]}" ] && taskkill //F //PID ${PID[$c]} > /dev/null 2>&1; PID[$c]=; sleep 5; done; return 1; }
 # userbusy: the owner is playing (a ReSkate / Skate.exe process): the rig waits between scenarios
-userbusy() { tasklist 2>/dev/null | grep -qi "^skate.exe"; }
+userbusy() {
+  tasklist 2>/dev/null | grep -qi "^skate.exe" && return 0
+  # any h2fe.exe the rig did not start (the owner's own copy)
+  local p; for p in $(tasklist //FI "IMAGENAME eq $EXE" //FO CSV //NH 2>/dev/null | cut -d, -f2 | tr -d '"'); do
+    case " ${PID[*]} " in *" $p "*) ;; *) return 0 ;; esac
+  done
+  return 1
+}
 # scr: classify the current frame against link_refs (title profiles signin mainmenu players
 # available lobby setup gametype variant selmap gamemenu carnage ingame exitdlg black); prints
 # "<name> <distance>" (a distance over 30 is no known screen)
