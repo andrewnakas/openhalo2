@@ -173,6 +173,46 @@ def kernel():
     return _KERNEL
 
 
+def rc4_key(u, ctx, n, key):
+    """XcRC4Key (ordinal 338) as the snapshot runtime implements it (xboxrecomp kernel_crypto.c):
+    context = S[256], i, j."""
+    if not ctx or not key or not n:
+        return
+    k = bytes(u.mem_read(key, n))
+    s = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + s[i] + k[i % n]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    u.mem_write(ctx, bytes(s) + bytes(2))
+    return [(ctx, 258)]
+
+
+def rc4_crypt(u, ctx, n, data):
+    """XcRC4Crypt (ordinal 339): the RC4 keystream xored into data in place."""
+    if not ctx or not data or not n:
+        return
+    c = bytearray(u.mem_read(ctx, 258))
+    d = bytearray(u.mem_read(data, n))
+    s, i, j = c, c[256], c[257]
+    for x in range(n):
+        i = (i + 1) & 0xFF
+        j = (j + s[i]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+        d[x] ^= s[(s[i] + s[j]) & 0xFF]
+    c[256], c[257] = i, j
+    u.mem_write(ctx, bytes(c))
+    u.mem_write(data, bytes(d))
+    return [(ctx, 258), (data, n)]
+
+
+# kernel exports with an effect the game depends on: ordinal -> fn(uc, *stack args); same on both sides
+KERNEL_EMU = {338: rc4_key, 339: rc4_crypt}
+# id(uc) -> fn(addr, size): told of the writes KERNEL_EMU makes (mem_write fires no write hook), so the
+# retail run records them among a callee's writes
+KWRITE = {}
+
+
 def kernel_hook(uc):
     slots = kernel()[0]
     st = {'last': None}
@@ -183,6 +223,14 @@ def kernel_hook(uc):
             return
         o, n = slots.get((addr - KVA) // 4, (0, 0))
         ret = u32(u, esp)
+        if o in KERNEL_EMU:
+            try:
+                ws = KERNEL_EMU[o](u, *[u32(u, esp + 4 + 4 * k) for k in range(n // 4)]) or []
+            except UcError:
+                ws = []   # an unmapped context or buffer: no effect, as before
+            for a_, n_ in ws:
+                if id(u) in KWRITE:
+                    KWRITE[id(u)](a_, n_)
         u.reg_write(X.UC_X86_REG_EAX, 0)
         u.reg_write(X.UC_X86_REG_ESP, esp + 4 + n)
         st['last'] = (addr, esp + 4 + n)
@@ -971,11 +1019,14 @@ def run_retail(s, va, size):
     uc.hook_add(UC_HOOK_CODE, on_code, begin=va, end=va + size - 1)
     uc.hook_add(UC_HOOK_CODE, lambda u, a, n, d: st.__setitem__('fsran', True), begin=CODE_LO, end=CODE_LO + CODE_N * 64 - 1)
     uc.hook_add(UC_HOOK_MEM_WRITE, on_w)
+    KWRITE[id(uc)] = lambda a_, n_: on_w(uc, None, a_, n_, 0, None)
     top0 = (uc.reg_read(X.UC_X86_REG_FPSW) >> 11) & 7
     try:
         uc.emu_start(va, SENT_END, timeout=120_000_000, count=CAP)
     except UcError as e:
         raise Fail('untestable: retail %s at %08x' % (e, uc.reg_read(X.UC_X86_REG_EIP)))
+    finally:
+        KWRITE.pop(id(uc), None)
     if uc.reg_read(X.UC_X86_REG_EIP) != SENT_END:
         raise Fail('untestable: retail did not return (cap) at %08x' % uc.reg_read(X.UC_X86_REG_EIP))
     eax, edx = struct.unpack('<II', uc.mem_read(SCR, 8))
@@ -1601,6 +1652,8 @@ def rcache_format():
     routines (they run for real and are never recorded as calls)."""
     import hashlib
     h = hashlib.sha1(repr((sorted(TRANSPARENT_NAMES), sorted(ALIASES.items()), sorted(transparent()))).encode()).hexdigest()[:12]
+    if KERNEL_EMU:   # kernel exports with an emulated effect (retail runs recorded before them lack it)
+        h += 'k' + '.'.join(map(str, sorted(KERNEL_EMU)))
     return '%d:%s' % (RCACHE_FORMAT, h)
 
 
