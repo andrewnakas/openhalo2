@@ -53,7 +53,8 @@ CAP = int(os.environ.get("FECHECK_CAP", 30_000_000))
 BLOB_CAP = 8_000_000      # ours: a wrong entry mapping usually loops; keep it short
 RESULTS = os.path.join(common.WORK, 'results')
 DEBUG = bool(os.environ.get('FECHECK_DEBUG'))
-RCACHE = os.path.join(common.WORK, 'rcache_v5')   # bump when retail recording changes
+# bump when retail recording changes (v6: entries before v6 lack the xmm call arguments, Rec.xlo)
+RCACHE = os.path.join(common.WORK, 'rcache_v6')
 REGS = ['eax', 'ecx', 'edx', 'ebx', 'esi', 'edi']
 UREG = {r: getattr(X, 'UC_X86_REG_' + r.upper()) for r in REGS + ['esp', 'ebp', 'eip']}
 TRANSPARENT_NAMES = ['__chkstk', '_memcpy', '__allmul', '__aulldiv', '__alldiv', '__ftol2', '__aullshr', '__allshr',
@@ -110,6 +111,19 @@ def _libm_sse2(ci, two):
 for _f, _two in (('sqrt', 0), ('sin', 0), ('cos', 0), ('tan', 0), ('acos', 0), ('asin', 0), ('atan', 0),
                  ('log', 0), ('log10', 0), ('exp', 0), ('atan2', 1), ('pow', 1)):
     BUILTINS['_libm_sse2_%s_precise' % _f] = _libm_sse2('_CI' + _f, _two)
+
+
+def builtin_code(name):
+    """A builtin's bytes. __libm_sse2_pow_precise runs retail's own _CIpow (x87 with every IEEE
+    edge case: pow(0,y>0)=0, pow(x,0)=1, negative bases with integer y, infinities) when the symbol
+    map knows it; transparent, so it runs for real as on retail's side."""
+    if name == '_libm_sse2_pow_precise':
+        ci = table().get('_CIpow')
+        if ci is not None:
+            return (bytes.fromhex('83ec10' 'f20f110424' 'f20f114c2408' 'dd0424' 'dd442408')   # st1 = x, st0 = y
+                    + bytes([0xB8]) + struct.pack('<I', ci) + bytes.fromhex('ffd0')        # mov eax, _CIpow; call eax
+                    + bytes.fromhex('dd1c24' 'f20f100424' '83c410' 'c3'))
+    return BUILTINS[name]
 
 
 class Fail(Exception):
@@ -431,7 +445,7 @@ def link(objp, va, size, decomp, env, force=()):
                             while len(b.data) % 16:
                                 b.data.append(0xCC)
                             b.placed[key] = BLOB + len(b.data)
-                            b.data += BUILTINS[bare]
+                            b.data += builtin_code(bare)
                             b.linked.append(bare)
                         fv = b.placed[key]
                     if fv is not None:        # an XAPI routine: a pointer cell like the import table's
@@ -449,7 +463,7 @@ def link(objp, va, size, decomp, env, force=()):
                     while len(b.data) % 16:
                         b.data.append(0xCC)
                     b.placed[key] = BLOB + len(b.data)
-                    b.data += BUILTINS[bn]
+                    b.data += builtin_code(bn)
                     b.linked.append(bn)
                 target = ('sec', key, 0)
             if target is None:
@@ -1007,6 +1021,59 @@ def fp_pairings(u, r, t, direct, sig, cl, fregs, esp, r_hi, b_hi, args):
     return sound, cands, val
 
 
+OBS = {}               # callee VA -> call-site observations (observe) for learn_callee
+
+
+def observe(u, t, cl, r, fregs, esp, b_hi, r_hi, lo_b, hi_b, fmap):
+    """What one mocked call tells about callee t's retail convention: per parameter, our value
+    and whether it is one of our frame pointers; retail's registers, stack words and frame.
+    Grouped by F's entry mapping (fmap): under a wrong one F passes wrong values."""
+    obs = OBS.setdefault(t, {}).setdefault(fmap, [])
+    if len(obs) >= 6 or len(OBS[t]) > 24:
+        return
+    vals = []
+    for kind, where, sz, pt in cl:
+        v = fregs[where] if kind == 'reg' else struct.unpack('<I', u.mem_read(esp + where, 4))[0]
+        vals.append((v, esp <= v < b_hi, lo_b <= v < hi_b))
+    key = (tuple(r.regs), tuple(r.stack[:16]), tuple(vals))
+    if any(o['key'] == key for o in obs):
+        return
+    obs.append(dict(key=key, vals=vals, regs=list(r.regs), stack=list(r.stack), xlo=list(r.xlo or []),
+                    lo=r.esp_call, hi=r_hi, popped=r.popped))
+
+
+UNSURE = ('unsure',)   # info key: callees met at uncertain sites whose convention is not known yet
+MAPS = {}              # callee VA -> [[(kind, where) per parameter]] retail conventions ([] = none found)
+
+
+def known_pairings(t, cl, r, val):
+    """Frame-pointer pairings from the callee's known retail convention: retail's value in the
+    location of parameter i pairs with ours for parameter i. [(locmap, {retail fp: ours fp})] or
+    None when no known convention fits this call."""
+    out = []
+    for km in MAPS.get(t) or []:
+        if len(km) != len(cl):
+            continue
+        lm, pm = [], {}
+        for e, (ok_, ow, sz, pt) in zip(km, cl):
+            if e is None:
+                continue
+            rk, rw = e
+            if sz > 4 or (rk == 'reg' and rw not in REGS) or (ok_ == 'reg' and ow not in REGS):
+                continue
+            if rk == 'stk' and rw >= len(r.stack):
+                continue
+            rl, ol = ('r', rw) if rk == 'reg' else ('s', rw), ('r', ow) if ok_ == 'reg' else ('s', ow)
+            a, b_ = val(rl, ol)
+            if a is None or b_ is None or a in pm:
+                continue
+            lm.append((rl, ol))
+            pm[a] = b_
+        if pm and all(c[0] != tuple(lm) for c in out):
+            out.append((tuple(lm), pm))
+    return out or None
+
+
 def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
     """alt: call site -> frame-pointer pairing to use there (see fp_pairings); info: dict that
     collects, per call site whose positional pairing is not certain, the alternative pairings."""
@@ -1121,7 +1188,12 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                 else:
                     w_ = list(struct.unpack('<%dI' % ((sz + 3) // 4), u.mem_read(esp + where, (sz + 3) & ~3)))
                     args += w_
-                    masks += [MASKS.get(pt, 0xFFFFFFFF)] * len(w_)
+                    if pt.startswith('struct') and sz < 4:
+                        # a by-value structure smaller than a dword: only sizeof bytes are the value
+                        # (retail pushes a register and stores the byte: the rest is garbage)
+                        masks.append((1 << (8 * sz)) - 1)
+                    else:
+                        masks += [MASKS.get(pt, 0xFFFFFFFF)] * len(w_)
         else:
             # retail's pops are exact for callee-cleaned calls (thiscall/stdcall/fastcall); an
             # indirect call that popped nothing is a virtual call without stack arguments.
@@ -1175,7 +1247,16 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                     if got:
                         pairs = got
                 elif info is not None and not sound:
-                    cs = [c for c in cands if {k: v for k, v in pairs.items() if k in c[1]} != c[1]]
+                    kl = known_pairings(t, cl, r, val) if direct and cl is not None else None
+                    if kl is None:
+                        if direct and cl is not None and t not in MAPS:
+                            info.setdefault(UNSURE, set()).add(t)   # its convention may be learnable
+                            observe(u, t, cl, r, fregs, esp, b_hi, r_hi, lo_b, hi_b, tuple(mapping))
+                        cs = [c for c in cands if {k: v for k, v in pairs.items() if k in c[1]} != c[1]]
+                    else:
+                        # the callee's retail convention is known: pair parameter by parameter, and
+                        # only that way (an open search could hide a source that swaps outputs)
+                        cs = [c for c in kl if {k: v for k, v in pairs.items() if k in c[1]} != c[1]]
                     if cs and site not in info:
                         info[site] = [c[0] for c in cs]
         pk = sorted(pairs)
@@ -1187,10 +1268,14 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
             if r.esp_call - 0x40000 <= a < r.esp_call:
                 continue                       # the callee's own stack
             if r.esp_call <= a < r_hi:         # retail's frame -> ours
-                p_ = max((p for p in pk if p <= a), default=None)
-                if p_ is None:
-                    continue
-                a = a - p_ + pairs[p_]
+                # a merged write can span several paired pointers (adjacent out-variables):
+                # each piece goes through the pointer it starts at or after
+                cuts = [a] + [p for p in pk if a < p < a + len(data)] + [a + len(data)]
+                for lo, hi in zip(cuts, cuts[1:]):
+                    p_ = max((p for p in pk if p <= lo), default=None)
+                    if p_ is not None:
+                        u.mem_write(lo - p_ + pairs[p_], data[lo - a:hi - a])
+                continue
             u.mem_write(a, data)
         if sig is not None and cl is not None:
             pops = sig.stack_bytes() if sig.callee_pops() else 0
@@ -1284,6 +1369,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
             continue
         words = sorted({int(x) & ~3 for x in bad})
         allok, anyfp = len(words) <= 4096, False
+        badw = None
         for w in words if allok else []:
             rw, bw = word_at(base, ri_, rv, w), word_at(base, bi, bv, w)
             bp = struct.unpack('<I', bw)[0]
@@ -1293,11 +1379,12 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                 anyfp = True
                 continue
             allok = False
+            badw = w
             break
         if allok:
             fp = fp or anyfp
             continue
-        a0 = int(bad[0])
+        a0 = int(bad[0]) if badw is None else badw   # the first word that is not a near-equal float
         return 'differs', 'memory: %d bytes differ, first %08x (%s): retail %s ours %s; last %08x' % (
             len(bad), a0 + off, nearest(a0 + off), word_at(base, ri_, rv, a0 & ~3).hex(),
             word_at(base, bi, bv, a0 & ~3).hex(), int(bad[-1]) + off)
@@ -1307,13 +1394,28 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
 # ---------------------------------------------------------------- driver
 
 
+RCACHE_FORMAT = 6   # bump with any change to what run_retail records
+
+
+def rcache_format():
+    """The recording format of a retail cache entry: the format number plus the transparent
+    routines (they run for real and are never recorded as calls)."""
+    import hashlib
+    h = hashlib.sha1(repr((sorted(TRANSPARENT_NAMES), sorted(ALIASES.items()), sorted(transparent()))).encode()).hexdigest()[:12]
+    return '%d:%s' % (RCACHE_FORMAT, h)
+
+
 def retail_cached(path, root, va, size):
     os.makedirs(RCACHE, exist_ok=True)
     key = os.path.join(RCACHE, '%s__%s.pkl' % (os.path.relpath(root, common.SNAPS).replace(os.sep, '_').replace('/', '_'), os.path.basename(path)))
     # a store re-captured later reuses snapshot names: a cache entry older than its snapshot is stale
     if os.path.exists(key) and os.path.getmtime(key) >= os.path.getmtime(path):
         try:
-            return pickle.load(open(key, 'rb'))
+            got = pickle.load(open(key, 'rb'))
+            # an entry recorded under another recording format (or another set of routines that
+            # run for real instead of being recorded as calls) is rerun
+            if isinstance(got, tuple) and len(got) == 3 and got[0] == 'fecheck-rcache' and got[1] == rcache_format():
+                return got[2]
         except Exception:
             pass
     s = snapstore.load(path, root)
@@ -1322,7 +1424,7 @@ def retail_cached(path, root, va, size):
     except Fail as e:
         out = str(e)
     tmp = key + '.%d' % os.getpid()
-    pickle.dump(out, open(tmp, 'wb'))
+    pickle.dump(('fecheck-rcache', rcache_format(), out), open(tmp, 'wb'))
     os.replace(tmp, key)
     return out
 
@@ -1352,6 +1454,291 @@ def known_maps(va, sig):
             m.append(('stk', int(w[3:]), sz) if w.startswith('stk') else ('reg', w, sz))
         out.append(m)
     return out
+
+
+def parse_map(text):
+    """'p0<-ecx, p1<-stk0' (fmt_map) -> [('reg', 'ecx'), ('stk', 0)]."""
+    out = []
+    for part in text.replace('+retbuf', '').split(','):
+        part = part.strip()
+        if not part:
+            continue
+        w = part.split('<-')[1].strip()
+        out.append(('stk', int(w[3:])) if w.startswith('stk') else ('reg', w))
+    return out
+
+
+def map_pops(km, loc):
+    """Stack bytes a callee with retail convention km (sizes from loc) pops."""
+    return 4 * max([e[1] + (l[2] + 3) // 4 for e, l in zip(km, loc) if e and e[0] == 'stk'], default=0)
+
+
+_RESMAPS = {}
+
+
+def entry_rows(t):
+    """t's maps in entry_maps.csv (read off retail's disassembly: trusted as the convention)."""
+    known_maps(t, None)
+    out = []
+    for text in _KNOWN.get(t, []):
+        km = parse_map(text)
+        if km not in out:
+            out.append(km)
+    return out
+
+
+def result_maps(t):
+    """Entry maps of t that a check found equivalent (any tree). Only candidates: a check takes the
+    first mapping that agrees, and a parameter its runs never tell apart may sit anywhere."""
+    if t not in _RESMAPS:
+        import glob
+        seen = []
+        for f in sorted(glob.glob(os.path.join(RESULTS, '%08x*.json' % t)), key=os.path.getmtime, reverse=True):
+            try:
+                d = json.load(open(f))
+            except (OSError, ValueError):
+                continue
+            if d.get('va') == '%08x' % t and str(d.get('verdict', '')).startswith('equivalent') and d.get('mapping'):
+                km = parse_map(d['mapping'])
+                if km not in seen:
+                    seen.append(km)
+        _RESMAPS[t] = seen
+    return _RESMAPS[t]
+
+
+def call_states(s, va, size, t, n):
+    """Machine states at the entry of retail's direct calls from A (va) to t, from retail A's run
+    on snapshot s: snapshot-like dicts the callee can be checked on (at most n)."""
+    uc, ram, con = machine(s)
+    esp0 = s['esp']
+    uc.mem_write(esp0, struct.pack('<I', SENT))
+    out = []
+
+    def on_t(u, addr, size_, d):
+        esp = u.reg_read(X.UC_X86_REG_ESP)
+        if not va <= u32(u, esp) < va + size:
+            return                       # a nested call, not one A makes
+        ds = {r: u.reg_read(UREG[r]) for r in REGS + ['ebp', 'esp']}
+        ds['xmm'] = [u.reg_read(getattr(X, 'UC_X86_REG_XMM%d' % i)).to_bytes(16, 'little') for i in range(8)]
+        ds['fpcw'] = u.reg_read(X.UC_X86_REG_FPCW)
+        ds['fs_base'] = s['fs_base']
+        ds['ram'] = np.array(ram[:len(s['ram'])])
+        ds['contig'] = np.array(con[:len(s['contig'])])
+        ds['path'] = '%s@%08x#%d' % (s.get('path', ''), t, len(out))
+        out.append(ds)
+        if len(out) >= n:
+            u.emu_stop()
+    uc.hook_add(UC_HOOK_CODE, on_t, begin=t, end=t)
+    try:
+        uc.emu_start(va, SENT_END, timeout=60_000_000, count=CAP)
+    except UcError:
+        pass
+    return out
+
+
+LEARN_DIR = os.path.join(common.WORK, 'callee_maps')
+FAR = 24   # stack slot given to a parameter retail does not pass
+
+
+def site_candidates(t, sig, P, live, cap=3000):
+    """Retail conventions for callee t (sig = its declaration) consistent with the calls observed
+    (OBS[t]): a parameter whose value is not one of our frame pointers sits where retail held the
+    same value (its own width for bool/char/short), a frame pointer where retail held one of its
+    frame pointers; stack parameters keep their order and fill exactly the P bytes retail's t pops
+    (P None: unknown); registers among t's live-in ones. A parameter nothing fits is not passed
+    (a far stack slot: it must not matter)."""
+    loc = sig.locations()
+    if loc is None:
+        return []
+    out = []
+    for obs in (OBS.get(t) or {}).values():   # one entry mapping of F at a time
+        for m in _site_candidates(obs, loc, P, live, cap):
+            if m not in out:
+                out.append(m)
+            if len(out) >= cap:
+                return out
+    return out
+
+
+def _site_candidates(obs, loc, P, live, cap):
+    nslot = P // 4 if P else None
+    allowed = []
+    for i, (kind, where, sz, pt) in enumerate(loc):
+        if sz > 4:
+            allowed.append(None)          # stack only, the next slot
+            continue
+        mask = MASKS.get(pt, 0xFFFFFFFF)
+        locs = [('reg', x) for x in live if x in REGS] + [('stk', k) for k in range(nslot if nslot is not None else 16)]
+        if pt == 'float':
+            locs += [('reg', x) for x in live if x in XREGS]
+        ok = []
+        for l in locs:
+            good = True
+            for o in obs:
+                v, isfp, isblob = o['vals'][i]
+                if isblob:
+                    continue              # our copy of a literal: any place
+                if l[0] == 'reg':
+                    rv = o['regs'][REGS.index(l[1])] if l[1] in REGS else (o['xlo'][XREGS.index(l[1])] if o['xlo'] else None)
+                else:
+                    rv = o['stack'][l[1]] if l[1] < len(o['stack']) else None
+                if rv is None:
+                    good = False
+                elif isfp:
+                    good = o['lo'] <= rv < o['hi']
+                else:
+                    good = ((rv ^ v) & mask) == 0
+                if not good:
+                    break
+            if good:
+                ok.append(l)
+        allowed.append(ok)
+    out = []
+
+    def rec(i, used, last_slot, m):
+        if len(out) >= cap:
+            return
+        if i == len(loc):
+            cover = []
+            for k_, w_, sz_ in m:
+                if k_ == 'stk' and w_ < FAR:
+                    cover += list(range(w_, w_ + (sz_ + 3) // 4))
+            if nslot is not None and sorted(cover) != list(range(nslot)):
+                return
+            if nslot is None and cover and sorted(cover) != list(range(len(cover))):
+                return
+            out.append(list(m))
+            return
+        sz = loc[i][2]
+        opts = allowed[i]
+        if opts is None:
+            opts = [('stk', last_slot + 1)]
+        for l in opts:
+            if l in used:
+                continue
+            if l[0] == 'stk':
+                if l[1] <= last_slot or (nslot is not None and l[1] + (sz + 3) // 4 > nslot):
+                    continue
+                rec(i + 1, used | {l}, l[1] + (sz + 3) // 4 - 1, m + [('stk', l[1], sz)])
+            else:
+                rec(i + 1, used | {l}, last_slot, m + [('reg', l[1], sz)])
+        if not opts:
+            rec(i + 1, used, last_slot, m + [('stk', FAR + i, sz)])   # not passed
+    rec(0, frozenset(), -1, [])
+    return out
+
+
+def learn_callee(t, va, size, good, snap, decomp, env, deadline):
+    """The retail convention of callee t, learned by checking t's own source against retail t on
+    the states retail A reaches at its calls to t: every entry mapping that pops the bytes retail's
+    t pops and under which ours agrees with retail on every such state. Kept only when they all
+    agree on each pointer parameter's location (None elsewhere for parameters they do not pin)."""
+    row = common.functions(decomp).get(t)
+    if not row or not row['source'] or t in transparent():
+        return None
+    srcp = os.path.join(decomp, row['source'])
+    import hashlib
+    ck = os.path.join(LEARN_DIR, '%08x_%s.json' % (t, hashlib.sha1(('%s|%s|%s|%s|%08x|%r' % (
+        os.path.abspath(decomp).lower(), os.path.getmtime(srcp) if os.path.exists(srcp) else 0,
+        dbuild.newest_header(decomp), rcache_format(), va,
+        sorted(repr([o['key'] for o in g]) for g in (OBS.get(t) or {}).values()))).encode()).hexdigest()[:12]))
+    if os.path.exists(ck):
+        try:
+            v = json.load(open(ck))
+            return [tuple(x) if x else None for x in v] if v else None
+        except (OSError, ValueError):
+            pass
+    found, complete = None, True
+    try:
+        bc = link(obj_for(row['source'], decomp, env), t, row['size_i'], decomp, env)
+        if bc.sig is not None and bc.sig.params and bc.sig.locations() is None:
+            bc.sig = sized(bc.sig, decomp, env)
+        pops = {r.popped for p, root, x, *_ in good for r in x[1] if r.target == t and not r.tail and r.popped is not None}
+        P = pops.pop() if len(pops) == 1 else None
+        states = []
+        for p, root, x, *_ in good:
+            if any(r.target == t for r in x[1]):
+                states += call_states(snap(p, root), va, size, t, 3 - len(states))
+            if len(states) >= 3:
+                break
+        uniq = {}
+        for ds in states:   # retail often reaches the same call state from several snapshots
+            k_ = (tuple(ds[r] for r in REGS + ['ebp', 'esp']), bytes(ds['ram'][ds['esp']:ds['esp'] + 0x800]))
+            uniq.setdefault(k_, ds)
+        states = list(uniq.values())
+        runs = []
+        for ds in states:
+            try:
+                runs.append((ds, run_retail(ds, t, row['size_i'])))
+            except Fail:
+                pass
+        if runs and bc.sig is not None and bc.sig.locations() is not None:
+            live, live2 = live_in(t, row['size_i']), live_in(t, row['size_i'], through=True)
+            sigs = [bc.sig] + ([with_retbuf(bc.sig)] if bc.sig.ret == 'struct' and with_retbuf(bc.sig) else [])
+            agree = []
+            for sg in sigs:
+                bc.sig = sg
+                loc = sg.locations()
+                ms = site_candidates(t, sg, P, live2)
+                for m in ms:
+                    if time.time() > deadline:
+                        complete = False
+                        break
+                    km = [(k, w) for k, w, sz in m]
+                    if all(run_blob(ds, bc, m, rr[0], rr[1])[0].startswith('equivalent') for ds, rr in runs):
+                        agree.append(([(k, w) if k == 'reg' or w < FAR else None for k, w, sz in m],
+                                      [l[3] for l in loc]))
+                if agree or not complete:
+                    break
+            if DEBUG:
+                print('    learn %s: %d states, %d runs, %d candidates tried, %d agree %s' % (
+                    nearest(t), len(states), len(runs), len(ms), len(agree), [fmt_map([(k, w, 4) if (k, w) != (None, None) else ('stk', 99, 4) for k, w in [e or (None, None) for e in km]]) for km, _ in agree[:4]]))
+                if not agree:
+                    for m in ms[:3]:
+                        print('      e.g. %s -> %s' % (fmt_map(m), [run_blob(ds, bc, m, rr[0], rr[1])[1][:200] for ds, rr in runs[:1]]))
+            # every mapping that agrees must put each pointer parameter in the same place: when the
+            # callee only hands its output pointers on to its own (mocked) callees, its runs cannot
+            # tell them apart, and a first-agreeing guess could pair a caller's outputs wrongly
+            if complete and agree and len({len(km) for km, pts in agree}) == 1:
+                km0, pts = agree[0]
+                out = []
+                for i, pt in enumerate(pts):
+                    where = {km[i] for km, _ in agree}
+                    if len(where) == 1:
+                        out.append(km0[i])
+                    elif pt == 'ptr':
+                        out = None
+                        break
+                    else:
+                        out.append(None)   # an argument the runs do not pin down
+                found = out
+    except Fail:
+        found = None
+    if complete:   # a timeout is not a result
+        try:
+            os.makedirs(LEARN_DIR, exist_ok=True)
+            json.dump(found, open(ck, 'w'))
+        except OSError:
+            pass
+    return found
+
+
+def ensure_maps(ts, b, va, size, good, snap, decomp, env, deadline):
+    """MAPS[t] for each callee t: its entry_maps.csv rows that fit our declaration and the bytes
+    retail's t popped at A's calls, else the one learn_callee finds."""
+    for t in ts:
+        if t in MAPS:
+            continue
+        sig = b.callee_sig.get(t)
+        locs = [x.locations() for x in [sig] + ([with_retbuf(sig)] if sig is not None and sig.ret == 'struct' else [])
+                if x is not None and x.locations() is not None]
+        pops = {r.popped for p, root, x, *_ in good for r in x[1] if r.target == t and not r.tail and r.popped is not None}
+        P = pops.pop() if len(pops) == 1 else None
+        ok = [km for km in entry_rows(t) if any(len(km) == len(l) and (not P or map_pops(km, l) == P) for l in locs)]
+        if not ok:
+            km = learn_callee(t, va, size, good, snap, decomp, env, deadline)
+            ok = [km] if km else []
+        MAPS[t] = ok
 
 
 def fmt_alts(alts):
@@ -1423,7 +1810,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             """Run one snapshot again under alternative frame-pointer pairings at the call sites
             whose positional pairing is uncertain (todo: site -> locmaps). Combinations over the
             sites, fewest changed sites first, capped; the first whole run that agrees wins."""
-            sites = [k for k in todo if k not in alts][:5]
+            sites = [k for k in todo if k != UNSURE and k not in alts and todo[k]][:5]
             combos = []
             for nchg in range(1, len(sites) + 1):
                 for ss in itertools.combinations(sites, nchg):
@@ -1432,7 +1819,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
                         if len(combos) >= 2 * PAIR_CAP:
                             break
             for c in combos[:2 * PAIR_CAP]:
-                if time.time() - t0 > budget:
+                if time.time() > lim['end']:
                     break
                 a2 = {**alts, **c}
                 v, d = run_blob(snap(p, root), b, m, x[0], x[1], alt=a2)
@@ -1454,7 +1841,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
                 if live2 != live:
                     ms += [m_ for m_ in candidates(sg, live2) if m_ not in ms]
                 for m in ms:
-                    if first is not None and time.time() - t0 > budget:
+                    if first is not None and time.time() > lim['end']:
                         break
                     mk = (id(b), fmt_map(m), len(sg.params or []))
                     if retry and mk not in amb_seen:
@@ -1463,6 +1850,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
                     for p, root, x, why in good:   # a mapping must hold on every snapshot
                         info = {}
                         v, d = run_blob(snap(p, root), b, m, x[0], x[1], alt=alts or None, info=info)
+                        unsure_t.update(info.get(UNSURE, ()))
                         if not v.startswith('equivalent') and info:
                             if not retry:
                                 amb_seen.add(mk)
@@ -1489,6 +1877,8 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             return first, chosen
 
         amb_seen = set()
+        unsure_t = set()
+        lim = {'end': t0 + budget}
 
         def search2(b):
             first, chosen = search(b)
@@ -1498,6 +1888,12 @@ def check(va, decomp, env, src=None, k=6, budget=240):
                     pv = dict(res, verdict='differs', detail='%s: %s' % first[1], mapping=fmt_map(first[0]),
                               tag=SAVE_TAG, t=round(time.time() - t0, 1))
                     save(pv)
+                new = [t_ for t_ in sorted(unsure_t) if t_ not in MAPS]
+                if new:
+                    # callees met at uncertain pairings: their retail conventions (known or learned)
+                    ensure_maps(new, b, va, size, good, snap, decomp, env, time.time() + 150)
+                    if any(MAPS.get(t_) for t_ in new):
+                        lim['end'] = max(lim['end'], time.time() + 120)   # room for the pairings they give
                 f2, chosen = search(b, retry=True)
             return first, chosen
         force = set()
@@ -1529,6 +1925,11 @@ def check(va, decomp, env, src=None, k=6, budget=240):
                                                           ' (%d retail runs untestable)' % (len(rr) - len(good)))
             if res.get('pairing'):
                 res['detail'] += ' [frame pointers paired: %s]' % res['pairing']
+        if unsure_t:
+            res['callee_maps'] = '; '.join('%s: %s' % (nearest(t_), ' | '.join(
+                ', '.join('p%d<-%s' % (i, '?' if e is None else e[1] if e[0] == 'reg' else 'stk%d' % e[1])
+                          for i, e in enumerate(km)) for km in MAPS[t_]) or 'unknown')
+                for t_ in sorted(unsure_t) if t_ in MAPS)
     except Fail as e:
         res['verdict'], _, res['detail'] = str(e).partition(': ')
     res['t'] = round(time.time() - t0, 1)
