@@ -105,8 +105,9 @@ boot() { local c=$1 mac; [ $c = A ] && mac=$MACA || mac=$MACB
 # userbusy: the owner is playing (a ReSkate / Skate.exe process): the rig waits between scenarios
 userbusy() {
   tasklist 2>/dev/null | grep -qi "^skate.exe" && return 0
-  # any h2fe.exe the rig did not start (the owner's own copy)
-  local p; for p in $(tasklist //FI "IMAGENAME eq $EXE" //FO CSV //NH 2>/dev/null | cut -d, -f2 | tr -d '"'); do
+  # any h2fe.exe the rig did not start (the owner's own copy); with none running, tasklist prints
+  # an INFO line whose words are not PIDs (they made the rig wait forever)
+  local p; for p in $(tasklist //FI "IMAGENAME eq $EXE" //FO CSV //NH 2>/dev/null | cut -d, -f2 | tr -d '"' | grep -E '^[0-9]+$'); do
     case " ${PID[*]} " in *" $p "*) ;; *) return 0 ;; esac
   done
   return 1
