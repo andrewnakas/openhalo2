@@ -490,6 +490,49 @@ def extdefs(decomp):
     return out
 
 
+def retail_vtable(oo, si, off):
+    """Retail's copy of the vtable at offset off of section si of object oo, found by its contents.
+    The slots whose functions have retail addresses (the others are wildcards) are matched against
+    retail's data sections. Returns (va, []) when exactly one place matches every known slot (at
+    least two), (va, [(slot, ours, retail)]) for a unique place matching all but a few of at least
+    eight known slots (not used for linking: it names the decomp's wrong slots), else None."""
+    sec = oo.sections[si]
+    n = (len(sec.data) - off) // 4
+    if n <= 0:
+        return None
+    slots = [None] * n
+    for roff, symi, typ in sec.relocs:
+        if typ != coff.IMAGE_REL_I386_DIR32 or roff < off or (roff - off) % 4 or (roff - off) // 4 >= n:
+            continue
+        t = oo.by_index[symi]
+        v = resolve(t.name)
+        if v is None and t.sclass == 105 and t.naux:
+            d = oo.by_index.get(struct.unpack_from('<I', t.aux[0], 0)[0])
+            v = resolve(d.name) if d is not None else None
+        slots[(roff - off) // 4] = v
+    known = [(i, v) for i, v in enumerate(slots) if v is not None]
+    if len(known) < 2:
+        return None
+    score = {}
+    for nm, va_, vs, raw, ex in common.xbe_sections():
+        if common.is_code(nm):
+            continue
+        for i0, v0 in known:
+            pat = struct.pack('<I', v0)
+            at = raw.find(pat)
+            while at >= 0:
+                base = at - 4 * i0
+                if base >= 0 and not base % 4 and base + 4 * n <= len(raw) and (va_ + base) not in score:
+                    got = struct.unpack_from('<%dI' % n, raw, base)
+                    score[va_ + base] = [(i, v, got[i]) for i, v in known if got[i] != v]
+                at = raw.find(pat, at + 1)
+    exact = [v for v, bad in score.items() if not bad]
+    if exact:
+        return (exact[0], []) if len(exact) == 1 else None
+    near = [(v, bad) for v, bad in score.items() if len(known) >= 8 and len(bad) <= max(1, len(known) // 8)]
+    return near[0] if len(near) == 1 else None
+
+
 def _code_sym(o, s):
     return s.section > 0 and s.sclass in (2, 3) and bool(o.sections[s.section].flags & coff.SCN_CODE) and not s.naux
 
@@ -598,6 +641,16 @@ def link(objp, va, size, decomp, env, force=(), src=None):
                 if typ == coff.IMAGE_REL_I386_REL32 and v not in transp:
                     b.callees.add(v)
                     b.callee_sig[v] = sized(coff.signature(t.name), decomp, env, src if p == objp else None)
+            if target is None and t.section > 0 and t.name.startswith('??_7'):
+                # a vtable with no retail address: retail's own copy, when its contents single it out, so
+                # an object's vtable pointer (stored into compared memory) is retail's
+                rv = retail_vtable(oo, t.section, t.value)
+                if rv is not None and not rv[1]:
+                    target = ('va', rv[0])
+                    b.linked.append('vtable:%s=%08x' % (coff.plain_name(t.name).replace(' ', ''), rv[0]))
+                elif rv is not None:   # ours stays in the blob: its slots differ from retail's copy
+                    b.linked.append('vtable:%s~%08x(%s)' % (coff.plain_name(t.name).replace(' ', ''), rv[0], ';'.join(
+                        'slot%d:ours=%08x,retail=%08x' % (i, o_, r_) for i, o_, r_ in rv[1])))
             if target is None and t.section > 0:
                 tsec = oo.sections[t.section]
                 if tsec.flags & coff.SCN_WRITE and not (tsec.flags & coff.SCN_CODE):
@@ -2257,6 +2310,9 @@ def check(va, decomp, env, src=None, k=6, budget=240):
         if chosen is None:
             m, bad, verdicts, n, sg = first
             res.update(verdict='differs', detail='%s: %s' % bad, mapping=fmt_map(m))
+            vts = [x[7:] for x in res['linked'].split() if x.startswith('vtable:') and '~' in x]
+            if vts:   # the object's vtable is not retail's: say so first, it explains stored vtable pointers
+                res['detail'] = 'vtable differs from the retail copy: %s; first difference %s' % (' '.join(vts), res['detail'])
         else:
             m, verdicts, sg = chosen
             res['mapping'] = fmt_map(m) + (' +retbuf' if sg.params and len(sg.params) > len(coff.signature(b.name).params or []) else '')

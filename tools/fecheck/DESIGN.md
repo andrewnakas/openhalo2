@@ -88,6 +88,14 @@ the thread 100000 times (NtYieldExecution / KeDelayExecutionThread) is waiting o
 never runs in the emulator (an I/O completion flag): it stops at once as `untestable: retail waits on
 another thread` naming the waiting function.
 
+## Vtables
+A vtable the object defines without a retail address (``??_7X``) links to retail's own copy when its
+contents single it out: the slots whose functions have retail addresses match exactly one place in
+retail's data (at least two known slots). Then an object's stored vtable pointer is retail's. A copy
+that matches all but a few of at least eight known slots is the class's vtable with wrong slots in the
+decomp: ours stays in the blob and a `differs` verdict names the slots first. A weak external (MSVC's
+vector deleting destructor ``??_E``) links to its default, the scalar deleting destructor ``??_G``.
+
 ## Builtins
 By-value structures smaller than a dword compare only their own bytes as call arguments (retail pushes
 a register and stores the byte). VS2022's __libm_sse2_pow_precise runs retail's own _CIpow, so pow's
