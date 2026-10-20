@@ -169,8 +169,8 @@ for s in "${SC[@]}"; do
     m=${s:5}; ty=${m#*_}; m=${m%%_*}; tr=$(typerow $ty); [ $tr = -1 ] && { echo "$s: unknown game type"; continue; }
     link_up $m $tr && both_play $FIGHT_MIN 1
     case $s in
-    dropB*) taskkill //F //PID ${PID[B]} > /dev/null 2>&1; st+="B-killed "; watch A 240 after ;;
-    dropA*) taskkill //F //PID ${PID[A]} > /dev/null 2>&1; st+="A-killed "; watch B 240 after ;;
+    dropB*) taskkill //F //PID ${PID[B]} > /dev/null 2>&1; PID[B]=; st+="B-killed "; watch A 240 after ;;
+    dropA*) taskkill //F //PID ${PID[A]} > /dev/null 2>&1; PID[A]=; st+="A-killed "; watch B 240 after ;;
     leaveB*) leave_game B; st+="B-left "; watch A 120 after; watch B 60 after ;;
     esac
     use A; alive && { endgame; } ;;
