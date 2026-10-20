@@ -5,8 +5,9 @@ patches/) is dedicated to the public domain under CC0 1.0 (see LICENSE), so
 decompilation projects and anyone else can reuse any of it without conditions.
 Exceptions: third-party code keeps its own licence (below), and the hunks in
 patches/xboxrecomp-full-vs-193e299.diff that modify the toolkit's xemu-derived
-files under src/apu/ stay LGPL-2.1-or-later. The recompiled game code built into
-the executable comes from the retail game and is not ours to license.
+files under src/apu/ stay LGPL-2.1-or-later. No game code is distributed: the
+recompilation is made on the player's machine from their own copy of the game
+(tools/byog), and it is not ours to license.
 
 
 1. xboxrecomp (static recompilation toolkit and Xbox runtime)
@@ -27,7 +28,18 @@ the executable comes from the retail game and is not ours to license.
    libjuice (MPL-2.0), usrsctp (BSD-3-Clause), OpenSSL (Apache-2.0).
    See net/README.md.
 
-5. Microsoft Windows SDK import libraries (system DLLs only).
+5. Microsoft C runtime and Windows SDK libraries: not distributed. The
+   player-side build uses an installed Visual Studio / Build Tools, or
+   downloads them from Microsoft with xwin after the player accepts
+   Microsoft's licence.
+
+6. Release build tools (in the download, used to build the game program on
+   the player's machine):
+   - LLVM clang-cl and lld-link -- Apache-2.0 WITH LLVM-exception
+     (toolchain/llvm/LICENSE.TXT).
+   - xwin (https://github.com/Jake-Shadle/xwin) -- MIT OR Apache-2.0.
+   - CPython embeddable package -- PSF License (python/LICENSE.txt).
+   - Capstone disassembler -- BSD-3-Clause.
 
 Halo 2 is a trademark of Microsoft. No game data is distributed with this
 program; it runs only with the user's own copy of the game.

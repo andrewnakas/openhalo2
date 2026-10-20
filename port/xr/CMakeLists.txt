@@ -78,10 +78,19 @@ set(GAME_SOURCES
 #   src/recomp/recomp_dispatch.h     - binary search dispatch table
 #   src/recomp/recomp_types.h        - register model, ICALL macros, MEM helpers
 
-add_executable(${PROJECT_NAME} WIN32
-    ${GAME_SOURCES}
-    ${RECOMP_GEN_SOURCES}
-)
+# OPENHALO2_KIT: the release build. It contains no game code: the runtime is
+# built as a static library (halo2_recomp.lib) and kit_link.txt lists what the
+# final link needs. tools/byog/build.py lifts the player's own default.xbe and
+# links the result with it on the player's machine.
+option(OPENHALO2_KIT "Runtime-only kit for player-side builds (no lifted code)" OFF)
+if(OPENHALO2_KIT)
+    add_library(${PROJECT_NAME} STATIC ${GAME_SOURCES})
+else()
+    add_executable(${PROJECT_NAME} WIN32
+        ${GAME_SOURCES}
+        ${RECOMP_GEN_SOURCES}
+    )
+endif()
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 # The toolkit's libraries, named one by one rather than through the
@@ -209,4 +218,25 @@ else()
     # the contract symbols (g_apu_state, mcpx_apu_*, apu_mixer_*) come from here
     target_compile_definitions(mcpx_audio PRIVATE MA_CONTRACT=1)
     set_target_properties(xbox_apu xbox_dsound PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+
+# Kit: the libraries the player-side link takes, one per line (system libraries
+# by bare name). Read by tools/byog/make_release.sh.
+if(OPENHALO2_KIT)
+    set(_kit_libs
+        $<TARGET_FILE:${PROJECT_NAME}> $<TARGET_FILE:mcpx_audio>
+        $<TARGET_FILE:xbox_kernel> $<TARGET_FILE:xbox_d3d8> $<TARGET_FILE:xbox_input>
+        $<TARGET_FILE:xbox_usb> $<TARGET_FILE:xbox_nv2a> $<TARGET_FILE:xbox_video>)
+    if(WIN32 AND OPENHALO2_NET AND EXISTS "${H2NET_VCPKG}/lib/datachannel.lib")
+        foreach(_l datachannel juice usrsctp libssl libcrypto)
+            list(APPEND _kit_libs ${H2NET_VCPKG}/lib/${_l}.lib)
+        endforeach()
+    endif()
+    list(APPEND _kit_libs d3d11 dxgi dxguid d3dcompiler xinput winmm dbghelp ws2_32 comdlg32
+        iphlpapi crypt32 bcrypt user32 advapi32 opengl32 gdi32 kernel32 mfplat mfreadwrite
+        mfuuid mf xaudio2_8 ole32 winspool shell32 oleaut32 uuid)
+    list(JOIN _kit_libs "
+" _kit_text)
+    file(GENERATE OUTPUT ${CMAKE_BINARY_DIR}/kit_link.txt CONTENT "${_kit_text}
+")
 endif()
