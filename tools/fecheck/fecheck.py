@@ -557,6 +557,12 @@ def link(objp, va, size, decomp, env, force=(), src=None):
         sec = oo.sections[si]
         for off, symi, typ in sec.relocs:
             t = oo.by_index[symi]
+            if t.sclass == 105 and t.section <= 0 and t.naux and resolve(t.name) is None:
+                # a weak external: a compiler-generated member (``vector deleting destructor'' behind a
+                # vtable) defaults to its alias in this object (the scalar deleting destructor), as link does
+                dflt = oo.by_index.get(struct.unpack_from('<I', t.aux[0], 0)[0])
+                if dflt is not None:
+                    t = dflt
             if typ in (coff.IMAGE_REL_I386_SECREL, coff.IMAGE_REL_I386_SECTION, coff.IMAGE_REL_I386_ABSOLUTE):
                 continue
             target = None
