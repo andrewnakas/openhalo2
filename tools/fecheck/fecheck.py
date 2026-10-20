@@ -687,6 +687,23 @@ PARTS = {'al': 'eax', 'ah': 'eax', 'ax': 'eax', 'cl': 'ecx', 'ch': 'ecx', 'cx': 
          'dx': 'edx', 'bl': 'ebx', 'bh': 'ebx', 'bx': 'ebx', 'si': 'esi', 'di': 'edi'}
 
 
+_RETPOPS = {}
+
+
+def ret_pops(va):
+    """Stack bytes retail function va pops: its single `ret N` (0 when caller-cleaned; None when
+    unknown or its rets disagree)."""
+    if va not in _RETPOPS:
+        r = common.functions().get(va) if va < KVA else None
+        n = None
+        if r:
+            pops = {(i.operands[0].imm if i.operands else 0) for i in md.disasm(common.xbe_read(va, r['size_i']) or b'', va)
+                    if i.mnemonic == 'ret'}
+            n = pops.pop() if len(pops) == 1 else None
+        _RETPOPS[va] = n
+    return _RETPOPS[va]
+
+
 def live_in(va, size, through=False):
     """Registers retail A reads before writing them on some path from its entry (its register
     arguments), in order of first read. Walks the control flow inside A.
@@ -695,6 +712,43 @@ def live_in(va, size, through=False):
     body = common.xbe_read(va, size) or b''
     insns = {i.address: i for i in md.disasm(body, va)}
     out, late, thru = [], [], []
+    # push R of a callee-saved register is its save (not a read) when A restores R (pop R) and the push
+    # does not open an argument list: a call reached through only further pushes and register loads
+    # passes its value on, e.g. an incoming ebx handed to a callee as a stack argument
+    popped = {md.reg_name(i.operands[0].reg) for i in insns.values()
+              if i.mnemonic == 'pop' and i.operands and i.operands[0].type == CX.X86_OP_REG}
+
+    def saves(addr, r):
+        """push R at addr saves R unless a call reached through only pushes, stack adjustments and
+        register loads takes it as an argument: it lies within the bytes the callee pops (its single
+        `ret N`) or the caller removes after the call (add esp, N). Unprovable: a save."""
+        if r == 'ebp':
+            return True
+        if r not in popped:
+            return False
+        a, depth = addr + insns[addr].size, 0
+        for _ in range(12):
+            i = insns.get(a)
+            if i is None:
+                return True
+            o = i.operands
+            if i.mnemonic == 'call':
+                n = None
+                if o and o[0].type == CX.X86_OP_IMM:
+                    n = ret_pops(o[0].imm & 0xFFFFFFFF)
+                nx = insns.get(a + i.size)
+                if not n and nx is not None and nx.mnemonic == 'add' and nx.operands[0].type == CX.X86_OP_REG and                         md.reg_name(nx.operands[0].reg) == 'esp' and nx.operands[1].type == CX.X86_OP_IMM:
+                    n = nx.operands[1].imm
+                return not (n and depth < n)
+            if i.mnemonic == 'push':
+                depth += 4
+            elif i.mnemonic == 'sub' and o[0].type == CX.X86_OP_REG and md.reg_name(o[0].reg) == 'esp' and o[1].type == CX.X86_OP_IMM:
+                depth += o[1].imm
+            elif not (i.mnemonic in ('mov', 'lea', 'movzx', 'movsx') and o[0].type == CX.X86_OP_REG
+                      and PARTS.get(md.reg_name(o[0].reg), md.reg_name(o[0].reg)) not in (r, 'esp')):
+                return True
+            a += i.size
+        return True
 
     def passed(tgt, written):
         if not through or tgt is None or va <= tgt < va + size:
@@ -731,7 +785,7 @@ def live_in(va, size, through=False):
                 rd = set()
             if mn in ('mov', 'lea') and len(ops) == 2 and ops[0].type == ops[1].type == CX.X86_OP_REG and ops[0].reg == ops[1].reg:
                 rd = wr = set()   # mov edi, edi: padding (neither reads nor writes the value)
-            if mn == 'push' and ops and ops[0].type == CX.X86_OP_REG and md.reg_name(ops[0].reg) in ('ebx', 'esi', 'edi', 'ebp'):
+            if mn == 'push' and ops and ops[0].type == CX.X86_OP_REG and md.reg_name(ops[0].reg) in ('ebx', 'esi', 'edi', 'ebp')                     and saves(addr, md.reg_name(ops[0].reg)):
                 rd = set()
             for r in REGS + XREGS:
                 if r in rd and r not in written and r not in out:
@@ -2082,6 +2136,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             raise Fail(rr[0][3])
         live = live_in(va, size)
         live2 = live_in(va, size, through=True)   # pass-through registers: tried after the others
+        rpops = ret_pops(va)
         loaded = {}
 
         def snap(p, root):
@@ -2120,9 +2175,12 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             first = chosen = None
             for sg in sigs:
                 b.sig = sg
-                ms = known_maps(va, sg) + candidates(sg, live)
+                ms = candidates(sg, live)
                 if live2 != live:
                     ms += [m_ for m_ in candidates(sg, live2) if m_ not in ms]
+                if rpops:   # retail pops N bytes: maps whose stack parameters fill exactly N come first
+                    ms.sort(key=lambda m_: sum((e[2] + 3) // 4 * 4 for e in m_ if e[0] == 'stk') != rpops)
+                ms = known_maps(va, sg) + [m_ for m_ in ms if m_ not in known_maps(va, sg)]
                 for m in ms:
                     if first is not None and time.time() > lim['end']:
                         break

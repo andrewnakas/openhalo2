@@ -44,6 +44,12 @@ parameter, candidate locations are eax/ecx/edx/ebx/esi/edi and the stack slots; 
 the assignment under which F's behaviour (calls + writes + return) agrees with retail on
 all K snapshots; fall back to the calling-convention analysis in tools/abi_wrap.py and
 the retail `ret N`.
+Candidate registers are A's live-ins: registers read before written on some path from the entry.
+A `push` of ebx/esi/edi is a callee-saved register's save, not a read, only when A restores it
+(`pop`) and the push does not sit within the argument bytes of the call it leads to (the callee's
+single `ret N`, or the caller's `add esp, N`); so an incoming edi/ebx handed on as a stack argument
+is a live-in. When retail's `ret N` pops N > 0 bytes, maps whose stack parameters fill exactly N
+bytes are tried first.
 
 ## 6. Frame-pointer pairing
 Callee writes into retail's frame are replayed into ours through a pairing of retail's frame
