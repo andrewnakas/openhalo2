@@ -140,10 +140,16 @@ def infer(decomp, table, data):
 
 
 def stale(decomp):
-    """True when runtime/decomp_symbols.csv is older than the decomp tree's sources or config."""
+    """True when runtime/decomp_symbols.csv was made from another tree (its .tree sidecar) or is
+    older than this tree's sources or config."""
     p = os.path.join(common.RUNTIME, 'decomp_symbols.csv')
     if not os.path.exists(p):
         return True
+    try:
+        if open(p + '.tree').read().strip() != os.path.abspath(decomp).lower():
+            return True
+    except OSError:
+        pass   # made before the sidecar existed: judge by time alone
     t = os.path.getmtime(p)
     files = glob.glob(os.path.join(decomp, 'src', '*.cpp')) + glob.glob(os.path.join(decomp, 'src', 'stubs', '*.cpp'))
     files.append(os.path.join(decomp, 'config', 'functions.csv'))
@@ -177,6 +183,7 @@ def refresh(decomp, quiet=False):
     for r in old:
         add(r['name'], r['kind'], int(r['va'], 16), r['how'], r['source'])
     common.write_csv(p, rows, ['name', 'kind', 'va', 'how', 'source'])
+    open(p + '.tree', 'w').write(os.path.abspath(decomp).lower())
     if not quiet:
         print('symmap: refreshed %d names from %s' % (len(rows), decomp), file=sys.stderr)
     return True
@@ -213,6 +220,7 @@ def main():
             if pn != name:
                 add(pn, 'data', va, 'infer:%d' % n, '')
     common.write_csv(os.path.join(common.RUNTIME, 'decomp_symbols.csv'), rows, ['name', 'kind', 'va', 'how', 'source'])
+    open(os.path.join(common.RUNTIME, 'decomp_symbols.csv.tree'), 'w').write(os.path.abspath(a.decomp).lower())
     c = collections.Counter(r['how'].split(':')[0] for r in rows)
     print('symmap: %d names (%s), %d inferred' % (len(rows), ', '.join('%s %d' % kv for kv in c.items()), len(rows) - n0))
 
