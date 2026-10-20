@@ -76,6 +76,11 @@ spans several paired pointers is split at them.
 `<WORK>/rcache_v6`: one pickle per snapshot holding ('fecheck-rcache', format, result). The format is
 RCACHE_FORMAT plus a hash of the routines that run for real (never recorded as calls); an entry of
 another format, or older than its snapshot, is rerun.
+Each entry also records the step cap it ran under (FECHECK_CAP); a run that stopped at the cap is
+rerun when the cap is larger, and the wall-clock limit grows with the cap. A retail run that yields
+the thread 100000 times (NtYieldExecution / KeDelayExecutionThread) is waiting on another thread that
+never runs in the emulator (an I/O completion flag): it stops at once as `untestable: retail waits on
+another thread` naming the waiting function.
 
 ## Builtins
 By-value structures smaller than a dword compare only their own bytes as call arguments (retail pushes

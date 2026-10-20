@@ -211,11 +211,16 @@ KERNEL_EMU = {338: rc4_key, 339: rc4_crypt}
 # id(uc) -> fn(addr, size): told of the writes KERNEL_EMU makes (mem_write fires no write hook), so the
 # retail run records them among a callee's writes
 KWRITE = {}
+# a thread that yields this often is waiting for another thread (an I/O completion, a worker): in the
+# emulator nothing else runs, so the wait never ends. NtYieldExecution, KeDelayExecutionThread
+YIELDS = {238, 99}
+SPIN = 100_000
+SPUN = {}   # id(uc) -> return address of the yield that crossed SPIN
 
 
 def kernel_hook(uc):
     slots = kernel()[0]
-    st = {'last': None}
+    st = {'last': None, 'yields': 0}
 
     def on_k(u, addr, size, d):
         esp = u.reg_read(X.UC_X86_REG_ESP)
@@ -223,6 +228,11 @@ def kernel_hook(uc):
             return
         o, n = slots.get((addr - KVA) // 4, (0, 0))
         ret = u32(u, esp)
+        if o in YIELDS:
+            st['yields'] += 1
+            if st['yields'] >= SPIN:
+                SPUN[id(u)] = (ret, u32(u, esp + 4 + n))   # the yield's caller and (if a wrapper) its caller
+                u.emu_stop()
         if o in KERNEL_EMU:
             try:
                 ws = KERNEL_EMU[o](u, *[u32(u, esp + 4 + 4 * k) for k in range(n // 4)]) or []
@@ -1022,13 +1032,17 @@ def run_retail(s, va, size):
     KWRITE[id(uc)] = lambda a_, n_: on_w(uc, None, a_, n_, 0, None)
     top0 = (uc.reg_read(X.UC_X86_REG_FPSW) >> 11) & 7
     try:
-        uc.emu_start(va, SENT_END, timeout=120_000_000, count=CAP)
+        # the wall-clock limit grows with the cap, so a larger FECHECK_CAP is not cut short by time
+        uc.emu_start(va, SENT_END, timeout=max(120, CAP // 250_000) * 1_000_000, count=CAP)
     except UcError as e:
         raise Fail('untestable: retail %s at %08x' % (e, uc.reg_read(X.UC_X86_REG_EIP)))
     finally:
         KWRITE.pop(id(uc), None)
+    spun = SPUN.pop(id(uc), None)
+    if spun is not None:
+        raise Fail('untestable: retail waits on another thread (%d yields, from %s <- %s)' % (SPIN, nearest(spun[0]), nearest(spun[1])))
     if uc.reg_read(X.UC_X86_REG_EIP) != SENT_END:
-        raise Fail('untestable: retail did not return (cap) at %08x' % uc.reg_read(X.UC_X86_REG_EIP))
+        raise Fail('untestable: retail did not return (cap %dM) at %08x' % (CAP // 1_000_000, uc.reg_read(X.UC_X86_REG_EIP)))
     eax, edx = struct.unpack('<II', uc.mem_read(SCR, 8))
     top, sts = fpsave(uc.mem_read(SCR + 16, 108))
     r = st['cur']
@@ -1561,8 +1575,11 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
     try:
         uc.emu_start(b.entry, SENT_END, timeout=60_000_000, count=rres.get('icount_cap', BLOB_CAP))
     except UcError as e:
+        SPUN.pop(id(uc), None)
         if not st['fail']:
             return 'differs', 'ours faults: %s at %08x' % (e, uc.reg_read(X.UC_X86_REG_EIP))
+    if SPUN.pop(id(uc), None) is not None and not st['fail']:
+        return 'differs', 'ours waits on another thread (%d yields) at %08x' % (SPIN, uc.reg_read(X.UC_X86_REG_EIP))
     if st['fail']:
         return 'differs', st['fail']
     if uc.reg_read(X.UC_X86_REG_EIP) != SENT_END:
@@ -1666,8 +1683,12 @@ def retail_cached(path, root, va, size):
             got = pickle.load(open(key, 'rb'))
             # an entry recorded under another recording format (or another set of routines that
             # run for real instead of being recorded as calls) is rerun
-            if isinstance(got, tuple) and len(got) == 3 and got[0] == 'fecheck-rcache' and got[1] == rcache_format():
-                return got[2]
+            # a run that stopped at the step cap is rerun under a larger cap (FECHECK_CAP); entries
+            # written before the cap was recorded ran under the default cap
+            if isinstance(got, tuple) and len(got) in (3, 4) and got[0] == 'fecheck-rcache' and got[1] == rcache_format():
+                cap0 = got[3] if len(got) == 4 else 30_000_000
+                if not (isinstance(got[2], str) and 'did not return' in got[2] and CAP > cap0):
+                    return got[2]
         except Exception:
             pass
     s = snapstore.load(path, root)
@@ -1676,7 +1697,7 @@ def retail_cached(path, root, va, size):
     except Fail as e:
         out = str(e)
     tmp = key + '.%d' % os.getpid()
-    pickle.dump(('fecheck-rcache', rcache_format(), out), open(tmp, 'wb'))
+    pickle.dump(('fecheck-rcache', rcache_format(), out, CAP), open(tmp, 'wb'))
     os.replace(tmp, key)
     return out
 
