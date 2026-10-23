@@ -76,7 +76,9 @@ TRANSPARENT_CLOBBER = {'_qsort', 'D3DDevice_SetVertexShaderInput', 'D3DDevice_Se
 # spell: ours calls a thunk that moves the arguments into retail's registers, then retail's copy.
 # Code before `push <retail va>; ret`.
 REG_THUNKS = {'D3DDevice_SelectVertexShaderDirect_Regs': bytes([0x89, 0xD0])}   # pVAF in ecx; Address edx -> eax
-ALIASES = {'__ftol2_sse': '__ftol2', '__ftol': '__ftol2', '__alloca_probe': '__chkstk'}
+# _memmove: libcmt's memcpy is memmove's code (memcpy.asm copies backwards when the ranges overlap,
+# retail 0x320890 `cmp edi, esi; jbe; cmp edi, eax; jb` backwards), and retail has no other copy
+ALIASES = {'__ftol2_sse': '__ftol2', '__ftol': '__ftol2', '__alloca_probe': '__chkstk', '_memmove': '_memcpy'}
 # mov [SCR],eax; mov [SCR+4],edx; fnsave [SCR+16]
 SENT_CODE = bytes([0xA3]) + struct.pack('<I', SCR) + bytes([0x89, 0x15]) + struct.pack('<I', SCR + 4) + \
     bytes([0x0F, 0x11, 0x05]) + struct.pack('<I', SCR + 0x100) + \
@@ -326,7 +328,9 @@ def obj_for(src, decomp, env, fresh=False, out=None):
     if os.path.basename(os.path.dirname(path)) == 'stubs':
         stem = 'stubs__' + stem
     obj = out or os.path.join(dbuild.objdir(decomp), stem + '.obj')
-    if fresh or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(path), dbuild.newest_header(decomp)):
+    # an object built before stdio was declared extern (dbuild.NO_STDIO_INLINE) is rebuilt
+    if fresh or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(path), dbuild.newest_header(decomp)) \
+            or dbuild.crt_stdio_static(obj):
         _, ok, errs, obj = dbuild.compile_one(path, decomp, env, out=out)
         if not ok:
             raise Fail('unbuildable: compile: ' + ' | '.join(errs[:3]))
@@ -344,7 +348,8 @@ def keep_obj(src, name, va, decomp, env):
     cpp = os.path.join(od, 'keep', '%s__%08x.cpp' % (stem, va))
     obj = cpp[:-4] + '.obj'
     os.makedirs(os.path.dirname(cpp), exist_ok=True)
-    if os.path.exists(obj) and os.path.getmtime(obj) >= max(os.path.getmtime(path), dbuild.newest_header(decomp)):
+    if os.path.exists(obj) and os.path.getmtime(obj) >= max(os.path.getmtime(path), dbuild.newest_header(decomp)) \
+            and not dbuild.crt_stdio_static(obj):
         return obj
     open(cpp, 'w').write('/* fecheck: emit the inline %s from %s */\n#include "%s"\n'
                          'auto fe_keep_%08x = &%s;\n' % (name, src, os.path.abspath(path).replace('\\', '/'), va, name))
@@ -439,6 +444,7 @@ class Blob:
         self.entry = None
         self.sig = None
         self.name = None
+        self.va = self.size = None   # retail A
 
 
 def with_retbuf(sig):
@@ -676,6 +682,8 @@ def link(objp, va, size, decomp, env, force=(), src=None):
             if target is None and t.section > 0:
                 tsec = oo.sections[t.section]
                 if tsec.flags & coff.SCN_WRITE and not (tsec.flags & coff.SCN_CODE):
+                    if DEBUG:
+                        print('  writable data %s in %s, referenced from %s' % (t.name, p, srcof.get(p)))
                     raise Fail('unbuildable: writable data %s has no retail address' % coff.plain_name(t.name))
                 place(p, t.section)
                 target = ('sec', (p, t.section), t.value)
@@ -750,6 +758,7 @@ def link(objp, va, size, decomp, env, force=(), src=None):
         else:
             raise Fail('unbuildable: reloc type %d' % typ)
     b.entry = b.placed[(objp, fsym.section)] + fsym.value
+    b.va, b.size = va, size
     b.inlinable = {v for v in b.callees if declared_inline(v, decomp)}
     return b
 
@@ -1113,10 +1122,84 @@ def merge(ws):
     return out
 
 
-def run_retail(s, va, size):
-    """Retail A from the snapshot: (result dict, call records)."""
+def stale_copies(uc, lo, hi, code, track):
+    """Follow `rep movs` copies made by the code in the ranges `code` out of stack bytes in [lo, hi)
+    that nothing wrote since the entry (stale bytes under the frame, left by earlier calls): track['g']
+    maps each destination byte to the stale byte copied there. track['mark'](a, n) records a write
+    made from outside the emulation (a mocked callee's replayed writes)."""
+    written = bytearray(hi - lo)
+    track.update(g={}, rep=None)
+
+    def on_w(u, acc, addr, size_, val, d):
+        a0, a1 = max(addr, lo), min(addr + size_, hi)
+        if a0 < a1:
+            written[a0 - lo:a1 - lo] = b'\x01' * (a1 - a0)
+
+    def on_c(u, addr, size_, d):
+        ins = decode(u, addr)
+        if not ins or not ins.mnemonic.startswith('rep movs') or u.reg_read(X.UC_X86_REG_EFLAGS) & 0x400:
+            return
+        n_ = {'b': 1, 'w': 2, 'd': 4}.get(ins.mnemonic[-1], 4)
+        esi, edi, ecx = (u.reg_read(x) for x in (X.UC_X86_REG_ESI, X.UC_X86_REG_EDI, X.UC_X86_REG_ECX))
+        rp = track['rep']
+        if rp and rp[0] == addr and ecx < rp[2] and edi == (rp[1] + (rp[2] - ecx) * n_) & 0xFFFFFFFF:
+            return   # the same copy, one iteration on
+        track['rep'] = (addr, edi, ecx)
+        cnt = ecx * n_
+        if not 0 < cnt <= 0x10000:
+            return
+        src = bytes(u.mem_read(esi, cnt))
+        for k in range(cnt):
+            if lo <= esi + k < hi and not written[esi + k - lo]:
+                track['g'][edi + k] = src[k]
+            else:
+                track['g'].pop(edi + k, None)
+    uc.hook_add(UC_HOOK_MEM_WRITE, on_w, begin=lo, end=hi - 1)
+    for c0, c1 in code:
+        uc.hook_add(UC_HOOK_CODE, on_c, begin=c0, end=c1 - 1)
+    track['mark'] = lambda a, n: on_w(None, None, a, n, 0, None)
+
+
+def stale_final(uc, track):
+    """The destination bytes that still hold the stale byte copied there at the end of the run, as
+    the compare addresses them (ram index; contiguous memory at 0x80000000 + index)"""
+    out, sz = set(), RAM_SIZE[0]
+    for d_, v in track.get('g', {}).items():
+        try:
+            if uc.mem_read(d_, 1)[0] != v:
+                continue
+        except UcError:
+            continue
+        out.add(0x80000000 + (d_ - 0xF0000000) if d_ >= 0xF0000000 else d_ if d_ >= 0x80000000 else d_ % sz)
+    return out
+
+
+RAM_SIZE = [0]
+
+
+def stale_both(s, b, mapping, rres, recs, alt):
+    """Bytes both sides copied out of stack bytes nothing wrote (an uninitialised part of a local
+    structure copied whole with rep movs: retail's frame sits elsewhere, aligned to 8, so its stale
+    bytes are others than ours). Their values are no one's: the compare leaves them out. Costs a
+    second run of each side, so it is made only when memory differs."""
+    if b.va is None:
+        return set()
+    tb, tr = {}, {}
+    try:
+        run_blob(s, b, mapping, rres, recs, alt=alt, track=tb)
+        run_retail(s, b.va, b.size, track=tr)
+    except Fail:
+        return set()
+    return tb.get('final', set()) & tr.get('final', set())
+
+
+def run_retail(s, va, size, track=None):
+    """Retail A from the snapshot: (result dict, call records). track: see stale_copies."""
     uc, ram, con = machine(s)
     esp0 = s['esp']
+    RAM_SIZE[0] = len(ram)
+    if track is not None:
+        stale_copies(uc, esp0 - 0x40000, esp0, [(va, va + size)], track)
     uc.mem_write(esp0, struct.pack('<I', SENT))
     transp = transparent()
     recs, st = [], {'cur': None, 'w': [], 'fs': False, 'fsran': False, 'stub': 0}
@@ -1213,6 +1296,8 @@ def run_retail(s, va, size):
         finish(r)
     res = dict(eax=eax, edx=edx, push=top == ((top0 - 1) & 7), st0=sts[0], xmm0=bytes(uc.mem_read(SCR + 0x100, 16)))
     res['delta'] = delta(s, ram, con, esp0)
+    if track is not None:
+        track['final'] = stale_final(uc, track)
     return res, recs
 
 
@@ -1267,6 +1352,296 @@ def callee_nargs(va):
                 n = len(callee_regs(va)) + min(pops) // 4
         _NARGS[va] = n
     return _NARGS[va]
+
+
+_NARROW = {}
+
+
+def narrow_slots(va):
+    """Stack argument dwords retail function va only ever reads through their low byte or word
+    (`movsx ecx, word ptr [esp+0x10]`): {slot: width in bytes}. A caller's high bits there are not
+    part of the value, which is how retail passes a short in a 32-bit slot (garbage high half).
+    Read off retail's body by following the stack depth through it; any access the walk cannot
+    place (esp or the frame pointer unknown, an escaping lea, an indexed access) gives {}."""
+    if va not in _NARROW:
+        r = common.functions().get(va) if va < KVA else None
+        _NARROW[va] = {}   # a recursive pass-through (below) meets {} while this one is being read
+        try:
+            _NARROW[va] = _narrow(va, r['size_i']) if r else {}
+        except Exception:
+            _NARROW[va] = {}
+    return _NARROW[va]
+
+
+def _narrow(va, size, why=None):
+    ESP, EBP = CX.X86_REG_ESP, CX.X86_REG_EBP
+    body = common.xbe_read(va, size) or b''
+    insns = list(md.disasm(body, va))
+    index_of = {x.address: n for n, x in enumerate(insns)}
+    targets = {o.imm & 0xFFFFFFFF for x in insns if x.mnemonic.startswith('j') for o in x.operands if o.type == CX.X86_OP_IMM}
+    at = {}                 # address -> stack state on entry (from a branch to it or the fall-through)
+    st = (0, None, False)   # (d, fp, aligned): esp = entry - d, ebp = entry - fp (a frame pointer),
+    #                         aligned: esp was aligned under the frame pointer (`and esp, -8`)
+    ev = collections.defaultdict(list)   # insn index -> (slot, width read | None for wide | 'store')
+    pend = []   # an argument loaded whole into a register only to be pushed as a direct callee's argument:
+    #             {R, slot, at (insn index), pushed, depth (bytes pushed since), dead (R reloaded since)}
+
+    def give_up(msg):
+        if why is not None:
+            why.append(msg)
+        return {}
+
+    def reg(op, r):
+        return op.type == CX.X86_OP_REG and op.reg == r
+
+    def touch(xi, off, n, write):
+        """an access of n bytes at [entry esp + off]; argument slot j is at 4 + 4j. A pure store reads
+        nothing of the caller's value (retail reuses an argument slot as a local) and ends it when whole."""
+        if off + n <= 4:
+            return
+        for j in range(max(0, (off - 4) // 4), (off + n - 5) // 4 + 1):
+            if write:
+                if off <= 4 + 4 * j and off + n >= 8 + 4 * j:
+                    ev[xi].append((j, 'store'))
+            else:
+                ev[xi].append((j, n if n <= 2 and off == 4 + 4 * j else None))
+
+    def succs(xi):
+        """control-flow successors of insns[xi] inside A; None for a jump table"""
+        x = insns[xi]
+        mn_, ops_ = x.mnemonic, x.operands
+        if mn_ == 'ret':
+            return []
+        if mn_.startswith('j') or mn_.startswith('loop'):
+            t = ops_[0].imm & 0xFFFFFFFF if ops_ and ops_[0].type == CX.X86_OP_IMM else None
+            if t is None:
+                return None
+            out = []
+            if va <= t < va + size:
+                if t not in index_of:
+                    return None
+                out.append(index_of[t])
+            if mn_ != 'jmp':
+                out.append(xi + 1)
+            return out
+        return [xi + 1]
+
+    def pushed_width(k):
+        """insns[k] pushes a stack argument of the direct call that ends its straight run of code:
+        the width that callee reads of it (narrow_slots), else None"""
+        depth = 0
+        for x in insns[k + 1:k + 40]:
+            if x.address in targets or x.mnemonic.startswith('j') or x.mnemonic == 'ret':
+                return None
+            if x.mnemonic == 'call':
+                if x.operands[0].type != CX.X86_OP_IMM:
+                    return None
+                return narrow_slots(x.operands[0].imm & 0xFFFFFFFF).get(depth // 4)
+            if 'esp' in {md.reg_name(y) for y in x.regs_access()[1]}:
+                if x.mnemonic == 'push':
+                    depth += 4
+                elif x.mnemonic == 'pop':
+                    depth -= 4
+                else:
+                    return None
+                if depth < 0:
+                    return None
+        return None
+
+    def reg_width(L, R):
+        """The argument loaded whole into R by insns[L] is only ever read through R's low word or byte:
+        that width, else None. Follows the control flow from L while R still holds the loaded value:
+        every read of it must be of si/di/ax/cx/dx/bx or al/cl/dl/bl, or a push of R as an argument
+        its callee reads that narrowly, and no callee may take R as a register argument."""
+        parts = {nm for nm, full in PARTS.items() if full == R} | {R}
+        w, seen, work = 0, set(), [L + 1]
+        while work:
+            xi = work.pop()
+            if xi >= len(insns) or xi in seen:
+                continue
+            seen.add(xi)
+            x = insns[xi]
+            ops_, mn_ = x.operands, x.mnemonic
+            rd_, wr_ = ({md.reg_name(y) for y in z} for z in x.regs_access())
+            zero = mn_ in ('xor', 'sub') and len(ops_) == 2 and all(o.type == CX.X86_OP_REG and o.reg == ops_[0].reg for o in ops_)
+            if mn_ == 'push' and ops_[0].type == CX.X86_OP_REG and md.reg_name(ops_[0].reg) == R:
+                pw = pushed_width(xi)
+                if pw is None:
+                    return None
+                w = max(w, pw)
+            elif not zero:
+                for nm in rd_ & parts:
+                    if nm in ('ax', 'cx', 'dx', 'bx', 'si', 'di'):
+                        w = max(w, 2)
+                    elif nm in ('al', 'cl', 'dl', 'bl'):
+                        w = max(w, 1)
+                    else:
+                        return None
+            t = ops_[0].imm & 0xFFFFFFFF if ops_ and ops_[0].type == CX.X86_OP_IMM else None
+            if mn_ in ('call', 'jmp') and t is not None and not (va <= t < va + size) and R in callee_regs(t):
+                return None
+            if R in wr_ and (zero or not (rd_ & parts)):
+                continue   # R overwritten: the loaded value ends here
+            nx = succs(xi)
+            if nx is None:
+                return None
+            work += nx
+        return w or None
+
+    for xi, i in enumerate(insns):
+        a, mn, ops = i.address, i.mnemonic, i.operands
+        if pend:
+            rd_, wr_ = ({PARTS.get(md.reg_name(y), md.reg_name(y)) for y in z} for z in i.regs_access())
+            for p in list(pend):
+                R = p['R']
+                if mn == 'call':
+                    ok = p['pushed'] and (p['dead'] or R in ('eax', 'ecx', 'edx')) and ops[0].type == CX.X86_OP_IMM
+                    ev[p['at']].append((p['j'], narrow_slots(ops[0].imm & 0xFFFFFFFF).get(p['depth'] // 4) if ok else None))
+                    pend.remove(p)
+                    continue
+                fail = a in targets or mn.startswith('j') or mn == 'ret'
+                if not fail and not p['dead'] and R in rd_:
+                    if mn == 'push' and not p['pushed'] and reg(ops[0], getattr(CX, 'X86_REG_' + R.upper())):
+                        p['pushed'] = True
+                        continue
+                    fail = True
+                if not fail and p['pushed'] and 'esp' in wr_:
+                    if mn == 'push':
+                        p['depth'] += 4
+                    elif mn == 'pop':
+                        p['depth'] -= 4
+                    elif mn in ('sub', 'add') and reg(ops[0], ESP) and ops[1].type == CX.X86_OP_IMM:
+                        p['depth'] += ops[1].imm if mn == 'sub' else -ops[1].imm
+                    else:
+                        fail = True
+                    fail = fail or p['depth'] < 0
+                if not fail and not p['dead'] and R in wr_:
+                    if p['pushed']:
+                        p['dead'] = True
+                    else:
+                        fail = True
+                if fail:
+                    ev[p['at']].append((p['j'], None))
+                    pend.remove(p)
+        if a in at:
+            if st is None:
+                st = at[a]
+            elif at[a] != st:
+                return give_up('%08x: two stack states meet' % a)
+        elif st is not None:
+            at[a] = st
+        if st is None:   # after a ret/jmp, reached by no branch seen yet
+            if any(op.type == CX.X86_OP_MEM and op.mem.base in (ESP, EBP) for op in ops) or mn in ('push', 'pop'):
+                return give_up('%08x: stack state unknown' % a)
+            continue
+        d, fp, aligned = st
+        if mn == 'lea' and reg(ops[0], ESP) and ops[1].mem.base == ESP and not ops[1].mem.index and not ops[1].mem.disp:
+            continue   # lea esp, [esp]: padding
+        for k, op in enumerate(ops):
+            if op.type == CX.X86_OP_MEM and op.mem.base in (ESP, EBP):
+                if op.mem.base == ESP and aligned:
+                    continue   # esp aligned below the frame pointer: locals only, the arguments go by ebp
+                base = d if op.mem.base == ESP else fp
+                if base is None:
+                    if op.mem.base == EBP:
+                        continue   # ebp as a general register (LTCG), not a frame pointer
+                    return give_up('%08x: esp depth unknown' % a)
+                off = op.mem.disp - base
+                if op.mem.index:
+                    if off + 16 * 4 >= 4 and op.mem.base == EBP or off >= 0:
+                        return give_up('%08x: indexed access near the arguments' % a)
+                    continue
+                if mn == 'lea':
+                    if off >= 4:
+                        return give_up('%08x: an argument address escapes' % a)
+                    continue
+                # a pure store (no read of the slot); read-modify-write forms count as reads
+                write = (k == 0 and mn in ('mov', 'movss', 'movsd', 'movd', 'movq', 'movaps', 'movups', 'movlps', 'movhps')) \
+                    or mn.startswith('set') or mn in ('fstp', 'fst', 'fistp', 'fist', 'fisttp', 'pop')
+                if (mn == 'mov' and k == 1 and op.size == 4 and off >= 4 and off % 4 == 0 and ops[0].type == CX.X86_OP_REG
+                        and md.reg_name(ops[0].reg) in REGS + ['ebp']
+                        and not any(p['R'] == md.reg_name(ops[0].reg) and not p['dead'] for p in pend)):
+                    R = md.reg_name(ops[0].reg)
+                    w = reg_width(xi, R)
+                    if w:
+                        ev[xi].append(((off - 4) // 4, w))
+                    else:
+                        pend.append(dict(R=R, j=(off - 4) // 4, at=xi, pushed=False, depth=0, dead=False))
+                    continue
+                touch(xi, off, op.size, write)
+            elif reg(op, ESP) and mn not in ('push', 'pop', 'add', 'sub', 'and') and not (
+                    mn == 'mov' and len(ops) == 2 and reg(ops[1 - k], EBP)):
+                return give_up('%08x: esp used as a value' % a)
+        rw = i.regs_access()[1]
+        if mn == 'push':
+            d = None if d is None else d + 4
+        elif mn == 'pop':
+            d = None if d is None else d - 4
+            if reg(ops[0], EBP):
+                fp = None
+        elif mn == 'and' and reg(ops[0], ESP):
+            if fp is None:
+                return give_up('%08x: esp aligned without a frame pointer' % a)
+            d, aligned = None, True
+        elif mn in ('sub', 'add') and reg(ops[0], ESP):
+            d = None if (d is None or ops[1].type != CX.X86_OP_IMM) else d + (ops[1].imm if mn == 'sub' else -ops[1].imm)
+        elif mn == 'mov' and reg(ops[0], EBP) and reg(ops[1], ESP):
+            fp = d
+        elif mn == 'mov' and reg(ops[0], ESP):
+            d, aligned = (fp if reg(ops[1], EBP) else None), False
+        elif mn == 'leave':
+            d, fp, aligned = (None if fp is None else fp - 4), None, False
+        elif mn == 'call':
+            n = ret_pops(ops[0].imm & 0xFFFFFFFF) if ops[0].type == CX.X86_OP_IMM else None
+            if not aligned:
+                d = None if (n is None or d is None) else d - n
+        elif ESP in rw and not mn.startswith('j') and mn != 'ret':
+            d = None
+        if EBP in rw and mn not in ('push', 'leave', 'pop') and not (mn == 'mov' and reg(ops[0], EBP) and reg(ops[1], ESP)):
+            fp = None
+        st = (d, fp, aligned)
+        if mn == 'ret':
+            st = None
+        elif mn.startswith('j'):
+            if ops and ops[0].type == CX.X86_OP_IMM:
+                t = ops[0].imm & 0xFFFFFFFF
+                if va <= t < va + size:
+                    if t in at and at[t] != st:
+                        return give_up('%08x: two stack states meet at %08x' % (a, t))
+                    at[t] = st
+            if mn == 'jmp':
+                st = None
+    for p in pend:
+        ev[p['at']].append((p['j'], None))
+    # each slot: the reads that can see the caller's value (from the entry until a whole store to it)
+    out = {}
+    for j in sorted({j for e in ev.values() for j, w in e if w != 'store'}):
+        widths, seen, work = set(), set(), [0]
+        while work and widths is not None:
+            xi = work.pop()
+            if xi >= len(insns) or xi in seen:
+                continue
+            seen.add(xi)
+            stored = False
+            for jj, w in ev.get(xi, ()):
+                if jj != j:
+                    continue
+                if w == 'store':
+                    stored = True
+                elif w is None:
+                    widths = None
+                    break
+                elif not stored:
+                    widths.add(w)
+            if stored or widths is None:
+                continue
+            nx = succs(xi)
+            work += range(len(insns)) if nx is None else nx
+        if widths:
+            out[j] = max(widths)
+        elif why is not None:
+            why.append('slot %d: %s' % (j, 'read whole' if widths is None else 'not read from the entry'))
+    return out
 
 
 _NULLDEF = {}
@@ -1415,9 +1790,13 @@ def fp_pairings(u, r, t, direct, sig, cl, fregs, esp, r_hi, b_hi, args):
     ext = {}
     for a, data in r.writes:
         if r.esp_call <= a < r_hi:
-            p_ = max((p for p in rk if p <= a), default=None)
-            if p_ is not None:
-                ext[p_] = max(ext.get(p_, 0), a + len(data) - p_)
+            # a merged write over several pointers retail passed (adjacent out-variables in retail's
+            # frame, separate locals in ours) is the bytes written through each: split it at them
+            cuts = [a] + [p for p in rk if a < p < a + len(data)] + [a + len(data)]
+            for lo, hi in zip(cuts, cuts[1:]):
+                p_ = max((p for p in rk if p <= lo), default=None)
+                if p_ is not None:
+                    ext[p_] = max(ext.get(p_, 0), hi - p_)
     if r.esp_call <= r.eax < r_hi:
         p_ = max((p for p in rk if p <= r.eax), default=None)
         if p_ is not None:
@@ -1505,10 +1884,12 @@ def known_pairings(t, cl, r, val):
     return out or None
 
 
-def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
+def run_blob(s, b, mapping, rres, recs, alt=None, info=None, track=None):
     """alt: call site -> frame-pointer pairing to use there (see fp_pairings); info: dict that
-    collects, per call site whose positional pairing is not certain, the alternative pairings."""
+    collects, per call site whose positional pairing is not certain, the alternative pairings.
+    track: follow copies of stale stack bytes (stale_copies) and say which survive in track['final']."""
     uc, ram, con = machine(s)
+    RAM_SIZE[0] = len(ram)
     esp0 = s['esp']
     uc.mem_write(BLOB, bytes(b.data))
     new_esp = esp0 - 0x10000
@@ -1659,11 +2040,17 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
             mk = masks[i] if i < len(masks) else 0xFFFFFFFF
             if mk != 0xFFFFFFFF and any((v ^ x) & mk == 0 for x in rset):
                 continue   # a bool/char/short: only its own width is the value
+            if any((v ^ r.stack[j]) & ((1 << 8 * w) - 1) == 0 for j, w in narrow_slots(t).items() if j < len(r.stack)):
+                continue   # retail's callee reads that stack argument only through its low word/byte (a short)
             if lo_b <= v < hi_b and same_pointee(u, v, r.regs + r.stack):
                 continue   # our copy of a literal / constant: same bytes as what retail passed
             if i in fidx and any(near_float(struct.pack('<I', v), struct.pack('<I', x)) for x in rset):
                 st['fp'] = True   # a float argument a few ulps off (x87 vs SSE rounding): equivalent_fp at best
                 continue
+            if DEBUG:
+                print('  argfail t=%08x direct=%s sig=%s cl=%s masks=%s stack=%s' % (
+                    t, direct, sig and (sig.cc, sig.params), cl, [hex(m_) for m_ in masks],
+                    ' '.join('%08x' % x for x in r.stack)))
             return stop('call %d to %s: argument %d = %08x, retail passed no such value (retail regs %s; stack %s)' % (
                 st['n'], nearest(t), i, v, ' '.join('%08x' % x for x in r.regs), ' '.join('%08x' % x for x in r.stack[:6])))
         kmatch = None
@@ -1680,6 +2067,8 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                         continue
                     v, rv = args[k0], r.regs[REGS.index(e[1])] if e[0] == 'reg' else r.stack[e[1]]
                     mk = masks[k0] if k0 < len(masks) else 0xFFFFFFFF
+                    if e[0] == 'stk' and e[1] in narrow_slots(t):
+                        mk &= (1 << 8 * narrow_slots(t)[e[1]]) - 1
                     if (v ^ rv) & mk == 0 or (esp <= v < b_hi and r.esp_call <= rv < r_hi):
                         continue   # equal, or a frame pointer each side (paired below)
                     if lo_b <= v < hi_b and same_pointee(u, v, [rv]):
@@ -1761,6 +2150,8 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                     p_ = max((p for p in pk if p <= lo), default=None)
                     if p_ is not None:
                         u.mem_write(lo - p_ + pairs[p_], data[lo - a:hi - a])
+                        if track is not None:
+                            track['mark'](lo - p_ + pairs[p_], hi - lo)
                 continue
             u.mem_write(a, data)
         if sig is not None and cl is not None:
@@ -1795,6 +2186,10 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         st['pend'] = addr
         u.reg_write(X.UC_X86_REG_EIP, at)
     uc.hook_add(UC_HOOK_CODE, on_code, begin=lo_b, end=hi_b - 1)
+    if track is not None:   # ours' frame lies under new_esp; retail routines ours runs may copy too
+        fns = common.functions()
+        stale_copies(uc, new_esp - 0x30000, new_esp, [(lo_b, hi_b)] + [
+            (v, v + fns[v]['size_i']) for v in b.run_retail if v in fns], track)
     uc.hook_add(UC_HOOK_CODE, lambda u, a, n, d: st.__setitem__('pend', None), begin=CODE_LO, end=CODE_LO + CODE_N * 64 - 1)
     top0 = (uc.reg_read(X.UC_X86_REG_FPSW) >> 11) & 7
     try:
@@ -1840,6 +2235,9 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         if rk == 'int64' and edx != rres['edx']:
             return 'differs', 'return edx: retail %08x, ours %08x' % (rres['edx'], edx)
     bd = delta(s, ram, con, esp0)
+    if track is not None:
+        track['final'] = stale_final(uc, track)
+    stale = None
     rd = rres['delta']
     nsl = max([w + (sz + 3) // 4 for k, w, sz in mapping if k == 'stk'], default=0)
     for off, ri_, rv, bi, bv, base in ((0, rd[0], rd[1], bd[0], bd[1], s['ram']),
@@ -1857,6 +2255,11 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         bvals = base[idx].copy()
         bvals[np.searchsorted(idx, bi)] = bv
         bad = idx[rvals != bvals]
+        if len(bad) and track is None:
+            if stale is None:
+                stale = stale_both(s, b, mapping, rres, recs, alt)
+            if stale:
+                bad = bad[~np.isin(bad + off, np.array(sorted(stale), dtype=np.int64))]
         if not len(bad):
             continue
         words = sorted({int(x) & ~3 for x in bad})

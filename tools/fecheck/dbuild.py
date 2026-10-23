@@ -77,7 +77,29 @@ def compile_one(path, decomp, env, extra=(), out=None, flags_src=None):
                                 '/I', os.path.dirname(os.path.abspath(flags_src or path))] + fl + list(extra) + ['/Fo' + obj, path]
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, errors='replace', cwd=decomp)
     errs = [l.strip() for l in r.stdout.splitlines() if ': error' in l or 'fatal error' in l]
-    return stem, r.returncode == 0 and os.path.exists(obj), errs[:6], obj
+    ok = r.returncode == 0 and os.path.exists(obj)
+    if ok and NO_STDIO_INLINE not in extra and crt_stdio_static(obj):
+        # VS2022's inline printf/scanf family keeps its options in a CRT-internal static and calls the
+        # UCRT's __stdio_common_*: declared extern instead, sprintf & co. are retail's own libcmt copies
+        return compile_one(path, decomp, env, tuple(extra) + (NO_STDIO_INLINE,), out, flags_src)
+    return stem, ok, errs[:6], obj
+
+
+NO_STDIO_INLINE = '/D_NO_CRT_STDIO_INLINE'
+_STDIO_SEEN = {}
+
+
+def crt_stdio_static(obj):
+    """obj was built with the UCRT's inline stdio (it holds `__local_stdio_printf_options'::_OptionsStorage
+    or the scanf one), cached per path and mtime"""
+    try:
+        key = (obj, os.path.getmtime(obj))
+    except OSError:
+        return False
+    if key not in _STDIO_SEEN:
+        data = open(obj, 'rb').read()
+        _STDIO_SEEN[key] = b'__local_stdio_printf_options' in data or b'__local_stdio_scanf_options' in data
+    return _STDIO_SEEN[key]
 
 
 def newest_header(decomp):

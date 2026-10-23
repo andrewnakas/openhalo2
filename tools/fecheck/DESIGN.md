@@ -113,11 +113,29 @@ pVAF in ecx, Address in eax), ours calls a REG_THUNKS thunk that moves the argum
 registers first. A callee's by-value structure parameters are sized from the source of the object that
 calls it (a linked callee's own file declares them), never guessed from retail's pops, which follow
 retail's convention.
+VS2022's inline printf/scanf family (a CRT-internal `_OptionsStorage` static and the UCRT's
+`__stdio_common_*`) is not built: an object holding it is rebuilt with `/D_NO_CRT_STDIO_INLINE`, so
+`sprintf` & co. are extern and link to retail's own libcmt copies. `memmove` is retail's `memcpy`
+(libcmt's memcpy.asm copies backwards when the ranges overlap).
+
+## Narrow stack arguments
+Retail passes a short in a 32-bit slot with garbage in the high half (it loads 16 bits and pushes
+the register). A callee argument is compared through its low word (byte) when retail's callee only
+ever reads that stack slot that narrowly (`narrow_slots`, read off retail's body by following the
+stack depth): a 16-bit read of the slot, a load into a register whose every later read is of its low
+word (or byte), or a push of it as an argument the next callee reads narrowly. Any read it cannot
+place (an escaping lea, an indexed access, an unknown depth) gives no narrow slots.
 
 ## Compare
 Return registers (eax, edx; x87 top for float), all guest memory writes outside the
 stack, and the call sequence. Equal on all K snapshots -> `equivalent`; otherwise
 `differs` with the first diverging snapshot, address, expected vs got.
+A merged callee write over several frame pointers retail passed (adjacent out-variables in retail's
+frame, separate locals in ours) is split at those pointers before they are paired with ours.
+Bytes that both sides copied with `rep movs` out of stack bytes nothing wrote since the entry (the
+uninitialised part of a local structure copied whole; retail's frame sits elsewhere, e.g. aligned to
+8) and that still hold them at the end are no one's values: when memory differs, both sides run
+again following such copies, and those bytes are left out of the compare.
 
 ## Not handled (marked in the queue `reason` column)
 - Sources calling Direct3D (the Xbox d3d8.h inlines push-buffer writes): `unbuildable: d3d`.
