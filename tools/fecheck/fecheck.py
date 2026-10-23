@@ -65,11 +65,17 @@ TRANSPARENT_NAMES = ['__chkstk', '_memcpy', '__allmul', '__aulldiv', '__alldiv',
                      'D3DDevice_SetVertexShaderConstant1', 'D3DDevice_SetVertexShaderConstant1Fast',
                      'D3DDevice_SetVertexShaderConstant4', 'D3DDevice_SetVertexShaderConstantFast_Dwords',
                      'D3DDevice_SetRenderState_FillMode', 'D3DDevice_SetRenderState_CullMode', 'D3DDevice_SetStateBeforeBegin',
+                     'D3DDevice_SetVertexShaderInput',   # 0x3f7440, under the shim's inline ...InputDirect
+                     'D3DDevice_SelectVertexShaderDirect_Regs',   # 0x3f6cf0 (through REG_THUNKS)
                      # CRT qsort sorts in place through a comparator: both sides run retail's copy (which calls
                      # the comparator each side passes), so the sorted array is compared like any other write
                      '_qsort']
 # transparent routines that clobber ecx/edx like any cdecl call (the helpers above leave them alone)
-TRANSPARENT_CLOBBER = {'_qsort'}
+TRANSPARENT_CLOBBER = {'_qsort', 'D3DDevice_SetVertexShaderInput', 'D3DDevice_SelectVertexShaderDirect_Regs'}
+# transparent routines whose retail register convention the shim's __fastcall declaration cannot
+# spell: ours calls a thunk that moves the arguments into retail's registers, then retail's copy.
+# Code before `push <retail va>; ret`.
+REG_THUNKS = {'D3DDevice_SelectVertexShaderDirect_Regs': bytes([0x89, 0xD0])}   # pVAF in ecx; Address edx -> eax
 ALIASES = {'__ftol2_sse': '__ftol2', '__ftol': '__ftol2', '__alloca_probe': '__chkstk'}
 # mov [SCR],eax; mov [SCR+4],edx; fnsave [SCR+16]
 SENT_CODE = bytes([0xA3]) + struct.pack('<I', SCR) + bytes([0x89, 0x15]) + struct.pack('<I', SCR + 4) + \
@@ -429,6 +435,7 @@ class Blob:
         self.linked = []      # names of functions linked in
         self.unlinked = set() # retail VAs retail never calls directly whose source does not build
         self.run_retail = set() # library routines with no source that ours calls and retail does not: ours runs retail's copy
+        self.inlinable = set()  # callees the source declares inline: ours may inline a call retail makes
         self.entry = None
         self.sig = None
         self.name = None
@@ -546,6 +553,7 @@ def link(objp, va, size, decomp, env, force=(), src=None):
             objs[p] = coff.Coff(p)
         return objs[p]
     o = get(objp)
+    srcof = {objp: src}   # object -> the source it compiles (sizes structures that source declares)
     fsym = next((s for s in o.symbols if _code_sym(o, s) and resolve(s.name) == va), None)
     if fsym is None:
         raise Fail('unbuildable: no symbol for %08x in %s' % (va, os.path.basename(objp)))
@@ -580,12 +588,14 @@ def link(objp, va, size, decomp, env, force=(), src=None):
             p = obj_for(os.path.join('src', src), decomp, env)
         except (Fail, OSError):
             return None
+        srcof.setdefault(p, os.path.join(decomp, 'src', src))
         oo = get(p)
         s = next((s for s in oo.symbols if _code_sym(oo, s) and resolve(s.name) == v), None)
         if s is None and _SRCNAME.get(v):
             # an inline function: emitted only where it is used, so make a use
             p = keep_obj(os.path.join('src', src), _SRCNAME[v], v, decomp, env)
             if p:
+                srcof.setdefault(p, os.path.join(decomp, 'src', src))
                 oo = get(p)
                 s = next((s for s in oo.symbols if _code_sym(oo, s) and resolve(s.name) == v), None)
         return (p, s.section) if s else None
@@ -619,6 +629,17 @@ def link(objp, va, size, decomp, env, force=(), src=None):
                 place(p, t.section)
                 relocs.append(((p, si), off, typ, ('sec', (p, t.section), t.value)))
                 continue
+            pn_ = coff.plain_name(t.name)
+            if v is not None and v in transp and pn_ in REG_THUNKS and typ == coff.IMAGE_REL_I386_REL32:
+                key = ('thunk', pn_)
+                if key not in b.placed:
+                    while len(b.data) % 16:
+                        b.data.append(0xCC)
+                    b.placed[key] = BLOB + len(b.data)
+                    b.data += REG_THUNKS[pn_] + bytes([0x68]) + struct.pack('<I', v) + bytes([0xC3])
+                    b.linked.append('thunk:' + pn_)
+                relocs.append(((p, si), off, typ, ('sec', key, 0)))
+                continue
             if v is not None and typ == coff.IMAGE_REL_I386_REL32 and (v not in rc or v in force) and v not in transp and v != va:
                 cd = (p, t.section) if (t.section > 0 and is_code) else code_def(t.name)
                 row = common.functions(decomp).get(v) if not cd and v not in rc else None
@@ -640,7 +661,8 @@ def link(objp, va, size, decomp, env, force=(), src=None):
                 target = ('va', v)
                 if typ == coff.IMAGE_REL_I386_REL32 and v not in transp:
                     b.callees.add(v)
-                    b.callee_sig[v] = sized(coff.signature(t.name), decomp, env, src if p == objp else None)
+                    # a call from a linked callee's object: that callee's own source declares its structures
+                    b.callee_sig[v] = sized(coff.signature(t.name), decomp, env, srcof.get(p))
             if target is None and t.section > 0 and t.name.startswith('??_7'):
                 # a vtable with no retail address: retail's own copy, when its contents single it out, so
                 # an object's vtable pointer (stored into compared memory) is retail's
@@ -728,7 +750,30 @@ def link(objp, va, size, decomp, env, force=(), src=None):
         else:
             raise Fail('unbuildable: reloc type %d' % typ)
     b.entry = b.placed[(objp, fsym.section)] + fsym.value
+    b.inlinable = {v for v in b.callees if declared_inline(v, decomp)}
     return b
+
+
+_INL = {}
+
+
+def declared_inline(v, decomp):
+    """True when the decomp source defines retail function v as `inline`: our compile may then
+    inline calls retail makes (its writes are then ours, and compared as such)."""
+    key = (v, decomp)
+    if key not in _INL:
+        table()
+        src = _SOURCES.get(v)
+        out = False
+        if src:
+            try:
+                text = open(os.path.join(decomp, 'src', src), errors='replace').read()
+            except OSError:
+                text = ''
+            m = re.search(r'//\s*@retail\s+0x0*%x\b[^\n]*\n([^(]*)\(' % v, text)
+            out = bool(m and re.search(r'\b(inline|__inline|__forceinline)\b', m.group(1)))
+        _INL[key] = out
+    return _INL[key]
 
 
 # ---------------------------------------------------------------- convention
@@ -1224,6 +1269,70 @@ def callee_nargs(va):
     return _NARGS[va]
 
 
+_NULLDEF = {}
+
+
+def null_defaults(va):
+    """Arguments retail function va replaces when NULL, read off its entry: `test R, R` then
+    `jne` over `mov R, imm` / `cmove R, [addr]` (R a register argument, or loaded from a stack
+    argument first). LTCG then passes the replacement itself at call sites where the source passes
+    NULL. {('reg', name) | ('stk', slot): ('imm', value) | ('mem', addr)}."""
+    if va not in _NULLDEF:
+        r = common.functions().get(va) if va < KVA else None
+        out = {}
+        if r:
+            ins = list(md.disasm(common.xbe_read(va, min(r['size_i'], 0x80)) or b'', va))[:24]
+            held, depth = {}, 0     # register -> argument location it holds; bytes pushed below the return address
+            for k, i in enumerate(ins):
+                o = i.operands
+                if i.mnemonic in ('ret', 'call', 'jmp'):
+                    break
+                if i.mnemonic == 'push':
+                    depth += 4
+                    continue
+                if i.mnemonic == 'sub' and o[0].type == CX.X86_OP_REG and md.reg_name(o[0].reg) == 'esp' and o[1].type == CX.X86_OP_IMM:
+                    depth += o[1].imm
+                    continue
+                if i.mnemonic == 'mov' and o[0].type == CX.X86_OP_REG and o[1].type == CX.X86_OP_MEM and                         o[1].mem.base and md.reg_name(o[1].mem.base) == 'esp' and not o[1].mem.index:
+                    d = o[1].mem.disp - depth - 4
+                    if d >= 0 and d % 4 == 0:
+                        held[md.reg_name(o[0].reg)] = ('stk', d // 4)
+                        continue
+                if i.mnemonic == 'test' and o[0].type == o[1].type == CX.X86_OP_REG and o[0].reg == o[1].reg:
+                    rn = md.reg_name(o[0].reg)
+                    where = held.get(rn, ('reg', rn) if rn in REGS else None)
+                    for j in ins[k + 1:k + 6]:
+                        oj = j.operands
+                        if j.mnemonic == 'cmove' and md.reg_name(oj[0].reg) == rn and oj[1].type == CX.X86_OP_MEM                                 and not oj[1].mem.base and not oj[1].mem.index:
+                            out[where] = ('mem', oj[1].mem.disp & 0xFFFFFFFF)
+                            break
+                        if j.mnemonic in ('jne', 'jnz') and oj[0].type == CX.X86_OP_IMM:
+                            nx = [x for x in ins if x.address == j.address + j.size]
+                            if nx and nx[0].mnemonic == 'mov' and nx[0].operands[0].type == CX.X86_OP_REG and                                     md.reg_name(nx[0].operands[0].reg) == rn and nx[0].operands[1].type == CX.X86_OP_IMM and                                     nx[0].address + nx[0].size == oj[0].imm:
+                                out[where] = ('imm', nx[0].operands[1].imm & 0xFFFFFFFF)
+                            break
+                        if j.mnemonic in ('test', 'cmp', 'call', 'ret', 'jmp'):
+                            break
+                        if any(x.type == CX.X86_OP_REG and md.reg_name(x.reg) == rn for x in oj[:1]):
+                            break
+        _NULLDEF[va] = out
+    return _NULLDEF[va]
+
+
+def null_default_of(u, t, e, rv):
+    """True when retail passed rv in place e (('reg', name) / ('stk', slot)) of callee t where the
+    callee would have substituted rv for NULL anyway (see null_defaults)."""
+    d = null_defaults(t).get(tuple(e))
+    if d is None:
+        return False
+    if d[0] == 'imm':
+        return d[1] == rv
+    try:
+        return u32(u, d[1]) == rv
+    except UcError:
+        return False
+
+
 JCC = {'jo', 'jno', 'jb', 'jae', 'je', 'jne', 'jbe', 'ja', 'js', 'jns', 'jp', 'jnp', 'jl', 'jge', 'jle', 'jg', 'jecxz'}
 
 
@@ -1460,8 +1569,9 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         direct = ins.operands[0].type == CX.X86_OP_IMM
         st['n'] += 1
         ri = st['ri']
-        while ri < len(recs) and recs[ri].target != t and not recs[ri].indirect and recs[ri].target not in b.callees:
-            ri += 1   # retail calls F inlined
+        while ri < len(recs) and recs[ri].target != t and not recs[ri].indirect and (
+                recs[ri].target not in b.callees or recs[ri].target in b.inlinable):
+            ri += 1   # retail calls F inlined (or calls one ours may inline)
         if (ri >= len(recs) or recs[ri].target != t) and t in b.unlinked:
             return stop('UNLINKED %s: retail inlined it and its source does not build here' % nearest(t))
         if ri >= len(recs) or recs[ri].target != t:
@@ -1577,6 +1687,8 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
                     if k0 in fidx and near_float(struct.pack('<I', v), struct.pack('<I', rv)):
                         st['fp'] = True
                         continue
+                    if v == 0 and null_default_of(u, t, e, rv):
+                        continue   # ours passes NULL, retail the default its callee puts in its place
                     miss = (i, v, rv, e)
                     break
                 if miss is None:
@@ -1697,7 +1809,7 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
         return 'differs', st['fail']
     if uc.reg_read(X.UC_X86_REG_EIP) != SENT_END:
         return 'differs', 'ours did not return (cap/loop) at %08x' % uc.reg_read(X.UC_X86_REG_EIP)
-    left = [r for r in recs[st['ri']:] if r.indirect or r.target in b.callees]
+    left = [r for r in recs[st['ri']:] if r.indirect or (r.target in b.callees and r.target not in b.inlinable)]
     if left:
         return 'differs', 'retail calls %s next (call %d); ours made no more calls' % (nearest(left[0].target), st['n'] + 1)
     eax, edx = struct.unpack('<II', uc.mem_read(SCR, 8))
@@ -1829,6 +1941,10 @@ def known_maps(va, sig):
                 _KNOWN[int(row['va'], 16)].append(row['map'])
             except (KeyError, ValueError):
                 pass
+        # FECHECK_IGNORE_ROWS=va,va,... (or 'all'): leave those rows out, to test the search unaided
+        ign = os.environ.get('FECHECK_IGNORE_ROWS', '').strip()
+        for v in (list(_KNOWN) if ign == 'all' else [int(x, 16) for x in ign.split(',') if x.strip()]):
+            _KNOWN.pop(v, None)
     loc = sig.locations() if sig else None
     out = []
     for text in _KNOWN.get(va, []):
@@ -2144,6 +2260,7 @@ def fmt_map(m):
     return ', '.join('p%d<-%s' % (i, w if k == 'reg' else 'stk%d' % w) for i, (k, w, sz) in enumerate(m))
 
 
+NOCALL = 'retail makes no such call here'
 SAVE_TAG = None   # main() sets it: check() then saves a provisional verdict before risky retries
 
 
@@ -2263,6 +2380,12 @@ def check(va, decomp, env, src=None, k=6, budget=240):
                         if not v.startswith('equivalent'):
                             bad = (os.path.basename(p), d)
                             break
+                    if DEBUG:
+                        print('  map %s: %s' % (fmt_map(m), bad[1][:160] if bad else 'agrees'))
+                    if bad and NOCALL in bad[1]:
+                        nm_ = bad[1].split(' to ', 1)[1].split(': ' + NOCALL, 1)[0]
+                        if nm_ not in nocall:
+                            nocall.append(nm_)
                     if first is None or (bad and len(verdicts) > first[3]):
                         first = (m, bad, verdicts, len(verdicts), sg)
                     if bad is None:
@@ -2291,12 +2414,20 @@ def check(va, decomp, env, src=None, k=6, budget=240):
                 f2, chosen = search(b, retry=True)
             return first, chosen
         force = set()
+        nocall = []   # callees ours calls where retail does not, under any mapping tried
         first, chosen = search2(b)
-        # a callee retail inlines here but calls elsewhere: run our compile of it, then search again
-        while chosen is None and first[1] and 'retail makes no such call here' in first[1][1] and len(force) < 4:
-            nm = first[1][1].split(' to ', 1)[1].split(': retail makes', 1)[0]
-            tv = resolve(nm) if nm in table() else None
-            if tv is None or tv in force:
+        # a callee retail inlines here but calls elsewhere: run our compile of it, then search again.
+        # Any mapping's failure names it: the mapping reported (the one that ran furthest) may be a
+        # wrong one that fails earlier for another reason, e.g. our own register convention
+        while chosen is None and len(force) < 4:
+            tv = None
+            for nm in ([first[1][1].split(' to ', 1)[1].split(': ' + NOCALL, 1)[0]]
+                       if first[1] and NOCALL in first[1][1] else []) + nocall:
+                tv = resolve(nm) if nm in table() else None
+                if tv is not None and tv not in force:
+                    break
+                tv = None
+            if tv is None:
                 break
             force.add(tv)
             try:

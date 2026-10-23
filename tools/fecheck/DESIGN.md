@@ -23,6 +23,13 @@ call sequence: target, entry registers, stack arguments, and the callee's return
 registers / x87 top / memory writes. Pair F's calls with retail's in order by target.
 Retail's recorded effects are replayed as the mock's result. Divergence in target
 order, count or argument values is reported as the first difference.
+A callee the source defines `inline` may be inlined by our compile where retail calls it: its
+recorded calls are then optional in the sequence (ours does its writes itself, compared as F's).
+A callee that substitutes a default for NULL at its entry (`test R, R; jne; mov R, imm` or
+`cmove R, [g]`) lets LTCG pass the default itself where the source passes NULL: ours passing NULL
+in that place matches retail passing the default.
+A callee ours calls where retail does not (retail inlined it) is linked from its own source and
+the search reruns; the callee is taken from any candidate map's failure, not only the reported one.
 
 ## 3. Convention learning from argument values
 LTCG gives internal callees custom conventions. For each callee, the declaration in our
@@ -100,6 +107,12 @@ vector deleting destructor ``??_E``) links to its default, the scalar deleting d
 By-value structures smaller than a dword compare only their own bytes as call arguments (retail pushes
 a register and stores the byte). VS2022's __libm_sse2_pow_precise runs retail's own _CIpow, so pow's
 IEEE edge cases (pow(0,y>0)=0, ...) are retail's.
+XDK push-buffer routines in TRANSPARENT_NAMES run retail's own copy on both sides. When the shim's
+`__fastcall` declaration cannot spell retail's register convention (D3DDevice_SelectVertexShaderDirect_Regs:
+pVAF in ecx, Address in eax), ours calls a REG_THUNKS thunk that moves the arguments into retail's
+registers first. A callee's by-value structure parameters are sized from the source of the object that
+calls it (a linked callee's own file declares them), never guessed from retail's pops, which follow
+retail's convention.
 
 ## Compare
 Return registers (eax, edx; x87 top for float), all guest memory writes outside the
