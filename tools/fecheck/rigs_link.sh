@@ -156,6 +156,8 @@ press() { local b=$1 i k n d n0 d0; shift; read n0 d0 <<< "$(scr)"
     for k in $(seq 20); do sleep 2; read n d <<< "$(scr)"; [ $d -le 30 ] && [[ " $* " == *" $n "* ]] && return 0; done
     [ "$n" = "$n0" ] || return 1
   done; return 1; }
+# menuq: 1 when the main menu's rows of text (Split Screen .. Settings) are under the logo
+menuq() { python -c "import sys;from PIL import Image;print(1 if sum(1 for x in Image.open(sys.argv[1]).convert('L').crop((250,335,390,410)).tobytes() if x>120)>150 else 0)" "$1" 2>/dev/null; }
 # toavail <profile>: from wherever the copy is in the front end, reach System Link's Available
 # Games signed in with profile row n (0 = Halo0001); every press is chosen from a screenshot
 # (a lagging UI can take the main menu's A on Split Screen: its lobby is left with B, and the
@@ -174,7 +176,10 @@ toavail() { local i n d r pv=
     profiles) rowto $((1 + $1)) 220 450 242 263 284 305 && { cp "$O/rw.png" "$O/s_profile.png"; pad a:500 6; } ;;
     signin|players) pad a:500 6 ;;
     exitdlg|lobby|settings|carnage|setup|gametype|variant|selmap) pad b:500 5 ;;
-    mainmenu) rowto 3 405 435 287 315 343 371 399 && { sleep 3; shot cl
+    # (a title over another background image classified as the main menu, and rowto pressed
+    # down on it for an hour: the menu needs its rows of text under the logo)
+    mainmenu) if [ "$(menuq "$O/cl.png")" != 1 ]; then pad start:1500 6; continue; fi
+      rowto 3 405 435 287 315 343 371 399 && { sleep 3; shot cl
       [ "$(lit "$O/cl.png" 405 435 287 315 343 371 399)" = 3 ] && pad a:500 6; } ;;
     *) sleep 4 ;;
     esac; done; return 1; }
