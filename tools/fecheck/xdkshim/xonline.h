@@ -43,9 +43,13 @@
 #define XONLINE_E_LOGON_USER_ACCOUNT_REQUIRES_MANAGEMENT ((HRESULT)0x80151007L)  /* unverified */
 #define XONLINE_S_LOGON_CONNECTION_ESTABLISHED           ((HRESULT)0x001510F0L)  /* unverified */
 #define XONLINE_S_LOGON_USER_HAS_MESSAGE                 ((HRESULT)0x001510F1L)  /* unverified */
-#define XONLINETASK_S_RUNNING                            ((HRESULT)0x00150001L)  /* unverified */
-#define XONLINETASK_S_RUNNING_IDLE                       ((HRESULT)0x00150002L)  /* unverified */
-#define XONLINETASK_S_RESULTS_AVAIL                      ((HRESULT)0x00150003L)  /* unverified */
+/* retail 0x6c450 (online_task_update) and 0x6b640 compare the continue result with 0 (running),
+   0x1500f1 (results available) and 0x1500f2 (running idle); SUCCESS is the next code in that
+   family below them (any value that is not one of the other cases behaves the same there) */
+#define XONLINETASK_S_RUNNING                            ((HRESULT)0x00000000L)
+#define XONLINETASK_S_SUCCESS                            ((HRESULT)0x001500F0L)
+#define XONLINETASK_S_RESULTS_AVAIL                      ((HRESULT)0x001500F1L)
+#define XONLINETASK_S_RUNNING_IDLE                       ((HRESULT)0x001500F2L)
 
 /* ---- handles ---- */
 typedef struct XONLINETASK_CONTEXT *XONLINETASK_HANDLE, **PXONLINETASK_HANDLE;
