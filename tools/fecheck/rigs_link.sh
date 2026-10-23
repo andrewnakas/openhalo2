@@ -157,7 +157,8 @@ press() { local b=$1 i k n d n0 d0; shift; userbusy && return 1; read n0 d0 <<< 
     [ "$n" = "$n0" ] || return 1
   done; return 1; }
 # menuq: 1 when the main menu's rows of text (Split Screen .. Settings) are under the logo
-menuq() { python -c "import sys;from PIL import Image;print(1 if sum(1 for x in Image.open(sys.argv[1]).convert('L').crop((250,335,390,410)).tobytes() if x>120)>150 else 0)" "$1" 2>/dev/null; }
+# (unlit rows peak near 110, the title's band below 40)
+menuq() { python -c "import sys;from PIL import Image;print(1 if sum(1 for x in Image.open(sys.argv[1]).convert('L').crop((250,335,390,410)).tobytes() if x>80)>300 else 0)" "$1" 2>/dev/null; }
 # toavail <profile>: from wherever the copy is in the front end, reach System Link's Available
 # Games signed in with profile row n (0 = Halo0001); every press is chosen from a screenshot
 # (a lagging UI can take the main menu's A on Split Screen: its lobby is left with B, and the
