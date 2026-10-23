@@ -222,20 +222,21 @@ host() {
 # focus back on Create New Game every few seconds); a game it created by mistake is left again
 # Only once a game is listed (a second row under Create New Game): pressing on an empty list
 # created B's own game every time, and the 8 tries ran out before the host's game was listed.
-# Up to JOIN_WAIT seconds (default 300) for the listing; B leaves and re-enters the list halfway.
+# Up to JOIN_WAIT seconds (default 600: under load one try takes a minute or more) for the listing; B leaves and re-enters the list halfway.
 listed() { python -c "import sys;from PIL import Image;print(1 if sum(1 for x in Image.open(sys.argv[1]).convert('L').crop((80,116,260,154)).tobytes() if x>60)>200 else 0)" "$1" 2>/dev/null; }
 # gamerow: up to 5 screenshots until the listed game's row (not Create New Game) has the focus
 # (a down swallowed by a slow frame made A create B's own game)
 gamerow() { local k; for k in 1 2 3 4 5; do shot sl || continue; [ "$(lit "$O/sl.png" 80 260 86 128)" = 1 ] && return 0; done; return 1; }
-join() { local i n d w=$SECONDS rf= gf=0
+join() { local i n d w=$SECONDS rf=
   for i in $(seq 40); do read n d <<< "$(scr)"
     case $n in
     # (the budget is checked only here: a slow lobby that was the host's came after it once)
-    available) [ $((SECONDS - w)) -ge ${JOIN_WAIT:-300} ] && return 1
+    available) [ $((SECONDS - w)) -ge ${JOIN_WAIT:-600} ] && return 1
       if [ "$(listed "$O/cl.png")" = 1 ]; then cp "$O/cl.png" "$O/s_listed.png"; pad down:600 0.2
-        # (after three misses A anyway, as before: the row test is a guard, not a gate)
-        { gamerow || { gf=$((gf + 1)); [ $gf -ge 3 ]; }; } && pad a:500 10
-      elif [ -z "$rf" ] && [ $((SECONDS - w)) -ge $(( ${JOIN_WAIT:-300} / 2 )) ]; then rf=1; pad b:500 6; toavail 1
+        # (the focus can still go back to Create New Game before a lagging A lands: its own
+        # lobby is then left with B and the list tried again)
+        gamerow && pad a:500 10
+      elif [ -z "$rf" ] && [ $((SECONDS - w)) -ge $(( ${JOIN_WAIT:-600} / 2 )) ]; then rf=1; pad b:500 6; toavail 1
       else sleep 6; fi ;;
     ingame) cp "$O/cl.png" "$O/s_joined.png"; return 0 ;;   # joined a game in progress
     lobby) if [ "$(joinedq "$O/cl.png")" = 1 ]; then cp "$O/cl.png" "$O/s_joined.png"; return 0; fi
