@@ -180,6 +180,10 @@ toavail() { local i n d r pv=
     esac; done; return 1; }
 # countdown: 1 when the lobby shows the start countdown ("Press X to cancel" line)
 countdown() { python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');print(1 if sum(1 for x in im.crop((60,128,300,142)).tobytes() if x>150)>20 else 0)" "$1" 2>/dev/null; }
+# watchlit <test>: up to 5 fresh screenshots (sl.png) until <test> on one says 1: a lagging UI
+# shows a move seconds late, and the lobby soon puts its focus back on Start Game (one
+# screenshot 0.2 s after the press missed it ten times in a row: host-fail(2))
+watchlit() { local k; for k in 1 2 3 4 5; do shot sl || continue; [ "$($1 "$O/sl.png")" = 1 ] && return 0; done; return 1; }
 # tosetup: from the host lobby into Custom Game Setup. Right moves to Game Setup, but the lobby
 # puts its focus back on Start Game every few seconds and a slow frame can swallow the press, so
 # A is pressed only right after a screenshot shows Game Setup lit; a countdown it started anyway
@@ -189,8 +193,7 @@ tosetup() { local i n d
     case $n in
     setup) return 0 ;;
     lobby) if [ "$(countdown "$O/cl.png")" = 1 ]; then pad x:500 3; continue; fi
-      if [ "$(setuplit "$O/cl.png")" != 1 ]; then pad right:700 0.2; shot sl; fi
-      if [ "$(setuplit "$O/sl.png")" = 1 ] || [ "$(setuplit "$O/cl.png")" = 1 ]; then pad a:500 4; fi ;;
+      if [ "$(setuplit "$O/cl.png")" = 1 ]; then pad a:500 4; else pad right:700 0.2; watchlit setuplit && pad a:500 4; fi ;;
     gametype|variant|selmap) pad b:500 5 ;;
     ingame) return 1 ;;
     *) sleep 4 ;;
@@ -244,8 +247,7 @@ mpgo() { local i n d
     # A only right after a screenshot shows Start Game lit: a left swallowed by a slow frame
     # left Game Setup lit, A opened Custom Game Setup and B came back, six times over
     lobby) [ "$(countdown "$O/cl.png")" = 1 ] && { sleep 10; continue; }
-      if [ "$(startlit "$O/cl.png")" != 1 ]; then pad left:700 0.2; shot sl; fi
-      if [ "$(startlit "$O/sl.png")" = 1 ] || [ "$(startlit "$O/cl.png")" = 1 ]; then pad a:500 15; else sleep 3; fi ;;
+      if [ "$(startlit "$O/cl.png")" = 1 ]; then pad a:500 15; else pad left:700 0.2; watchlit startlit && pad a:500 15; fi ;;
     ingame) return 0 ;;
     setup|gametype|variant|selmap) pad b:500 5 ;;
     *) sleep 8 ;;
