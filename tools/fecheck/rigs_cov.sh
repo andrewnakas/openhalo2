@@ -64,7 +64,7 @@ tomain() { local prof=$1 row=$2 i n d r
       [ $((i % 2)) = 0 ] && pad b:500 4 || sleep 3 ;;
     esac; done; return 1; }
 # reboot_a: kill copy A and start it again (a crawl that ended in a game or a hang)
-reboot_a() { [ -n "${PID[A]}" ] && taskkill //F //PID ${PID[A]} > /dev/null 2>&1; PID[A]=; sleep 5; boot A; use A; }
+reboot_a() { [ -n "${PID[A]}" ] && taskkill //F //T //PID ${PID[A]} > /dev/null 2>&1; PID[A]=; sleep 5; boot A; use A; }
 # anchor <main row>: to that main-menu row, rebooting once when the copy is lost
 anchor() { tomain 0 $1 && return 0; reboot_a && tomain 0 $1; }
 # crawl <depth> <tag> [SKIP list]: cov_drive.py from the current screen (screens c_<tag>_*.png)
@@ -169,8 +169,8 @@ for s in "${SC[@]}"; do
     m=${s:5}; ty=${m#*_}; m=${m%%_*}; tr=$(typerow $ty); [ $tr = -1 ] && { echo "$s: unknown game type"; continue; }
     link_up $m $tr && both_play $FIGHT_MIN 1
     case $s in
-    dropB*) taskkill //F //PID ${PID[B]} > /dev/null 2>&1; PID[B]=; st+="B-killed "; watch A 240 after ;;
-    dropA*) taskkill //F //PID ${PID[A]} > /dev/null 2>&1; PID[A]=; st+="A-killed "; watch B 240 after ;;
+    dropB*) taskkill //F //T //PID ${PID[B]} > /dev/null 2>&1; PID[B]=; st+="B-killed "; watch A 240 after ;;
+    dropA*) taskkill //F //T //PID ${PID[A]} > /dev/null 2>&1; PID[A]=; st+="A-killed "; watch B 240 after ;;
     leaveB*) leave_game B; st+="B-left "; watch A 120 after; watch B 60 after ;;
     esac
     use A; alive && { endgame; } ;;
