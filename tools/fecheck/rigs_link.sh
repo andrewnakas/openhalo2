@@ -296,7 +296,10 @@ endgame() { local i n d c k
 over_budget() { [ $((SECONDS - t0)) -ge ${REACH_MAX:-4200} ]; }
 if [ -n "$RIG_LIB" ]; then return 0 2>/dev/null || exit 0; fi
 
-for s in "${SC[@]}"; do
+# a scenario abandoned because the owner started a game goes to the end of the list again
+# (up to OWNER_RETRY times, default 3)
+declare -A RETRY; si=0
+while [ $si -lt ${#SC[@]} ]; do s=${SC[$si]}; si=$((si + 1))
   case $s in link[0-9]*_*) ;; *) echo "unknown scenario $s"; continue ;; esac
   m=${s#link}; ty=${m#*_}; m=${m%%_*}; tr=-1
   for i in "${!TYPES[@]}"; do [ "${TYPES[$i]}" = "$ty" ] && tr=$i; done
@@ -333,4 +336,5 @@ for s in "${SC[@]}"; do
   line="$s: $((SECONDS - t0)) s, $st"
   for c in A B; do O=${OD[$c]}; line+="| $c $(grep -a 'fps (' "$O/out.log" | tail -1 | sed 's/.*\] //'), fe.bin $(stat -c %s "$O/fe.bin" 2>/dev/null || echo missing), snaps $(grep -a -c '\[FE\] snap ' "$O/out.log") "; done
   echo "$line"
+  case "$st" in *owner-busy*) RETRY[$s]=$(( ${RETRY[$s]:-0} + 1 )); [ ${RETRY[$s]} -le ${OWNER_RETRY:-3} ] && SC+=("$s") ;; esac
 done
