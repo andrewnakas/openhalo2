@@ -78,7 +78,7 @@ def _probe(decomp, env, hdr, rows, types, tmp):
                                                                    '/Od', '/Fo' + tmp + os.sep, '/Fe' + exe, src]
         r = subprocess.run(cmd, capture_output=True, text=True, env=env, errors='replace', cwd=tmp)
         if r.returncode == 0 and os.path.exists(exe):
-            out = subprocess.run([exe], capture_output=True, text=True, errors='replace').stdout
+            out = subprocess.run(common.run_exe() + [exe], capture_output=True, text=True, errors='replace', env=env).stdout
             res = {}
             for line in out.splitlines():
                 d, g, off, size = line.split()

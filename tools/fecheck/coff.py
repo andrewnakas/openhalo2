@@ -1,7 +1,11 @@
 """Minimal i386 COFF object reader + MSVC name undecoration (dbghelp)."""
 import ctypes
+import os
 import re
 import struct
+import subprocess
+import sys
+import threading
 
 IMAGE_REL_I386_ABSOLUTE = 0
 IMAGE_REL_I386_DIR32 = 6
@@ -112,6 +116,38 @@ class Coff:
 
 
 _dbghelp = None
+_undec = None
+_undec_cache = {}
+_undec_lock = threading.Lock()
+
+
+def _undecorate_wine(name, flags):
+    """undecorate off Windows: the same Microsoft dbghelp (common.DBGHELP) in undec.exe under Wine."""
+    global _undec
+    import common
+    with _undec_lock:
+        key = (name, flags)
+        if key in _undec_cache:
+            return _undec_cache[key]
+        if _undec is None:
+            env = common.vcenv()
+            exe = os.path.join(common.WORK, 'undec', 'undec.exe')
+            src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'undec.c')
+            if not os.path.exists(exe) or os.path.getmtime(exe) < os.path.getmtime(src):
+                os.makedirs(os.path.dirname(exe), exist_ok=True)
+                r = subprocess.run([common.CL, '/nologo', '/O1', '/Fo' + exe[:-4] + '.obj', '/Fe' + exe, src],
+                                   capture_output=True, text=True, env=env, cwd=os.path.dirname(exe))
+                if r.returncode or not os.path.exists(exe):
+                    raise RuntimeError('undec.exe does not build: ' + r.stdout[-400:])
+            env = dict(env, WINEDLLOVERRIDES=env.get('WINEDLLOVERRIDES', '') + ';dbghelp=n')
+            _undec = subprocess.Popen(common.run_exe() + [exe, common.winpath(common.DBGHELP)], env=env,
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding='latin-1', bufsize=1)
+        _undec.stdin.write('%x %s\n' % (flags, name))
+        out = _undec.stdout.readline()
+        if not out:
+            raise RuntimeError('undec.exe exited (is %s Microsoft dbghelp.dll?)' % common.DBGHELP)
+        _undec_cache[key] = out = out.rstrip('\n')
+        return out
 
 
 def undecorate(name, flags=0):
@@ -119,6 +155,8 @@ def undecorate(name, flags=0):
     global _dbghelp
     if not name.startswith('?'):
         return name
+    if sys.platform != 'win32':
+        return _undecorate_wine(name, flags)
     if _dbghelp is None:
         _dbghelp = ctypes.WinDLL('dbghelp')
         _dbghelp.UnDecorateSymbolName.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32]

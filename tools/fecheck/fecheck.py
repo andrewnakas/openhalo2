@@ -2479,6 +2479,8 @@ def main():
     if os.name == 'nt' and os.environ.get('FECHECK_PRIORITY', 'low') == 'low':
         import ctypes   # below normal: overnight rigs play the game beside the checks
         ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
+    elif os.name != 'nt' and os.environ.get('FECHECK_PRIORITY', 'low') == 'low':
+        os.nice(10)
     ap = argparse.ArgumentParser()
     ap.add_argument('vas', nargs='+')
     ap.add_argument('--decomp', default=common.DECOMP)

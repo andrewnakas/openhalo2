@@ -20,12 +20,47 @@ XBE = HALO2 + '/dirty/game/default.xbe'
 GEN = os.path.join(OPENHALO2, 'port', 'xr', 'src', 'recomp', 'gen').replace('\\', '/')
 SHIM = os.path.join(HERE, 'xdkshim')
 VCVARS = r'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat'
-CL = r'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x86\cl.exe'
+MSVC_VER, SDK_VER = '14.44.35207', '10.0.26100.0'
+CL = r'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\%s\bin\Hostx64\x86\cl.exe' % MSVC_VER
+WINDOWS = sys.platform == 'win32'
+if not WINDOWS:
+    # Linux: the same cl.exe under Wine. FECHECK_MSVC holds a copy of a VS2022 BuildTools install:
+    #   VC/Tools/MSVC/<MSVC_VER>/  and  Kits/10/{Include,Lib}/<SDK_VER>/
+    # (from C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools and .../Windows Kits).
+    MSVC = os.environ.get('FECHECK_MSVC', os.path.join(os.path.dirname(OPENHALO2), 'msvc'))
+    CL_EXE = os.path.join(MSVC, 'VC', 'Tools', 'MSVC', MSVC_VER, 'bin', 'Hostx64', 'x86', 'cl.exe')
+    CL = os.path.join(HERE, 'wine_cl.py')
+    # coff.undecorate: Microsoft's 32-bit dbghelp.dll (C:/Windows/SysWOW64/dbghelp.dll)
+    DBGHELP = os.environ.get('FECHECK_DBGHELP', os.path.join(MSVC, 'dbghelp.dll'))
 GAME_LO, GAME_HI = 0x12000, 0x2CB4E2
+
+
+def winpath(p):
+    """A Unix path as Wine sees it (Z: is /)."""
+    return 'Z:' + os.path.abspath(p).replace('/', '\\')
+
+
+def run_exe():
+    """Prefix that runs a built Windows program (wine off Windows)."""
+    return [] if WINDOWS else ['wine']
 
 
 def vcenv():
     """The environment of an amd64_x86 VS2022 developer prompt (cached)."""
+    if not WINDOWS:
+        vc = os.path.join(MSVC, 'VC', 'Tools', 'MSVC', MSVC_VER)
+        kit = os.path.join(MSVC, 'Kits', '10')
+        env = dict(os.environ)
+        env.setdefault('WINEPREFIX', os.path.join(os.path.dirname(MSVC), 'wineprefix'))
+        env.setdefault('WINEDEBUG', '-all')
+        env.setdefault('WINEDLLOVERRIDES', 'mscoree,mshtml=')
+        env['INCLUDE'] = ';'.join(winpath(p) for p in (
+            os.path.join(vc, 'include'),
+            *(os.path.join(kit, 'Include', SDK_VER, d) for d in ('ucrt', 'um', 'shared', 'winrt', 'cppwinrt'))))
+        env['LIB'] = ';'.join(winpath(p) for p in (
+            os.path.join(vc, 'lib', 'x86'),
+            *(os.path.join(kit, 'Lib', SDK_VER, d, 'x86') for d in ('ucrt', 'um'))))
+        return env
     os.makedirs(WORK, exist_ok=True)
     cache = os.path.join(WORK, 'vcenv.json')
     if os.path.exists(cache):
