@@ -169,13 +169,13 @@ toavail() { local i n d r pv=
     case $n in
     available) cp "$O/cl.png" "$O/s_available.png"; return 0 ;;
     title) pad start:1500 6 ;;
-    profiles) r=$(lit "$O/cl.png" 220 450 242 263 284 305)
-      if [ "$r" = $((1 + $1)) ]; then cp "$O/cl.png" "$O/s_profile.png"; pad a:500 6
-      elif [ "${r:--1}" -gt $((1 + $1)) ]; then pad up:450 3; else pad down:450 3; fi ;;
+    # (rows are reached with rowto, which waits for each move and adapts the hold: fixed
+    # 450 ms presses on a slow frame rate moved two rows and see-sawed past the target)
+    profiles) rowto $((1 + $1)) 220 450 242 263 284 305 && { cp "$O/rw.png" "$O/s_profile.png"; pad a:500 6; } ;;
     signin|players) pad a:500 6 ;;
     exitdlg|lobby|settings|carnage|setup|gametype|variant|selmap) pad b:500 5 ;;
-    mainmenu) r=$(lit "$O/cl.png" 405 435 287 315 343 371 399)
-      if [ "$r" = 3 ]; then sleep 3; shot cl; [ "$(lit "$O/cl.png" 405 435 287 315 343 371 399)" = 3 ] && pad a:500 6; elif [ "${r:--1}" -gt 3 ]; then pad up:450 3; else pad down:450 3; fi ;;
+    mainmenu) rowto 3 405 435 287 315 343 371 399 && { sleep 3; shot cl
+      [ "$(lit "$O/cl.png" 405 435 287 315 343 371 399)" = 3 ] && pad a:500 6; } ;;
     *) sleep 4 ;;
     esac; done; return 1; }
 # countdown: 1 when the lobby shows the start countdown ("Press X to cancel" line)
