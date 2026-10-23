@@ -140,7 +140,10 @@ hud() { python -W ignore -c "import sys;from PIL import Image;v=Image.open(sys.a
 # rowto <target> <x0> <x1> <y>...: up/down until row <target> is lit; after each press wait (up to
 # 12 s) for the lit row to change
 rowto() { local tg=$1 r r2 i k h=${ROWHOLD:-300}; shift
-  for i in $(seq 16); do shot rw; r=$(lit "$O/rw.png" "$@"); [ "$r" = $tg ] && return 0
+  # (the target row must still be lit on a second screenshot 2 s later: a lagging move that
+  # landed after the first one put A on Switch To: Co-Op Game, link0_oddball)
+  for i in $(seq 16); do shot rw; r=$(lit "$O/rw.png" "$@")
+    [ "$r" = $tg ] && { sleep 2; shot rw; [ "$(lit "$O/rw.png" "$@")" = $tg ] && return 0; continue; }
     if [ "${r:--1}" = -1 ]; then [ $((i % 4)) = 3 ] && pad down:$h 1; sleep 2; continue; fi
     if [ "$r" -gt $tg ]; then pad up:$h 1; else pad down:$h 1; fi
     for k in 1 2 3 4 5 6; do sleep 2; shot rw; r2=$(lit "$O/rw.png" "$@"); [ "$r2" != "$r" ] && break; done
