@@ -166,7 +166,7 @@ for s in "${SC[@]}"; do
       else st+="no-live-menu "; fi
     else st+="A-noboot "; fi ;;
   dropB[0-9]*_*|dropA[0-9]*_*|leaveB[0-9]*_*)
-    m=${s:5}; ty=${m#*_}; m=${m%%_*}; tr=$(typerow $ty); [ $tr = -1 ] && { echo "$s: unknown game type"; continue; }
+    m=${s#*[AB]}; ty=${m#*_}; m=${m%%_*}; tr=$(typerow $ty); [ $tr = -1 ] && { echo "$s: unknown game type"; continue; }
     link_up $m $tr && both_play $FIGHT_MIN 1
     case $s in
     dropB*) taskkill //F //T //PID ${PID[B]} > /dev/null 2>&1; PID[B]=; st+="B-killed "; watch A 240 after ;;
