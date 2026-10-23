@@ -10,7 +10,8 @@
 #                Settings (Player Profiles, Game Variants: editors several levels deep). The copy's
 #                UDATA is put back from PRISTINE_GAME before and after (the crawl may edit or
 #                delete profiles and variants).
-#   pause<row>   campaign level <row> (Select Level row), fight, then crawl the pause menu.
+#   pause<row>   campaign level <row> (Select Level row), fight CAMP_MIN minutes (default 3), then
+#                crawl the pause menu.
 #   coop<row>    split-screen co-op: two pads (RECOMP_USB_PADS=2, pad p2 joins), Campaign ->
 #                Cooperative, level <row>, both players fight.
 #   live         Open Live (RECOMP_OPEN_LIVE=1, local gamertag; the transport is the relay of
@@ -138,7 +139,7 @@ for s in "${SC[@]}"; do
     else st+="A-noboot "; fi
     kill_mine; udata_reset $DIRA ;;
   pause[0-9]*)
-    if boot A; then use A; anchor 0 && camp_go ${s#pause} && hudlong && { st+="inlevel "; cshot c0; fight 3
+    if boot A; then use A; anchor 0 && camp_go ${s#pause} && hudlong && { st+="inlevel "; cshot c0; fight ${CAMP_MIN:-3}
         pad start:500 5; cshot pause; crawl 2 pause 'pause_0,pause_4,pause_1_*,pause_2_*'; cshot end; } || st+="nolevel "
     else st+="A-noboot "; fi ;;
   coop[0-9]*)
