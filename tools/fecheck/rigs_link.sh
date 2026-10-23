@@ -260,7 +260,8 @@ mpgo() { local i n d
 # ingame_wait: up to 5 minutes for the copy's map (in-game screen)
 ingame_wait() { local i n d; for i in $(seq 40); do alive || return 1; read n d <<< "$(scr)"; [ $n = ingame ] && return 0; sleep 6; done; return 1; }
 # fight <minutes>: wander and fight (rigs5's loop); stops early when the copy is back in a menu
-fight() { local end=$((SECONDS + $1 * 60)) n d; while [ $SECONDS -lt $end ]; do alive || return 1
+# (the owner starting a game mid-scenario ends it: userbusy, returns 3)
+fight() { local end=$((SECONDS + $1 * 60)) n d; while [ $SECONDS -lt $end ]; do alive || return 1; userbusy && return 3
     pad lup:1800 2; pad rright:350 0.8; pad rt:1200 1.5; pad lup:1500 1.8; pad x:600 1; pad lt:300 1.2
     pad rleft:500 0.8; pad rt:800 1; pad b:300 1; pad y:300 1.2; pad lup:1200 1.5; pad a:300 1
     pad lthumb:300 0.8; pad rthumb:300 0.8; pad ldown:800 1; pad rup:300 0.6; pad rt:600 1; pad x:300 1
@@ -289,6 +290,8 @@ endgame() { local i n d c k
   for c in A B; do use $c; for i in $(seq 10); do read n d <<< "$(scr)"; [ $n = carnage ] && break; sleep 4; done
     for i in 1 2 3 4; do shot s_carnage$i; pad right:500 3; done; done
 }
+# (userbusy is also checked before B boots and before the start: an owner's game that starts
+# mid-scenario abandons it; the batch then waits as usual)
 # over_budget: the scenario has run REACH_MAX seconds without reaching the fight
 over_budget() { [ $((SECONDS - t0)) -ge ${REACH_MAX:-4200} ]; }
 if [ -n "$RIG_LIB" ]; then return 0 2>/dev/null || exit 0; fi
@@ -308,8 +311,10 @@ for s in "${SC[@]}"; do
   ab=; nm=0
   if boot A; then use A; toavail 0 && host $m $tr; r=$?; [ $r = 0 ] && st+="hosted " || st+="host-fail($r) "; else st+="A-noboot "; ab=1; fi
   [ -z "$ab" ] && over_budget && { st+="over-budget "; ab=1; }
+  [ -z "$ab" ] && userbusy && { st+="owner-busy "; ab=1; }
   if [ -z "$ab" ]; then if boot B; then use B; toavail 1 && join; r=$?; [ $r = 0 ] && st+="joined " || st+="join-fail($r) "; else st+="B-noboot "; ab=1; fi; fi
   [ -z "$ab" ] && over_budget && { st+="over-budget "; ab=1; }
+  [ -z "$ab" ] && userbusy && { st+="owner-busy "; ab=1; }
   if [ -z "$ab" ]; then
     use B; read n d <<< "$(scr)"; case $ty in slayer|oddball|juggernaut) ;; *) [ $n = lobby ] && { teamswap || st+="noswap "; } ;; esac
     use A; shot s_prestart; mpgo && st+="started " || st+="start-fail "
