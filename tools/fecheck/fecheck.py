@@ -211,11 +211,16 @@ KERNEL_EMU = {338: rc4_key, 339: rc4_crypt}
 # id(uc) -> fn(addr, size): told of the writes KERNEL_EMU makes (mem_write fires no write hook), so the
 # retail run records them among a callee's writes
 KWRITE = {}
+# a thread that yields this often is waiting for another thread (an I/O completion, a worker): in the
+# emulator nothing else runs, so the wait never ends. NtYieldExecution, KeDelayExecutionThread
+YIELDS = {238, 99}
+SPIN = 100_000
+SPUN = {}   # id(uc) -> return address of the yield that crossed SPIN
 
 
 def kernel_hook(uc):
     slots = kernel()[0]
-    st = {'last': None}
+    st = {'last': None, 'yields': 0}
 
     def on_k(u, addr, size, d):
         esp = u.reg_read(X.UC_X86_REG_ESP)
@@ -223,6 +228,11 @@ def kernel_hook(uc):
             return
         o, n = slots.get((addr - KVA) // 4, (0, 0))
         ret = u32(u, esp)
+        if o in YIELDS:
+            st['yields'] += 1
+            if st['yields'] >= SPIN:
+                SPUN[id(u)] = (ret, u32(u, esp + 4 + n))   # the yield's caller and (if a wrapper) its caller
+                u.emu_stop()
         if o in KERNEL_EMU:
             try:
                 ws = KERNEL_EMU[o](u, *[u32(u, esp + 4 + 4 * k) for k in range(n // 4)]) or []
@@ -480,6 +490,49 @@ def extdefs(decomp):
     return out
 
 
+def retail_vtable(oo, si, off):
+    """Retail's copy of the vtable at offset off of section si of object oo, found by its contents.
+    The slots whose functions have retail addresses (the others are wildcards) are matched against
+    retail's data sections. Returns (va, []) when exactly one place matches every known slot (at
+    least two), (va, [(slot, ours, retail)]) for a unique place matching all but a few of at least
+    eight known slots (not used for linking: it names the decomp's wrong slots), else None."""
+    sec = oo.sections[si]
+    n = (len(sec.data) - off) // 4
+    if n <= 0:
+        return None
+    slots = [None] * n
+    for roff, symi, typ in sec.relocs:
+        if typ != coff.IMAGE_REL_I386_DIR32 or roff < off or (roff - off) % 4 or (roff - off) // 4 >= n:
+            continue
+        t = oo.by_index[symi]
+        v = resolve(t.name)
+        if v is None and t.sclass == 105 and t.naux:
+            d = oo.by_index.get(struct.unpack_from('<I', t.aux[0], 0)[0])
+            v = resolve(d.name) if d is not None else None
+        slots[(roff - off) // 4] = v
+    known = [(i, v) for i, v in enumerate(slots) if v is not None]
+    if len(known) < 2:
+        return None
+    score = {}
+    for nm, va_, vs, raw, ex in common.xbe_sections():
+        if common.is_code(nm):
+            continue
+        for i0, v0 in known:
+            pat = struct.pack('<I', v0)
+            at = raw.find(pat)
+            while at >= 0:
+                base = at - 4 * i0
+                if base >= 0 and not base % 4 and base + 4 * n <= len(raw) and (va_ + base) not in score:
+                    got = struct.unpack_from('<%dI' % n, raw, base)
+                    score[va_ + base] = [(i, v, got[i]) for i, v in known if got[i] != v]
+                at = raw.find(pat, at + 1)
+    exact = [v for v, bad in score.items() if not bad]
+    if exact:
+        return (exact[0], []) if len(exact) == 1 else None
+    near = [(v, bad) for v, bad in score.items() if len(known) >= 8 and len(bad) <= max(1, len(known) // 8)]
+    return near[0] if len(near) == 1 else None
+
+
 def _code_sym(o, s):
     return s.section > 0 and s.sclass in (2, 3) and bool(o.sections[s.section].flags & coff.SCN_CODE) and not s.naux
 
@@ -547,6 +600,12 @@ def link(objp, va, size, decomp, env, force=(), src=None):
         sec = oo.sections[si]
         for off, symi, typ in sec.relocs:
             t = oo.by_index[symi]
+            if t.sclass == 105 and t.section <= 0 and t.naux and resolve(t.name) is None:
+                # a weak external: a compiler-generated member (``vector deleting destructor'' behind a
+                # vtable) defaults to its alias in this object (the scalar deleting destructor), as link does
+                dflt = oo.by_index.get(struct.unpack_from('<I', t.aux[0], 0)[0])
+                if dflt is not None:
+                    t = dflt
             if typ in (coff.IMAGE_REL_I386_SECREL, coff.IMAGE_REL_I386_SECTION, coff.IMAGE_REL_I386_ABSOLUTE):
                 continue
             target = None
@@ -582,6 +641,16 @@ def link(objp, va, size, decomp, env, force=(), src=None):
                 if typ == coff.IMAGE_REL_I386_REL32 and v not in transp:
                     b.callees.add(v)
                     b.callee_sig[v] = sized(coff.signature(t.name), decomp, env, src if p == objp else None)
+            if target is None and t.section > 0 and t.name.startswith('??_7'):
+                # a vtable with no retail address: retail's own copy, when its contents single it out, so
+                # an object's vtable pointer (stored into compared memory) is retail's
+                rv = retail_vtable(oo, t.section, t.value)
+                if rv is not None and not rv[1]:
+                    target = ('va', rv[0])
+                    b.linked.append('vtable:%s=%08x' % (coff.plain_name(t.name).replace(' ', ''), rv[0]))
+                elif rv is not None:   # ours stays in the blob: its slots differ from retail's copy
+                    b.linked.append('vtable:%s~%08x(%s)' % (coff.plain_name(t.name).replace(' ', ''), rv[0], ';'.join(
+                        'slot%d:ours=%08x,retail=%08x' % (i, o_, r_) for i, o_, r_ in rv[1])))
             if target is None and t.section > 0:
                 tsec = oo.sections[t.section]
                 if tsec.flags & coff.SCN_WRITE and not (tsec.flags & coff.SCN_CODE):
@@ -671,6 +740,23 @@ PARTS = {'al': 'eax', 'ah': 'eax', 'ax': 'eax', 'cl': 'ecx', 'ch': 'ecx', 'cx': 
          'dx': 'edx', 'bl': 'ebx', 'bh': 'ebx', 'bx': 'ebx', 'si': 'esi', 'di': 'edi'}
 
 
+_RETPOPS = {}
+
+
+def ret_pops(va):
+    """Stack bytes retail function va pops: its single `ret N` (0 when caller-cleaned; None when
+    unknown or its rets disagree)."""
+    if va not in _RETPOPS:
+        r = common.functions().get(va) if va < KVA else None
+        n = None
+        if r:
+            pops = {(i.operands[0].imm if i.operands else 0) for i in md.disasm(common.xbe_read(va, r['size_i']) or b'', va)
+                    if i.mnemonic == 'ret'}
+            n = pops.pop() if len(pops) == 1 else None
+        _RETPOPS[va] = n
+    return _RETPOPS[va]
+
+
 def live_in(va, size, through=False):
     """Registers retail A reads before writing them on some path from its entry (its register
     arguments), in order of first read. Walks the control flow inside A.
@@ -679,6 +765,43 @@ def live_in(va, size, through=False):
     body = common.xbe_read(va, size) or b''
     insns = {i.address: i for i in md.disasm(body, va)}
     out, late, thru = [], [], []
+    # push R of a callee-saved register is its save (not a read) when A restores R (pop R) and the push
+    # does not open an argument list: a call reached through only further pushes and register loads
+    # passes its value on, e.g. an incoming ebx handed to a callee as a stack argument
+    popped = {md.reg_name(i.operands[0].reg) for i in insns.values()
+              if i.mnemonic == 'pop' and i.operands and i.operands[0].type == CX.X86_OP_REG}
+
+    def saves(addr, r):
+        """push R at addr saves R unless a call reached through only pushes, stack adjustments and
+        register loads takes it as an argument: it lies within the bytes the callee pops (its single
+        `ret N`) or the caller removes after the call (add esp, N). Unprovable: a save."""
+        if r == 'ebp':
+            return True
+        if r not in popped:
+            return False
+        a, depth = addr + insns[addr].size, 0
+        for _ in range(12):
+            i = insns.get(a)
+            if i is None:
+                return True
+            o = i.operands
+            if i.mnemonic == 'call':
+                n = None
+                if o and o[0].type == CX.X86_OP_IMM:
+                    n = ret_pops(o[0].imm & 0xFFFFFFFF)
+                nx = insns.get(a + i.size)
+                if not n and nx is not None and nx.mnemonic == 'add' and nx.operands[0].type == CX.X86_OP_REG and                         md.reg_name(nx.operands[0].reg) == 'esp' and nx.operands[1].type == CX.X86_OP_IMM:
+                    n = nx.operands[1].imm
+                return not (n and depth < n)
+            if i.mnemonic == 'push':
+                depth += 4
+            elif i.mnemonic == 'sub' and o[0].type == CX.X86_OP_REG and md.reg_name(o[0].reg) == 'esp' and o[1].type == CX.X86_OP_IMM:
+                depth += o[1].imm
+            elif not (i.mnemonic in ('mov', 'lea', 'movzx', 'movsx') and o[0].type == CX.X86_OP_REG
+                      and PARTS.get(md.reg_name(o[0].reg), md.reg_name(o[0].reg)) not in (r, 'esp')):
+                return True
+            a += i.size
+        return True
 
     def passed(tgt, written):
         if not through or tgt is None or va <= tgt < va + size:
@@ -715,7 +838,7 @@ def live_in(va, size, through=False):
                 rd = set()
             if mn in ('mov', 'lea') and len(ops) == 2 and ops[0].type == ops[1].type == CX.X86_OP_REG and ops[0].reg == ops[1].reg:
                 rd = wr = set()   # mov edi, edi: padding (neither reads nor writes the value)
-            if mn == 'push' and ops and ops[0].type == CX.X86_OP_REG and md.reg_name(ops[0].reg) in ('ebx', 'esi', 'edi', 'ebp'):
+            if mn == 'push' and ops and ops[0].type == CX.X86_OP_REG and md.reg_name(ops[0].reg) in ('ebx', 'esi', 'edi', 'ebp')                     and saves(addr, md.reg_name(ops[0].reg)):
                 rd = set()
             for r in REGS + XREGS:
                 if r in rd and r not in written and r not in out:
@@ -1022,13 +1145,17 @@ def run_retail(s, va, size):
     KWRITE[id(uc)] = lambda a_, n_: on_w(uc, None, a_, n_, 0, None)
     top0 = (uc.reg_read(X.UC_X86_REG_FPSW) >> 11) & 7
     try:
-        uc.emu_start(va, SENT_END, timeout=120_000_000, count=CAP)
+        # the wall-clock limit grows with the cap, so a larger FECHECK_CAP is not cut short by time
+        uc.emu_start(va, SENT_END, timeout=max(120, CAP // 250_000) * 1_000_000, count=CAP)
     except UcError as e:
         raise Fail('untestable: retail %s at %08x' % (e, uc.reg_read(X.UC_X86_REG_EIP)))
     finally:
         KWRITE.pop(id(uc), None)
+    spun = SPUN.pop(id(uc), None)
+    if spun is not None:
+        raise Fail('untestable: retail waits on another thread (%d yields, from %s <- %s)' % (SPIN, nearest(spun[0]), nearest(spun[1])))
     if uc.reg_read(X.UC_X86_REG_EIP) != SENT_END:
-        raise Fail('untestable: retail did not return (cap) at %08x' % uc.reg_read(X.UC_X86_REG_EIP))
+        raise Fail('untestable: retail did not return (cap %dM) at %08x' % (CAP // 1_000_000, uc.reg_read(X.UC_X86_REG_EIP)))
     eax, edx = struct.unpack('<II', uc.mem_read(SCR, 8))
     top, sts = fpsave(uc.mem_read(SCR + 16, 108))
     r = st['cur']
@@ -1561,8 +1688,11 @@ def run_blob(s, b, mapping, rres, recs, alt=None, info=None):
     try:
         uc.emu_start(b.entry, SENT_END, timeout=60_000_000, count=rres.get('icount_cap', BLOB_CAP))
     except UcError as e:
+        SPUN.pop(id(uc), None)
         if not st['fail']:
             return 'differs', 'ours faults: %s at %08x' % (e, uc.reg_read(X.UC_X86_REG_EIP))
+    if SPUN.pop(id(uc), None) is not None and not st['fail']:
+        return 'differs', 'ours waits on another thread (%d yields) at %08x' % (SPIN, uc.reg_read(X.UC_X86_REG_EIP))
     if st['fail']:
         return 'differs', st['fail']
     if uc.reg_read(X.UC_X86_REG_EIP) != SENT_END:
@@ -1666,8 +1796,12 @@ def retail_cached(path, root, va, size):
             got = pickle.load(open(key, 'rb'))
             # an entry recorded under another recording format (or another set of routines that
             # run for real instead of being recorded as calls) is rerun
-            if isinstance(got, tuple) and len(got) == 3 and got[0] == 'fecheck-rcache' and got[1] == rcache_format():
-                return got[2]
+            # a run that stopped at the step cap is rerun under a larger cap (FECHECK_CAP); entries
+            # written before the cap was recorded ran under the default cap
+            if isinstance(got, tuple) and len(got) in (3, 4) and got[0] == 'fecheck-rcache' and got[1] == rcache_format():
+                cap0 = got[3] if len(got) == 4 else 30_000_000
+                if not (isinstance(got[2], str) and 'did not return' in got[2] and CAP > cap0):
+                    return got[2]
         except Exception:
             pass
     s = snapstore.load(path, root)
@@ -1676,7 +1810,7 @@ def retail_cached(path, root, va, size):
     except Fail as e:
         out = str(e)
     tmp = key + '.%d' % os.getpid()
-    pickle.dump(('fecheck-rcache', rcache_format(), out), open(tmp, 'wb'))
+    pickle.dump(('fecheck-rcache', rcache_format(), out, CAP), open(tmp, 'wb'))
     os.replace(tmp, key)
     return out
 
@@ -2055,6 +2189,7 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             raise Fail(rr[0][3])
         live = live_in(va, size)
         live2 = live_in(va, size, through=True)   # pass-through registers: tried after the others
+        rpops = ret_pops(va)
         loaded = {}
 
         def snap(p, root):
@@ -2093,9 +2228,12 @@ def check(va, decomp, env, src=None, k=6, budget=240):
             first = chosen = None
             for sg in sigs:
                 b.sig = sg
-                ms = known_maps(va, sg) + candidates(sg, live)
+                ms = candidates(sg, live)
                 if live2 != live:
                     ms += [m_ for m_ in candidates(sg, live2) if m_ not in ms]
+                if rpops:   # retail pops N bytes: maps whose stack parameters fill exactly N come first
+                    ms.sort(key=lambda m_: sum((e[2] + 3) // 4 * 4 for e in m_ if e[0] == 'stk') != rpops)
+                ms = known_maps(va, sg) + [m_ for m_ in ms if m_ not in known_maps(va, sg)]
                 for m in ms:
                     if first is not None and time.time() > lim['end']:
                         break
@@ -2172,6 +2310,9 @@ def check(va, decomp, env, src=None, k=6, budget=240):
         if chosen is None:
             m, bad, verdicts, n, sg = first
             res.update(verdict='differs', detail='%s: %s' % bad, mapping=fmt_map(m))
+            vts = [x[7:] for x in res['linked'].split() if x.startswith('vtable:') and '~' in x]
+            if vts:   # the object's vtable is not retail's: say so first, it explains stored vtable pointers
+                res['detail'] = 'vtable differs from the retail copy: %s; first difference %s' % (' '.join(vts), res['detail'])
         else:
             m, verdicts, sg = chosen
             res['mapping'] = fmt_map(m) + (' +retbuf' if sg.params and len(sg.params) > len(coff.signature(b.name).params or []) else '')

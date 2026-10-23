@@ -44,6 +44,12 @@ parameter, candidate locations are eax/ecx/edx/ebx/esi/edi and the stack slots; 
 the assignment under which F's behaviour (calls + writes + return) agrees with retail on
 all K snapshots; fall back to the calling-convention analysis in tools/abi_wrap.py and
 the retail `ret N`.
+Candidate registers are A's live-ins: registers read before written on some path from the entry.
+A `push` of ebx/esi/edi is a callee-saved register's save, not a read, only when A restores it
+(`pop`) and the push does not sit within the argument bytes of the call it leads to (the callee's
+single `ret N`, or the caller's `add esp, N`); so an incoming edi/ebx handed on as a stack argument
+is a live-in. When retail's `ret N` pops N > 0 bytes, maps whose stack parameters fill exactly N
+bytes are tried first.
 
 ## 6. Frame-pointer pairing
 Callee writes into retail's frame are replayed into ours through a pairing of retail's frame
@@ -76,6 +82,19 @@ spans several paired pointers is split at them.
 `<WORK>/rcache_v6`: one pickle per snapshot holding ('fecheck-rcache', format, result). The format is
 RCACHE_FORMAT plus a hash of the routines that run for real (never recorded as calls); an entry of
 another format, or older than its snapshot, is rerun.
+Each entry also records the step cap it ran under (FECHECK_CAP); a run that stopped at the cap is
+rerun when the cap is larger, and the wall-clock limit grows with the cap. A retail run that yields
+the thread 100000 times (NtYieldExecution / KeDelayExecutionThread) is waiting on another thread that
+never runs in the emulator (an I/O completion flag): it stops at once as `untestable: retail waits on
+another thread` naming the waiting function.
+
+## Vtables
+A vtable the object defines without a retail address (``??_7X``) links to retail's own copy when its
+contents single it out: the slots whose functions have retail addresses match exactly one place in
+retail's data (at least two known slots). Then an object's stored vtable pointer is retail's. A copy
+that matches all but a few of at least eight known slots is the class's vtable with wrong slots in the
+decomp: ours stays in the blob and a `differs` verdict names the slots first. A weak external (MSVC's
+vector deleting destructor ``??_E``) links to its default, the scalar deleting destructor ``??_G``.
 
 ## Builtins
 By-value structures smaller than a dword compare only their own bytes as call arguments (retail pushes
