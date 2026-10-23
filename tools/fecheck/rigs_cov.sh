@@ -124,7 +124,8 @@ TYPESN=(slayer koth oddball juggernaut ctf assault territories)
 typerow() { local i; for i in "${!TYPESN[@]}"; do [ "${TYPESN[$i]}" = "$1" ] && { echo $i; return; }; done; echo -1; }
 
 for s in "${SC[@]}"; do
-  while userbusy; do sleep 60; done   # never beside the owner's game
+  # never beside the owner's game: IDLE_MIN (default 10) quiet minutes first, as rigs_link.sh
+  q=0; until [ $q -ge ${IDLE_MIN:-10} ]; do if userbusy; then q=0; else q=$((q + 1)); fi; [ $q -ge ${IDLE_MIN:-10} ] || sleep 60; done
   setsc $s; kill_mine; t0=$SECONDS; st=""; SAVEXENV=("${XENV[@]}")
   case $s in
   menus*)
