@@ -151,7 +151,7 @@ rowto() { local tg=$1 r r2 i k h=${ROWHOLD:-300}; shift
   done; return 1; }
 # press <button> <screen>...: press, then wait (up to 40 s) for one of the screens; press again
 # only while the screen is still the one the first press was made on (up to 3 presses)
-press() { local b=$1 i k n d n0 d0; shift; read n0 d0 <<< "$(scr)"
+press() { local b=$1 i k n d n0 d0; shift; userbusy && return 1; read n0 d0 <<< "$(scr)"
   for i in 1 2 3; do pad $b:500 1
     for k in $(seq 20); do sleep 2; read n d <<< "$(scr)"; [ $d -le 30 ] && [[ " $* " == *" $n "* ]] && return 0; done
     [ "$n" = "$n0" ] || return 1
@@ -165,7 +165,7 @@ menuq() { python -c "import sys;from PIL import Image;print(1 if sum(1 for x in 
 # went straight back into that lobby for ever; the System Link row is confirmed on a second
 # screenshot before A)
 toavail() { local i n d r pv=
-  for i in $(seq ${NAVMAX:-40}); do read n d <<< "$(scr)"; [ $d -gt 30 ] && n=other
+  for i in $(seq ${NAVMAX:-40}); do userbusy && return 9; read n d <<< "$(scr)"; [ $d -gt 30 ] && n=other
     [ "$pv" = lobby ] && [ $n = players ] && { pad b:500 6; pv=; continue; }
     [ $n = other ] || pv=$n
     case $n in
@@ -301,7 +301,9 @@ for s in "${SC[@]}"; do
   m=${s#link}; ty=${m#*_}; m=${m%%_*}; tr=-1
   for i in "${!TYPES[@]}"; do [ "${TYPES[$i]}" = "$ty" ] && tr=$i; done
   [ $tr = -1 ] && { echo "$s: unknown game type $ty"; continue; }
-  while userbusy; do sleep 60; done   # never run beside the owner's game
+  # never run beside the owner's game: start only after IDLE_MIN (default 10) quiet minutes
+  # in a row (a game restarted every few minutes let a copy start in a gap)
+  q=0; until [ $q -ge ${IDLE_MIN:-10} ]; do if userbusy; then q=0; else q=$((q + 1)); fi; [ $q -ge ${IDLE_MIN:-10} ] || sleep 60; done
   setsc $s; kill_mine; t0=$SECONDS; st=""
   [ -n "$RESTORE" ] && { restore $DIRA; restore $DIRB; }
   # host first (two copies booting at once on a busy E: took 7 minutes to the title)
