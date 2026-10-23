@@ -42,7 +42,8 @@ pad() { echo "$1" >> "$O/pad.txt"; sleep ${2:-1}; }
 shot() { local i; rm -f "$O/$1.png"; for i in 1 2 3 4 5 6; do bash $T/shot.sh "$O" "$1" > /dev/null 2>&1
   [ -s "$O/$1.png" ] && return 0; sleep 1; done; return 1; }
 alive() { [ -n "${PID[$C]}" ] && tasklist //FI "PID eq ${PID[$C]}" 2>/dev/null | grep -q "$EXE"; }
-kill_mine() { local c; for c in A B; do [ -n "${PID[$c]}" ] && taskkill //F //PID ${PID[$c]} > /dev/null 2>&1; PID[$c]=; rm -f "${OD[$c]}/pid"; done; sleep 3; }
+# (/T: a launcher stub that is still alive takes its game with it)
+kill_mine() { local c; for c in A B; do [ -n "${PID[$c]}" ] && taskkill //F //T //PID ${PID[$c]} > /dev/null 2>&1; PID[$c]=; rm -f "${OD[$c]}/pid"; done; sleep 3; }
 flips() { grep -a 'fps (' "$O/out.log" | tail -1 | sed 's/.*(\([0-9]*\) flips).*/\1/'; }
 # restore <dir>: the copy's save images/caches and UDATA back to the pristine sources (only the
 # 1 MB blocks that differ are written)
@@ -83,9 +84,10 @@ setuplit() { python -c "import sys;from PIL import Image;im=Image.open(sys.argv[
 start() {
   use $1; local d; [ $1 = A ] && d=$DIRA || d=$DIRB
   # one game per copy folder: a second one (another rig's) fails on the shared save images with
-  # sharing violations; wait for the folder to be free (up to COPY_WAIT s, default 3 hours)
+  # sharing violations; wait for the folder to be free (up to COPY_WAIT s, default 10 minutes:
+  # a 3-hour wait behind a lost game made one scenario take 2 hours and fail)
   local w=0; while [ -n "$(powershell -NoProfile -c "Get-Process h2fe -ea 0 | ?{\$_.Path -like '$(cygpath -w $d)\\*'} | %{ \$_.Id }" | tr -d '\r')" ]; do
-    [ $w -ge ${COPY_WAIT:-10800} ] && return 1; sleep 30; w=$((w + 30)); done
+    [ $w -ge ${COPY_WAIT:-600} ] && return 1; sleep 30; w=$((w + 30)); done
   : > "$O/pad.txt"; rm -f "$O/fe.bin" "$O"/fb*.bmp "$O/dumpflag"
   local E=(RECOMP_APU_MUTE=1 RECOMP_FB_DUMP_REPORT=0 RECOMP_FE_OUT="$(cygpath -m "$O")/fe.bin" RECOMP_MAC=$2 RECOMP_NIC_FRAMES=${NIC_FRAMES:-0} "${XENV[@]}")
   # (the runtime creates only the last directory level)
@@ -93,9 +95,19 @@ start() {
   ( cd $d && exec env "${E[@]}" RECOMP_WATCHDOG_SECS=$3 RECOMP_PB_REPORT_MS=5000 RECOMP_PAD_LIVE="$(cygpath -m "$O")/pad.txt" \
       RECOMP_FB_DUMP_FLIPS="$(cygpath -m "$O")/dumpflag" RECOMP_FB_DUMP="$(cygpath -m "$O")/fb" ./$EXE > "$O/out.log" 2>&1 ) &
   # the Windows PID of exactly the process started here (the subshell execs the game): never a
-  # lookup by folder, which picked up another rig's game in the same folder (and killed it)
-  local bp=$! p= i; for i in $(seq 20); do sleep 1
-    p=$(cat /proc/$bp/winpid 2>/dev/null | tr -d '\r'); [ -n "$p" ] && break; done
+  # lookup by folder, which picked up another rig's game in the same folder (and killed it).
+  # winpid changes while the subshell execs env and env starts the game: on a loaded machine the
+  # first value read was the short-lived stub's, so the rig lost its own game (it ran on untracked
+  # for the 90-minute watchdog, holding the folder and the userbusy check). A PID is taken only
+  # once it is $EXE (or a $EXE child of a stub PID seen here); else whatever was seen is killed.
+  local bp=$! p= q i seen=" "; for i in $(seq 60); do sleep 1
+    q=$(cat /proc/$bp/winpid 2>/dev/null | tr -d '\r')
+    if [ -n "$q" ]; then case "$seen" in *" $q "*) ;; *) seen+="$q " ;; esac
+      tasklist //FI "PID eq $q" 2>/dev/null | grep -qi "^$EXE" && { p=$q; break; }; fi
+    if [ $i -ge 10 ]; then p=$(powershell -NoProfile -c "\$s='$seen'.Trim() -split ' '; Get-CimInstance Win32_Process -Filter \"Name='$EXE'\" | ?{ \$s -contains [string]\$_.ParentProcessId } | %{ \$_.ProcessId } | select -First 1" 2>/dev/null | tr -d '\r')
+      [ -n "$p" ] && break; fi
+  done
+  [ -z "$p" ] && for q in $seen; do taskkill //F //T //PID $q > /dev/null 2>&1; done
   [ -n "$p" ] && powershell -NoProfile -c "(Get-Process -Id $p -ea 0).PriorityClass='$PRIO'" > /dev/null 2>&1
   PID[$1]=$p; echo "$p" > "$O/pid"; [ -n "$p" ]
 }
@@ -107,7 +119,7 @@ waittitle() { local d=0 t=$SECONDS; until [ "$(flips)" -ge 1100 ] 2>/dev/null; d
 # started once more
 boot() { local c=$1 mac; [ $c = A ] && mac=$MACA || mac=$MACB
   for k in 1 2; do start $c $mac ${WD:-5400} && waittitle && return 0
-    [ -n "${PID[$c]}" ] && taskkill //F //PID ${PID[$c]} > /dev/null 2>&1; PID[$c]=; sleep 5; done; return 1; }
+    [ -n "${PID[$c]}" ] && taskkill //F //T //PID ${PID[$c]} > /dev/null 2>&1; PID[$c]=; rm -f "$O/pid"; sleep 5; done; return 1; }
 # userbusy: the owner is playing (a ReSkate / Skate.exe process): the rig waits between scenarios
 userbusy() {
   tasklist 2>/dev/null | grep -qi "^skate.exe" && return 0
@@ -139,29 +151,45 @@ rowto() { local tg=$1 r r2 i k h=${ROWHOLD:-300}; shift
   done; return 1; }
 # press <button> <screen>...: press, then wait (up to 40 s) for one of the screens; press again
 # only while the screen is still the one the first press was made on (up to 3 presses)
-press() { local b=$1 i k n d n0 d0; shift; read n0 d0 <<< "$(scr)"
+press() { local b=$1 i k n d n0 d0; shift; userbusy && return 1; read n0 d0 <<< "$(scr)"
   for i in 1 2 3; do pad $b:500 1
     for k in $(seq 20); do sleep 2; read n d <<< "$(scr)"; [ $d -le 30 ] && [[ " $* " == *" $n "* ]] && return 0; done
     [ "$n" = "$n0" ] || return 1
   done; return 1; }
+# menuq: 1 when the main menu's rows of text (Split Screen .. Settings) are under the logo
+# (unlit rows peak near 110, the title's band below 40)
+menuq() { python -c "import sys;from PIL import Image;print(1 if sum(1 for x in Image.open(sys.argv[1]).convert('L').crop((250,335,390,410)).tobytes() if x>80)>300 else 0)" "$1" 2>/dev/null; }
 # toavail <profile>: from wherever the copy is in the front end, reach System Link's Available
 # Games signed in with profile row n (0 = Halo0001); every press is chosen from a screenshot
-toavail() { local i n d r
-  for i in $(seq ${NAVMAX:-40}); do read n d <<< "$(scr)"; [ $d -gt 30 ] && n=other
+# (a lagging UI can take the main menu's A on Split Screen: its lobby is left with B, and the
+# profile screen that follows is left with B too, back to the main menu, instead of A, which
+# went straight back into that lobby for ever; the System Link row is confirmed on a second
+# screenshot before A)
+toavail() { local i n d r pv=
+  for i in $(seq ${NAVMAX:-40}); do userbusy && return 9; read n d <<< "$(scr)"; [ $d -gt 30 ] && n=other
+    [ "$pv" = lobby ] && [ $n = players ] && { pad b:500 6; pv=; continue; }
+    [ $n = other ] || pv=$n
     case $n in
     available) cp "$O/cl.png" "$O/s_available.png"; return 0 ;;
     title) pad start:1500 6 ;;
-    profiles) r=$(lit "$O/cl.png" 220 450 242 263 284 305)
-      if [ "$r" = $((1 + $1)) ]; then cp "$O/cl.png" "$O/s_profile.png"; pad a:500 6
-      elif [ "${r:--1}" -gt $((1 + $1)) ]; then pad up:450 3; else pad down:450 3; fi ;;
+    # (rows are reached with rowto, which waits for each move and adapts the hold: fixed
+    # 450 ms presses on a slow frame rate moved two rows and see-sawed past the target)
+    profiles) rowto $((1 + $1)) 220 450 242 263 284 305 && { cp "$O/rw.png" "$O/s_profile.png"; pad a:500 6; } ;;
     signin|players) pad a:500 6 ;;
     exitdlg|lobby|settings|carnage|setup|gametype|variant|selmap) pad b:500 5 ;;
-    mainmenu) r=$(lit "$O/cl.png" 405 435 287 315 343 371 399)
-      if [ "$r" = 3 ]; then pad a:500 6; elif [ "${r:--1}" -gt 3 ]; then pad up:450 3; else pad down:450 3; fi ;;
+    # (a title over another background image classified as the main menu, and rowto pressed
+    # down on it for an hour: the menu needs its rows of text under the logo)
+    mainmenu) if [ "$(menuq "$O/cl.png")" != 1 ]; then pad start:1500 6; continue; fi
+      rowto 3 405 435 287 315 343 371 399 && { sleep 3; shot cl
+      [ "$(lit "$O/cl.png" 405 435 287 315 343 371 399)" = 3 ] && pad a:500 6; } ;;
     *) sleep 4 ;;
     esac; done; return 1; }
 # countdown: 1 when the lobby shows the start countdown ("Press X to cancel" line)
 countdown() { python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');print(1 if sum(1 for x in im.crop((60,128,300,142)).tobytes() if x>150)>20 else 0)" "$1" 2>/dev/null; }
+# watchlit <test>: up to 5 fresh screenshots (sl.png) until <test> on one says 1: a lagging UI
+# shows a move seconds late, and the lobby soon puts its focus back on Start Game (one
+# screenshot 0.2 s after the press missed it ten times in a row: host-fail(2))
+watchlit() { local k; for k in 1 2 3 4 5; do shot sl || continue; [ "$($1 "$O/sl.png")" = 1 ] && return 0; done; return 1; }
 # tosetup: from the host lobby into Custom Game Setup. Right moves to Game Setup, but the lobby
 # puts its focus back on Start Game every few seconds and a slow frame can swallow the press, so
 # A is pressed only right after a screenshot shows Game Setup lit; a countdown it started anyway
@@ -171,8 +199,7 @@ tosetup() { local i n d
     case $n in
     setup) return 0 ;;
     lobby) if [ "$(countdown "$O/cl.png")" = 1 ]; then pad x:500 3; continue; fi
-      if [ "$(setuplit "$O/cl.png")" != 1 ]; then pad right:700 0.2; shot sl; fi
-      if [ "$(setuplit "$O/sl.png")" = 1 ] || [ "$(setuplit "$O/cl.png")" = 1 ]; then pad a:500 4; fi ;;
+      if [ "$(setuplit "$O/cl.png")" = 1 ]; then pad a:500 4; else pad right:700 0.2; watchlit setuplit && pad a:500 4; fi ;;
     gametype|variant|selmap) pad b:500 5 ;;
     ingame) return 1 ;;
     *) sleep 4 ;;
@@ -193,22 +220,46 @@ host() {
 }
 # join: B, on Available Games, picks the first listed game (down then A at once: the list puts its
 # focus back on Create New Game every few seconds); a game it created by mistake is left again
-join() { local i n d
-  for i in $(seq 8); do read n d <<< "$(scr)"
+# Only once a game is listed (a second row under Create New Game): pressing on an empty list
+# created B's own game every time, and the 8 tries ran out before the host's game was listed.
+# Up to JOIN_WAIT seconds (default 600: under load one try takes a minute or more) for the listing; B leaves and re-enters the list halfway.
+listed() { python -c "import sys;from PIL import Image;print(1 if sum(1 for x in Image.open(sys.argv[1]).convert('L').crop((80,116,260,154)).tobytes() if x>60)>200 else 0)" "$1" 2>/dev/null; }
+# gamerow: up to 5 screenshots until the listed game's row (not Create New Game) has the focus
+# (a down swallowed by a slow frame made A create B's own game)
+gamerow() { local k; for k in 1 2 3 4 5; do shot sl || continue; [ "$(lit "$O/sl.png" 80 260 86 128)" = 1 ] && return 0; done; return 1; }
+join() { local i n d w=$SECONDS rf=
+  for i in $(seq 40); do read n d <<< "$(scr)"
     case $n in
-    available) pad down:600 0.7; pad a:500 10 ;;
+    # (the budget is checked only here: a slow lobby that was the host's came after it once)
+    available) [ $((SECONDS - w)) -ge ${JOIN_WAIT:-600} ] && return 1
+      if [ "$(listed "$O/cl.png")" = 1 ]; then cp "$O/cl.png" "$O/s_listed.png"; pad down:600 0.2
+        # (the focus can still go back to Create New Game before a lagging A lands: its own
+        # lobby is then left with B and the list tried again)
+        gamerow && pad a:500 10
+      elif [ -z "$rf" ] && [ $((SECONDS - w)) -ge $(( ${JOIN_WAIT:-600} / 2 )) ]; then rf=1; pad b:500 6; toavail 1
+      else sleep 6; fi ;;
     ingame) cp "$O/cl.png" "$O/s_joined.png"; return 0 ;;   # joined a game in progress
     lobby) if [ "$(joinedq "$O/cl.png")" = 1 ]; then cp "$O/cl.png" "$O/s_joined.png"; return 0; fi
       cp "$O/cl.png" "$O/s_ownlobby$i.png"; pad b:500 6 ;;
     *) sleep 4 ;;
     esac; done; return 1; }
 # teamswap: B moves to the other team (X opens its team picker; right, A)
-teamswap() { pad x:500 4; pad right:500 2; pad a:500 4; shot s_team; }
+# (on a slow frame rate the right press landed before the picker was open and nothing changed:
+# each step waits 8 s, and the move is checked for a blue bar in the player list)
+blueq() { python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('RGB')
+print(1 if any(sum(p[2]-p[0] for p in im.crop((440,y-4,600,y+4)).getdata())>40*160*8 for y in (74,96)) else 0)" "$1" 2>/dev/null; }
+teamswap() { local i; for i in 1 2 3; do pad x:500 8; pad right:500 8; pad a:500 8; shot s_team
+  [ "$(blueq "$O/s_team.png")" = 1 ] && return 0; done; return 1; }
 # mpgo: A presses Start Game (left first: Start Game is the left button) until a map loads
+startlit() { python -c "import sys;from PIL import Image;im=Image.open(sys.argv[1]).convert('L');a=sum(im.crop((45,68,200,86)).tobytes());b=sum(im.crop((225,68,380,86)).tobytes());print(1 if a>1.15*b else 0)" "$1" 2>/dev/null; }
 mpgo() { local i n d
-  for i in $(seq 6); do read n d <<< "$(scr)"
+  rm -f "$O/sl.png"
+  for i in $(seq 12); do read n d <<< "$(scr)"
     case $n in
-    lobby) [ "$(setuplit "$O/cl.png")" = 1 ] && pad left:500 0.6; pad a:500 15 ;;
+    # A only right after a screenshot shows Start Game lit: a left swallowed by a slow frame
+    # left Game Setup lit, A opened Custom Game Setup and B came back, six times over
+    lobby) [ "$(countdown "$O/cl.png")" = 1 ] && { sleep 10; continue; }
+      if [ "$(startlit "$O/cl.png")" = 1 ]; then pad a:500 15; else pad left:700 0.2; watchlit startlit && pad a:500 15; fi ;;
     ingame) return 0 ;;
     setup|gametype|variant|selmap) pad b:500 5 ;;
     *) sleep 8 ;;
@@ -216,7 +267,8 @@ mpgo() { local i n d
 # ingame_wait: up to 5 minutes for the copy's map (in-game screen)
 ingame_wait() { local i n d; for i in $(seq 40); do alive || return 1; read n d <<< "$(scr)"; [ $n = ingame ] && return 0; sleep 6; done; return 1; }
 # fight <minutes>: wander and fight (rigs5's loop); stops early when the copy is back in a menu
-fight() { local end=$((SECONDS + $1 * 60)) n d; while [ $SECONDS -lt $end ]; do alive || return 1
+# (the owner starting a game mid-scenario ends it: userbusy, returns 3)
+fight() { local end=$((SECONDS + $1 * 60)) n d; while [ $SECONDS -lt $end ]; do alive || return 1; userbusy && return 3
     pad lup:1800 2; pad rright:350 0.8; pad rt:1200 1.5; pad lup:1500 1.8; pad x:600 1; pad lt:300 1.2
     pad rleft:500 0.8; pad rt:800 1; pad b:300 1; pad y:300 1.2; pad lup:1200 1.5; pad a:300 1
     pad lthumb:300 0.8; pad rthumb:300 0.8; pad ldown:800 1; pad rup:300 0.6; pad rt:600 1; pad x:300 1
@@ -245,28 +297,51 @@ endgame() { local i n d c k
   for c in A B; do use $c; for i in $(seq 10); do read n d <<< "$(scr)"; [ $n = carnage ] && break; sleep 4; done
     for i in 1 2 3 4; do shot s_carnage$i; pad right:500 3; done; done
 }
+# (userbusy is also checked before B boots and before the start: an owner's game that starts
+# mid-scenario abandons it; the batch then waits as usual)
+# over_budget: the scenario has run REACH_MAX seconds without reaching the fight
+over_budget() { [ $((SECONDS - t0)) -ge ${REACH_MAX:-4200} ]; }
 if [ -n "$RIG_LIB" ]; then return 0 2>/dev/null || exit 0; fi
 
-for s in "${SC[@]}"; do
+# a scenario abandoned because the owner started a game goes to the end of the list again
+# (up to OWNER_RETRY times, default 3)
+declare -A RETRY; si=0
+while [ $si -lt ${#SC[@]} ]; do s=${SC[$si]}; si=$((si + 1))
   case $s in link[0-9]*_*) ;; *) echo "unknown scenario $s"; continue ;; esac
   m=${s#link}; ty=${m#*_}; m=${m%%_*}; tr=-1
   for i in "${!TYPES[@]}"; do [ "${TYPES[$i]}" = "$ty" ] && tr=$i; done
   [ $tr = -1 ] && { echo "$s: unknown game type $ty"; continue; }
-  while userbusy; do sleep 60; done   # never run beside the owner's game
+  # never run beside the owner's game: start only after IDLE_MIN (default 10) quiet minutes
+  # in a row (a game restarted every few minutes let a copy start in a gap)
+  q=0; until [ $q -ge ${IDLE_MIN:-10} ]; do if userbusy; then q=0; else q=$((q + 1)); fi; [ $q -ge ${IDLE_MIN:-10} ] || sleep 60; done
   setsc $s; kill_mine; t0=$SECONDS; st=""
   [ -n "$RESTORE" ] && { restore $DIRA; restore $DIRB; }
   # host first (two copies booting at once on a busy E: took 7 minutes to the title)
-  if boot A; then use A; toavail 0 && host $m $tr; r=$?; [ $r = 0 ] && st+="hosted " || st+="host-fail($r) "; else st+="A-noboot "; fi
-  if boot B; then use B; toavail 1 && join; r=$?; [ $r = 0 ] && st+="joined " || st+="join-fail($r) "; else st+="B-noboot "; fi
-  use B; read n d <<< "$(scr)"; case $ty in slayer|oddball|juggernaut) ;; *) [ $n = lobby ] && teamswap ;; esac
-  use A; shot s_prestart; mpgo && st+="started " || st+="start-fail "
-  for c in A B; do use $c; ingame_wait && shot s_inmap || st+="$c-nomap "; done
-  # both copies fight at once (each loop drives only its own pad file)
-  # (wait only for the two fight loops: the games are children of this shell too)
-  fp=(); for c in A B; do ( use $c; fight ${FIGHT_MIN:-6}; shot s_fightend ) & fp+=($!); done; wait "${fp[@]}"
-  endgame; sleep 16   # one more fe.bin rewrite (every 15 s)
+  # fail fast: a copy that does not boot, copies that are past REACH_MAX seconds (default 70
+  # minutes) before the start, or neither copy in the map abandon the scenario: its own games are
+  # killed and the batch moves on
+  ab=; nm=0
+  if boot A; then use A; toavail 0 && host $m $tr; r=$?; [ $r = 0 ] && st+="hosted " || st+="host-fail($r) "; else st+="A-noboot "; ab=1; fi
+  [ -z "$ab" ] && over_budget && { st+="over-budget "; ab=1; }
+  [ -z "$ab" ] && userbusy && { st+="owner-busy "; ab=1; }
+  if [ -z "$ab" ]; then if boot B; then use B; toavail 1 && join; r=$?; [ $r = 0 ] && st+="joined " || st+="join-fail($r) "; else st+="B-noboot "; ab=1; fi; fi
+  [ -z "$ab" ] && over_budget && { st+="over-budget "; ab=1; }
+  [ -z "$ab" ] && userbusy && { st+="owner-busy "; ab=1; }
+  if [ -z "$ab" ]; then
+    use B; read n d <<< "$(scr)"; case $ty in slayer|oddball|juggernaut) ;; *) [ $n = lobby ] && { teamswap || st+="noswap "; } ;; esac
+    use A; shot s_prestart; mpgo && st+="started " || st+="start-fail "
+    for c in A B; do use $c; ingame_wait && shot s_inmap || { st+="$c-nomap "; nm=$((nm + 1)); }; done
+    [ $nm = 2 ] && ab=1
+  fi
+  if [ -z "$ab" ]; then
+    # both copies fight at once (each loop drives only its own pad file)
+    # (wait only for the two fight loops: the games are children of this shell too)
+    fp=(); for c in A B; do ( use $c; fight ${FIGHT_MIN:-6}; shot s_fightend ) & fp+=($!); done; wait "${fp[@]}"
+    endgame; sleep 16   # one more fe.bin rewrite (every 15 s)
+  else st+="ABANDONED "; sleep 16; fi
   kill_mine
   line="$s: $((SECONDS - t0)) s, $st"
   for c in A B; do O=${OD[$c]}; line+="| $c $(grep -a 'fps (' "$O/out.log" | tail -1 | sed 's/.*\] //'), fe.bin $(stat -c %s "$O/fe.bin" 2>/dev/null || echo missing), snaps $(grep -a -c '\[FE\] snap ' "$O/out.log") "; done
   echo "$line"
+  case "$st" in *owner-busy*) RETRY[$s]=$(( ${RETRY[$s]:-0} + 1 )); [ ${RETRY[$s]} -le ${OWNER_RETRY:-3} ] && SC+=("$s") ;; esac
 done
