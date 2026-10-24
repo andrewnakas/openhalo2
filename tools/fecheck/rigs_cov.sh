@@ -144,7 +144,9 @@ for s in "${SC[@]}"; do
     else st+="A-noboot "; fi
     kill_mine; udata_reset $DIRA ;;
   pause[0-9]*)
-    if boot A; then use A; anchor 0 && camp_go ${s#pause} && hudlong && { st+="inlevel "; cshot c0; fight 3
+    # (a level whose HUD the shield-bar test does not see (the Arbiter's, a long cinematic) is
+    # played anyway once hudlong gives up: presses in a cinematic are harmless)
+    if boot A; then use A; anchor 0 && camp_go ${s#pause} && { hudlong || st+="nohud "; alive; } && { st+="inlevel "; cshot c0; fight 3
         pad start:500 5; cshot pause; crawl 2 pause 'pause_0,pause_4,pause_1_*,pause_2_*'; cshot end; } || st+="nolevel "
     else st+="A-noboot "; fi ;;
   coop[0-9]*)
