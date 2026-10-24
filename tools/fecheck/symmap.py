@@ -228,6 +228,8 @@ def infer(decomp, table, data):
                 t = o.by_index.get(si)
                 if t is None or t.name in seen:
                     continue
+                if t.name.startswith(('__imp_', '_imp_')):
+                    continue   # an import cell (fecheck's link makes one): never a data global
                 if resolve(t.name, table) is not None or (t.section > 0 and t.sclass == 3):
                     continue
                 if t.section > 0 and not (o.sections[t.section].flags & coff.SCN_WRITE):
