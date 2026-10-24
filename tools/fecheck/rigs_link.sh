@@ -21,16 +21,21 @@
 #   FE_SNAP_ROOT=E:/halo2/snaps/link1 bash rigs_link.sh /e/halo2/reports/link1 link7_ctf \
 #     -- RECOMP_FE_SNAP=E:/halo2/build/fecheck/queue/rig_snap_list2.txt RECOMP_FE_SNAP_K=4 RECOMP_FE_SNAP_GAP_MS=15000
 # One summary line per scenario. RIG_LIB=1: only define the functions (source it to probe).
+# Linux: the game runs under Wine (rigproc.sh); RIG_E is the E: mount (no spaces), RIG_PY a
+# Python with Pillow, RIG_WINEPREFIX the rigs' own Wine prefix.
+RL_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$RL_HERE/rigproc.sh" || exit 1
 OUTR=${1:?outroot}; shift
-case "$OUTR" in ""|/|/d*|/c|/c/|/e|/e/) echo "refusing outroot '$OUTR'"; exit 1;; esac
+case "$OUTR" in ""|/|/d*|/c|/c/|/e|/e/|"$E"|"$E/") echo "refusing outroot '$OUTR'"; exit 1;; esac
 SC=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do SC+=("$1"); shift; done; [ "$1" = "--" ] && shift
 XENV=("$@")
-DIRA=${DIRA:-/e/h2link1} DIRB=${DIRB:-/e/h2link2} EXE=${EXE:-h2fe.exe}
-PRISTINE_SAVE=${PRISTINE_SAVE:-/e/halo2/build/xr_fe/save}
-PRISTINE_GAME=${PRISTINE_GAME:-/e/halo2/dirty/game}
+DIRA=${DIRA:-$E/h2link1} DIRB=${DIRB:-$E/h2link2} EXE=${EXE:-h2fe.exe}
+PRISTINE_SAVE=${PRISTINE_SAVE:-$E/halo2/build/xr_fe/save}
+PRISTINE_GAME=${PRISTINE_GAME:-$E/halo2/dirty/game}
 MACA=${MACA:-02:48:32:00:00:0a} MACB=${MACB:-02:48:32:00:00:0b}
 PRIO=${PRIO:-BelowNormal}
-T=/e/openhalo2/tools
+# shot.sh, scr.py and link_refs/ from this tree
+T=$(cd "$RL_HERE/.." && pwd)
 declare -A PID OD
 # setsc <scenario>: report dirs <outroot>/<scenario>/{A,B}; PIDs survive in their pid files
 setsc() { S=$1; local c; for c in A B; do OD[$c]=$OUTR/$S/$c; mkdir -p "${OD[$c]}"
@@ -41,15 +46,15 @@ pad() { echo "$1" >> "$O/pad.txt"; sleep ${2:-1}; }
 # shot <label>: <label>.png from a fresh frame (a slow frame dump can miss the 0.6 s window: retry)
 shot() { local i; rm -f "$O/$1.png"; for i in 1 2 3 4 5 6; do bash $T/shot.sh "$O" "$1" > /dev/null 2>&1
   [ -s "$O/$1.png" ] && return 0; sleep 1; done; return 1; }
-alive() { [ -n "${PID[$C]}" ] && tasklist //FI "PID eq ${PID[$C]}" 2>/dev/null | grep -q "$EXE"; }
-# (/T: a launcher stub that is still alive takes its game with it)
-kill_mine() { local c; for c in A B; do [ -n "${PID[$c]}" ] && taskkill //F //T //PID ${PID[$c]} > /dev/null 2>&1; PID[$c]=; rm -f "${OD[$c]}/pid"; done; sleep 3; }
+alive() { rp_alive "${PID[$C]}" "$EXE"; }
+# (with its children: a launcher stub that is still alive takes its game with it)
+kill_mine() { local c; for c in A B; do rp_kill "${PID[$c]}"; PID[$c]=; rm -f "${OD[$c]}/pid"; done; sleep 3; }
 flips() { grep -a 'fps (' "$O/out.log" | tail -1 | sed 's/.*(\([0-9]*\) flips).*/\1/'; }
 # restore <dir>: the copy's save images/caches and UDATA back to the pristine sources (only the
 # 1 MB blocks that differ are written)
 SAVEF="Partition0.img Partition1.img Partition2.img Partition3.img Partition4.img Partition5.img Cache/preferences.dat CacheY/savegame0.bin"
 restore() {
-  local d=$1 f; case "$d" in /e/h2link?) ;; *) echo "refusing restore '$d'"; return 1;; esac
+  local d=$1 f; case "$d" in "$E"/h2link?) ;; *) echo "refusing restore '$d'"; return 1;; esac
   for f in $SAVEF; do [ -s "$PRISTINE_SAVE/$f" ] && python -c "
 import sys,time
 a,b=sys.argv[1],sys.argv[2]
@@ -86,29 +91,22 @@ start() {
   # one game per copy folder: a second one (another rig's) fails on the shared save images with
   # sharing violations; wait for the folder to be free (up to COPY_WAIT s, default 10 minutes:
   # a 3-hour wait behind a lost game made one scenario take 2 hours and fail)
-  local w=0; while [ -n "$(powershell -NoProfile -c "Get-Process h2fe -ea 0 | ?{\$_.Path -like '$(cygpath -w $d)\\*'} | %{ \$_.Id }" | tr -d '\r')" ]; do
+  local w=0; while [ -n "$(rp_pids_in "$d" "$EXE")" ]; do
     [ $w -ge ${COPY_WAIT:-600} ] && return 1; sleep 30; w=$((w + 30)); done
   : > "$O/pad.txt"; rm -f "$O/fe.bin" "$O"/fb*.bmp "$O/dumpflag"
-  local E=(RECOMP_APU_MUTE=1 RECOMP_FB_DUMP_REPORT=0 RECOMP_FE_OUT="$(cygpath -m "$O")/fe.bin" RECOMP_MAC=$2 RECOMP_NIC_FRAMES=${NIC_FRAMES:-0} "${XENV[@]}")
+  # (paths in the game's environment are the game's: E:/x on Windows, Z:/x under Wine)
+  local G; G=$(rp_gpath "$O")
+  local V=(RECOMP_APU_MUTE=1 RECOMP_FB_DUMP_REPORT=0 RECOMP_FE_OUT="$G/fe.bin" RECOMP_MAC=$2 RECOMP_NIC_FRAMES=${NIC_FRAMES:-0} "${XENV[@]}")
   # (the runtime creates only the last directory level)
-  [ -n "$FE_SNAP_ROOT" ] && { mkdir -p "$(cygpath -u "$FE_SNAP_ROOT")/$1/$S"; E+=(RECOMP_FE_SNAP_DIR="$FE_SNAP_ROOT/$1/$S"); }
-  ( cd $d && exec env "${E[@]}" RECOMP_WATCHDOG_SECS=$3 RECOMP_PB_REPORT_MS=5000 RECOMP_PAD_LIVE="$(cygpath -m "$O")/pad.txt" \
-      RECOMP_FB_DUMP_FLIPS="$(cygpath -m "$O")/dumpflag" RECOMP_FB_DUMP="$(cygpath -m "$O")/fb" ./$EXE > "$O/out.log" 2>&1 ) &
-  # the Windows PID of exactly the process started here (the subshell execs the game): never a
-  # lookup by folder, which picked up another rig's game in the same folder (and killed it).
-  # winpid changes while the subshell execs env and env starts the game: on a loaded machine the
-  # first value read was the short-lived stub's, so the rig lost its own game (it ran on untracked
-  # for the 90-minute watchdog, holding the folder and the userbusy check). A PID is taken only
-  # once it is $EXE (or a $EXE child of a stub PID seen here); else whatever was seen is killed.
-  local bp=$! p= q i seen=" "; for i in $(seq 60); do sleep 1
-    q=$(cat /proc/$bp/winpid 2>/dev/null | tr -d '\r')
-    if [ -n "$q" ]; then case "$seen" in *" $q "*) ;; *) seen+="$q " ;; esac
-      tasklist //FI "PID eq $q" 2>/dev/null | grep -qi "^$EXE" && { p=$q; break; }; fi
-    if [ $i -ge 10 ]; then p=$(powershell -NoProfile -c "\$s='$seen'.Trim() -split ' '; Get-CimInstance Win32_Process -Filter \"Name='$EXE'\" | ?{ \$s -contains [string]\$_.ParentProcessId } | %{ \$_.ProcessId } | select -First 1" 2>/dev/null | tr -d '\r')
-      [ -n "$p" ] && break; fi
-  done
-  [ -z "$p" ] && for q in $seen; do taskkill //F //T //PID $q > /dev/null 2>&1; done
-  [ -n "$p" ] && powershell -NoProfile -c "(Get-Process -Id $p -ea 0).PriorityClass='$PRIO'" > /dev/null 2>&1
+  [ -n "$FE_SNAP_ROOT" ] && { mkdir -p "$(rp_upath "$FE_SNAP_ROOT")/$1/$S"; V+=(RECOMP_FE_SNAP_DIR="$(rp_gpath "$(rp_upath "$FE_SNAP_ROOT")/$1/$S")"); }
+  ( cd $d && exec env "${V[@]}" RECOMP_WATCHDOG_SECS=$3 RECOMP_PB_REPORT_MS=5000 RECOMP_PAD_LIVE="$G/pad.txt" \
+      RECOMP_FB_DUMP_FLIPS="$G/dumpflag" RECOMP_FB_DUMP="$G/fb" $RIG_LAUNCH ./$EXE > "$O/out.log" 2>&1 ) &
+  # the PID of exactly the process started here (the subshell execs the game): never a lookup by
+  # folder, which picked up another rig's game in the same folder (and killed it). On Windows the
+  # PID changes while the subshell execs env and env starts the game (rp_started: a PID is taken
+  # only once it is $EXE; else whatever was seen is killed)
+  local p; p=$(rp_started $! "$EXE")
+  [ -n "$p" ] && rp_prio $p $PRIO
   PID[$1]=$p; echo "$p" > "$O/pid"; [ -n "$p" ]
 }
 # waittitle: until the copy has presented 1100 frames (the title)
@@ -119,13 +117,13 @@ waittitle() { local d=0 t=$SECONDS; until [ "$(flips)" -ge 1100 ] 2>/dev/null; d
 # started once more
 boot() { local c=$1 mac; [ $c = A ] && mac=$MACA || mac=$MACB
   for k in 1 2; do start $c $mac ${WD:-5400} && waittitle && return 0
-    [ -n "${PID[$c]}" ] && taskkill //F //T //PID ${PID[$c]} > /dev/null 2>&1; PID[$c]=; rm -f "$O/pid"; sleep 5; done; return 1; }
-# userbusy: the owner is playing (a ReSkate / Skate.exe process): the rig waits between scenarios
+    rp_kill "${PID[$c]}"; PID[$c]=; rm -f "$O/pid"; sleep 5; done; return 1; }
+# userbusy: the owner is playing (rp_owner_game: a ReSkate / Skate.exe process, on Linux also
+# GTA V or a Steam game): the rig waits between scenarios
 userbusy() {
-  tasklist 2>/dev/null | grep -qi "^skate.exe" && return 0
-  # any h2fe.exe the rig did not start (the owner's own copy); with none running, tasklist prints
-  # an INFO line whose words are not PIDs (they made the rig wait forever)
-  local p; for p in $(tasklist //FI "IMAGENAME eq $EXE" //FO CSV //NH 2>/dev/null | cut -d, -f2 | tr -d '"' | grep -E '^[0-9]+$'); do
+  rp_owner_game && return 0
+  # any h2fe.exe the rig did not start (the owner's own copy)
+  local p; for p in $(rp_pids "$EXE"); do
     case " ${PID[*]} " in *" $p "*) ;; *) return 0 ;; esac
   done
   return 1

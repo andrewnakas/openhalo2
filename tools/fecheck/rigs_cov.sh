@@ -29,16 +29,13 @@
 # link_measure.py reads both). One summary line per scenario.
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RIG_LIB=1 source "$HERE/rigs_link.sh" "$@" || exit 1
-# shot.sh, scr.py and link_refs/ from this tree (rigs_link.sh points at the main checkout,
-# which other sessions switch branches in)
-T=$(cd "$HERE/.." && pwd)
 PRISTINE_UDATA=${PRISTINE_UDATA:-$PRISTINE_GAME/UDATA}
 FIGHT_MIN=${FIGHT_MIN:-4}
 
 # has <anchor>: the menus scenario crawls that part (MENUS, default all: camp live0 split link settings)
 has() { [[ " ${MENUS:-camp live0 split link settings} " == *" $1 "* ]]; }
 # udata_reset <dir>: the copy's profiles back from the pristine source (read only)
-udata_reset() { case "$1" in /e/h2link?) ;; *) echo "refusing udata_reset '$1'"; return 1;; esac
+udata_reset() { case "$1" in "$E"/h2link?) ;; *) echo "refusing udata_reset '$1'"; return 1;; esac
   [ -d "$PRISTINE_UDATA" ] || return 1; rm -rf "$1/game/UDATA" && cp -r "$PRISTINE_UDATA" "$1/game/UDATA"; }
 # tomain <profile row> <main row>: from wherever the copy is in the front end to the main menu
 # with row <main row> lit (Campaign 0, Xbox Live 1, Split Screen 2, System Link 3, Settings 4).
@@ -64,11 +61,11 @@ tomain() { local prof=$1 row=$2 i n d r
       [ $((i % 2)) = 0 ] && pad b:500 4 || sleep 3 ;;
     esac; done; return 1; }
 # reboot_a: kill copy A and start it again (a crawl that ended in a game or a hang)
-reboot_a() { [ -n "${PID[A]}" ] && taskkill //F //T //PID ${PID[A]} > /dev/null 2>&1; PID[A]=; sleep 5; boot A; use A; }
+reboot_a() { rp_kill "${PID[A]}"; PID[A]=; sleep 5; boot A; use A; }
 # anchor <main row>: to that main-menu row, rebooting once when the copy is lost
 anchor() { tomain 0 $1 && return 0; reboot_a && tomain 0 $1; }
 # crawl <depth> <tag> [SKIP list]: cov_drive.py from the current screen (screens c_<tag>_*.png)
-crawl() { SKIP=$3 RIG_TOOLS=$T python "$HERE/cov_drive.py" crawl "$(cygpath -m "$O")" $1 ${ROWS:-8} $2 > /dev/null; local rc=$?
+crawl() { SKIP=$3 RIG_TOOLS=$T python "$HERE/cov_drive.py" crawl "$(rp_hpath "$O")" $1 ${ROWS:-8} $2 > /dev/null; local rc=$?
   st+="$2:$([ $rc = 0 ] && echo ok || echo lost) "; return $rc; }
 # tolobby1: after A on Split Screen, A through the player screens until the lobby shows
 tolobby1() { local i n d; for i in $(seq 6); do read n d <<< "$(scr)"; [ $d -le 30 ] && [ $n = lobby ] && return 0
@@ -93,7 +90,7 @@ fight2() { local end=$((SECONDS + $1 * 60)) k; while [ $SECONDS -lt $end ]; do a
     for k in lup:1500 rright:350 rt:1000 x:500 lleft:800 rt:800 b:300 y:300 a:300 lt:300 ldown:800 rleft:400; do
       pad $k 0.6; pad p2-$k 0.6; done; done; }
 # live_menu: 1 when the frame is Open Live's Xbox Live menu (header of the openlive2 reference)
-OLREF=${OLREF:-/e/halo2/reports/openlive2/ref}
+OLREF=${OLREF:-$E/halo2/reports/openlive2/ref}
 live_menu() { python -c "import sys;from PIL import Image
 a=Image.open(sys.argv[1]).convert('L').crop((0,30,640,60)).tobytes();b=Image.open(sys.argv[2]).convert('L').crop((0,30,640,60)).tobytes()
 print(1 if sum(abs(x-y) for x,y in zip(a,b))/len(a)<12 else 0)" "$1" "$OLREF/live.png" 2>/dev/null; }
@@ -154,7 +151,7 @@ for s in "${SC[@]}"; do
         pad start:500 5; cshot pause; pad b:500 3; pad p2-start:500 5; cshot pause2; pad p2-b:500 3; } || st+="menu-fail "
     else st+="A-noboot "; fi ;;
   live)
-    XENV+=(RECOMP_OPEN_LIVE=1 RECOMP_OL_GAMERTAG=${OL_TAG:-CovRig} RECOMP_OL_PROFILE="$(cygpath -m "$DIRA")/openlive_cov.json")
+    XENV+=(RECOMP_OPEN_LIVE=1 RECOMP_OL_GAMERTAG=${OL_TAG:-CovRig} RECOMP_OL_PROFILE="$(rp_gpath "$DIRA")/openlive_cov.json")
     if boot A; then use A
       LIVEACCT=1 anchor 1 && pad a:500 12
       # the first sign-in asks which profile goes with the account: A until the Live menu shows
@@ -169,8 +166,8 @@ for s in "${SC[@]}"; do
     m=${s#*[AB]}; ty=${m#*_}; m=${m%%_*}; tr=$(typerow $ty); [ $tr = -1 ] && { echo "$s: unknown game type"; continue; }
     link_up $m $tr && both_play $FIGHT_MIN 1
     case $s in
-    dropB*) taskkill //F //T //PID ${PID[B]} > /dev/null 2>&1; PID[B]=; st+="B-killed "; watch A 240 after ;;
-    dropA*) taskkill //F //T //PID ${PID[A]} > /dev/null 2>&1; PID[A]=; st+="A-killed "; watch B 240 after ;;
+    dropB*) rp_kill "${PID[B]}"; PID[B]=; st+="B-killed "; watch A 240 after ;;
+    dropA*) rp_kill "${PID[A]}"; PID[A]=; st+="A-killed "; watch B 240 after ;;
     leaveB*) leave_game B; st+="B-left "; watch A 120 after; watch B 60 after ;;
     esac
     use A; alive && { endgame; } ;;

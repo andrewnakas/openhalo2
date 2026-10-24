@@ -23,7 +23,7 @@ import time
 
 from PIL import Image
 
-T = os.environ.get('RIG_TOOLS', '/e/openhalo2/tools')
+T = os.environ.get('RIG_TOOLS', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WAIT_A = float(os.environ.get('CRAWL_WAIT_A', '6'))
 WAIT_B = float(os.environ.get('CRAWL_WAIT_B', '5'))
 SKIP = [x for x in os.environ.get('SKIP', '').split(',') if x]
