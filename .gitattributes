@@ -1,0 +1,3 @@
+# shell scripts run under Git Bash on Windows and bash on Linux: LF only (bash on Linux
+# reads a CR as part of each command)
+*.sh text eol=lf
