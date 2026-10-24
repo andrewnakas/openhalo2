@@ -76,9 +76,15 @@ cshot() { shot "s_$1"; }
 # Level 1 / Cooperative 2 at y 192 213 235) -> Select Level row <row> (y 92 + 22n) -> the top
 # difficulty
 camp_go() { local ROWS15 n d
-  # (a copy not yet signed in for the campaign gets Choose Profile first: Halo0001, row 1)
-  pad a:500 8; read n d <<< "$(scr)"
-  [ "$n" = profiles ] && [ $d -le 30 ] && { rowto 1 220 450 242 263 284 305 || return 1; cshot campprofile; pad a:500 8; }
+  # (a copy not yet signed in for the campaign gets Choose Profile (Halo0001, row 1) and then
+  # Sign In To Xbox Live (A on its default, Don't Sign In) before Campaign Options)
+  pad a:500 8
+  for k in 1 2 3; do read n d <<< "$(scr)"; [ $d -le 30 ] || break
+    case $n in
+    profiles) rowto 1 220 450 242 263 284 305 || return 1; cshot campprofile; pad a:500 8 ;;
+    signin) cshot campsignin; pad a:500 8 ;;
+    *) break ;;
+    esac; done
   rowto 1 100 300 192 213 235 || return 1; cshot campopt; pad a:500 8
   ROWS15=$(python -c "print(' '.join(str(92+22*i) for i in range(15)))")
   rowto $1 140 330 $ROWS15 || return 3; cshot level; pad a:500 8; cshot diff
