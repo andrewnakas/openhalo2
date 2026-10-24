@@ -29,6 +29,13 @@ export FECHECK_ROOT=/media/$USER/E FECHECK_WORK=~/fecheck-work WINEPREFIX=~/fech
 python fecheck.py 59e50 --tag _lx
 ```
 
+Once per new `runtime/` (a fresh clone or worktree), build every object and rebuild the symbol table, or
+the users of inferred data (`g_network_configuration`, `async_globals`, ...) are unbuildable:
+
+```sh
+python dbuild.py --all --jobs 2 && python symmap.py
+```
+
 `wine_cl.py` stands in for `cl.exe` (it turns `/home/...` arguments into `Z:\home\...`, which cl would
 otherwise read as options); `undec.exe` (built on first use from `undec.c`) runs Microsoft's dbghelp
 `UnDecorateSymbolName` for `coff.undecorate`.
