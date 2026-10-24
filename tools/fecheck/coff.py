@@ -1,5 +1,6 @@
 """Minimal i386 COFF object reader + MSVC name undecoration (dbghelp)."""
 import ctypes
+import hashlib
 import os
 import re
 import struct
@@ -131,14 +132,19 @@ def _undecorate_wine(name, flags):
             return _undec_cache[key]
         if _undec is None:
             env = common.vcenv()
-            exe = os.path.join(common.WORK, 'undec', 'undec.exe')
+            # one exe per undec.c contents, built under a private name and renamed into place:
+            # several fecheck processes (and worktrees) share WORK and keep it open under Wine
             src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'undec.c')
-            if not os.path.exists(exe) or os.path.getmtime(exe) < os.path.getmtime(src):
+            tag = hashlib.sha1(open(src, 'rb').read()).hexdigest()[:10]
+            exe = os.path.join(common.WORK, 'undec', 'undec_%s.exe' % tag)
+            if not os.path.exists(exe):
                 os.makedirs(os.path.dirname(exe), exist_ok=True)
-                r = subprocess.run([common.CL, '/nologo', '/O1', '/Fo' + exe[:-4] + '.obj', '/Fe' + exe, src],
+                tmp = exe[:-4] + '_%d' % os.getpid()
+                r = subprocess.run([common.CL, '/nologo', '/O1', '/Fo' + tmp + '.obj', '/Fe' + tmp + '.exe', src],
                                    capture_output=True, text=True, env=env, cwd=os.path.dirname(exe))
-                if r.returncode or not os.path.exists(exe):
+                if r.returncode or not os.path.exists(tmp + '.exe'):
                     raise RuntimeError('undec.exe does not build: ' + r.stdout[-400:])
+                os.replace(tmp + '.exe', exe)
             env = dict(env, WINEDLLOVERRIDES=env.get('WINEDLLOVERRIDES', '') + ';dbghelp=n')
             _undec = subprocess.Popen(common.run_exe() + [exe, common.winpath(common.DBGHELP)], env=env,
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding='latin-1', bufsize=1)
